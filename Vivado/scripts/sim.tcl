@@ -48,7 +48,8 @@ set work_root  [file join $vivado_dir sim]
 set taxi_dir   [file normalize [file join $vivado_dir .. submodules taxi]]
 
 # Taxi library sources needed by the simulated RTL (pktrec_axis_async_fifo,
-# pktrec_m0_path, pktrec_cap_port)
+# pktrec_m0_path, pktrec_cap_port) and, as MAC/PCS models, by tb_pktrec_tap
+# (taxi_axis_basex_tx_16 / _rx_16 + taxi_lfsr)
 set taxi_sim_srcs {}
 foreach rel {
   src/axis/rtl/taxi_axis_if.sv
@@ -57,6 +58,9 @@ foreach rel {
   src/axis/rtl/taxi_axis_async_fifo_adapter.sv
   src/sync/rtl/taxi_sync_reset.sv
   src/sync/rtl/taxi_sync_signal.sv
+  src/lfsr/rtl/taxi_lfsr.sv
+  src/eth/rtl/taxi_axis_basex_tx_16.sv
+  src/eth/rtl/taxi_axis_basex_rx_16.sv
 } {
   lappend taxi_sim_srcs [file join $taxi_dir $rel]
 }
