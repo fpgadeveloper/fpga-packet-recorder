@@ -7,7 +7,9 @@
 //   0 IDLE  nothing is sent
 //   1 LOOP  port n's own RX frames             (RX n -> TX n)
 //   2 FWD   the pair partner's RX frames        (RX n^1 -> TX n; P0<->P1, P2<->P3 = TAP)
-//   3       reserved (= IDLE)
+//   3 GEN   the port's hardware traffic generator (pktrec_gen, M2): sequence-
+//           numbered test frames, register-controlled (GEN_* registers); each
+//           port also has a receive checker (pktrec_gen_chk, CHK_*) on its RX
 // Each (TX port, source) pair has its own store-and-forward async frame FIFO
 // (pktrec_axis_async_fifo, rx_clk[src] -> tx_clk[n], 4 KB): 8 FIFOs in total. A FIFO
 // is written only while its source is selected (decided at the first beat of every
@@ -342,6 +344,15 @@ wire [31:0] mode_rx_all;        // path_mode synchronised into rx_clk[n]: [8n+7:
 wire [31:0] mode_tx_all;        // path_mode synchronised into tx_clk[n]: [8n+7:8n]
 wire [23:0] evt_tgl;            // event toggles, [6n+i] (i: see pktrec_m0_regs)
 wire [7:0]  fifo_drop;          // FIFO f drop strobe (rx_clk of its source)
+// generator / checker configuration (ctrl_clk) and status (into ctrl_clk)
+localparam GCFG_W = 3 + 14 + 14 + 16 + 32 + 48 + 48 + 16 + 32 + 32;   // 255
+localparam CCFG_W = 2 + 16;
+localparam GST_W  = 2 + 64 + 64;
+localparam CST_W  = 4 * 32 + 64;
+wire [4*GCFG_W-1:0] gen_cfg;
+wire [4*CCFG_W-1:0] chk_cfg;
+wire [4*GST_W-1:0]  gen_st;
+wire [4*CST_W-1:0]  chk_st;
 
 // FIFO f = 2*n + k: TX port n = f/2, k = 0 LOOP (source n), k = 1 FWD (source n^1)
 wire [8*16-1:0] f_tdata;
@@ -412,27 +423,107 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
 
     // ---- TX source select (tx_clk[n]) ----
     wire [1:0] tmode  = mode_tx_all[8*n + 2*n +: 2];
-    wire [1:0] target = (tmode == 2'd3) ? 2'd0 : tmode;
-    reg  [1:0] sel = 2'd0;          // 0 none, 1 LOOP FIFO (2n), 2 FWD FIFO (2n+1)
-    reg  [1:0] fin = 2'b00;         // FIFO output is inside a frame
-    wire [1:0] hs = {f_tvalid[2*n+1] && f_tready[2*n+1], f_tvalid[2*n] && f_tready[2*n]};
+    wire [1:0] target = tmode;
+    reg  [1:0] sel = 2'd0;          // 0 none, 1 LOOP FIFO (2n), 2 FWD FIFO (2n+1), 3 GEN
+    reg  [2:0] fin = 3'b000;        // FIFO / generator output is inside a frame
+
+    // ---- traffic generator (tx_clk[n]) ----
+    wire [GCFG_W-1:0] gcfg;
+    taxi_sync_signal #(.WIDTH(GCFG_W), .N(2)) gcfg_sync_inst (
+        .clk(tx_clk[n]), .in(gen_cfg[GCFG_W*n +: GCFG_W]), .out(gcfg));
+    wire [15:0] g_tdata;
+    wire [1:0]  g_tkeep;
+    wire        g_tvalid, g_tlast, g_running, g_done;
+    wire [63:0] g_frames, g_bytes;
+    wire        g_tready = (sel == 2'd3) ? tx_tready[n] : 1'b0;
+    pktrec_gen gen_inst (
+        .clk(tx_clk[n]), .rst(tx_rst[n]),
+        .enable(gcfg[0]), .allow(sel == 2'd3), .fmt_raw(gcfg[1]), .rand_len(gcfg[2]),
+        .len(gcfg[3 +: 14]), .len_mask(gcfg[17 +: 14]), .ifg(gcfg[31 +: 16]),
+        .count(gcfg[47 +: 32]), .dst(gcfg[79 +: 48]), .src(gcfg[127 +: 48]),
+        .etype(gcfg[175 +: 16]), .stream(gcfg[191 +: 32]), .seq_first(gcfg[223 +: 32]),
+        .m_tdata(g_tdata), .m_tkeep(g_tkeep), .m_tvalid(g_tvalid), .m_tready(g_tready),
+        .m_tlast(g_tlast), .running(g_running), .done(g_done), .frames(g_frames), .bytes(g_bytes)
+    );
+    // status snapshot tx_clk[n] -> ctrl_clk
+    reg  [GST_W-1:0] gst_hold = {GST_W{1'b0}};
+    reg              gst_send = 1'b0;
+    wire             gst_rcv, gst_req;
+    wire [GST_W-1:0] gst_out;
+    reg  [GST_W-1:0] gst_q = {GST_W{1'b0}};
+    always @(posedge tx_clk[n]) begin
+        if (!gst_send && !gst_rcv) begin
+            gst_hold <= {g_bytes, g_frames, g_done, g_running};
+            gst_send <= 1'b1;
+        end else if (gst_send && gst_rcv) begin
+            gst_send <= 1'b0;
+        end
+    end
+    xpm_cdc_handshake #(.DEST_EXT_HSK(0), .DEST_SYNC_FF(3), .INIT_SYNC_FF(1), .SIM_ASSERT_CHK(0),
+                        .SRC_SYNC_FF(3), .WIDTH(GST_W))
+    gst_cdc (.src_clk(tx_clk[n]), .src_in(gst_hold), .src_send(gst_send), .src_rcv(gst_rcv),
+             .dest_clk(ctrl_clk), .dest_req(gst_req), .dest_ack(1'b0), .dest_out(gst_out));
+    always @(posedge ctrl_clk) if (gst_req) gst_q <= gst_out;
+    assign gen_st[GST_W*n +: GST_W] = gst_q;
+
+    // ---- receive checker (rx_clk[n]) ----
+    wire [CCFG_W-1:0] ccfg;
+    taxi_sync_signal #(.WIDTH(CCFG_W), .N(2)) ccfg_sync_inst (
+        .clk(rx_clk[n]), .in(chk_cfg[CCFG_W*n +: CCFG_W]), .out(ccfg));
+    wire [31:0] c_frames, c_lost, c_errors, c_bad;
+    wire [63:0] c_last;
+    pktrec_gen_chk chk_inst (
+        .clk(rx_clk[n]), .rst(rx_rst[n]), .enable(ccfg[0]), .fmt_raw(ccfg[1]), .etype(ccfg[2 +: 16]),
+        .s_tdata(rx_tdata[16*n +: 16]), .s_tvalid(rx_tvalid[n]), .s_tlast(rx_tlast[n]),
+        .s_tbad(rx_tbad[n]),
+        .frames(c_frames), .lost(c_lost), .errors(c_errors), .bad(c_bad), .last_seq(c_last)
+    );
+    reg  [CST_W-1:0] cst_hold = {CST_W{1'b0}};
+    reg              cst_send = 1'b0;
+    wire             cst_rcv, cst_req;
+    wire [CST_W-1:0] cst_out;
+    reg  [CST_W-1:0] cst_q = {CST_W{1'b0}};
+    always @(posedge rx_clk[n]) begin
+        if (!cst_send && !cst_rcv) begin
+            cst_hold <= {c_last, c_bad, c_errors, c_lost, c_frames};
+            cst_send <= 1'b1;
+        end else if (cst_send && cst_rcv) begin
+            cst_send <= 1'b0;
+        end
+    end
+    xpm_cdc_handshake #(.DEST_EXT_HSK(0), .DEST_SYNC_FF(3), .INIT_SYNC_FF(1), .SIM_ASSERT_CHK(0),
+                        .SRC_SYNC_FF(3), .WIDTH(CST_W))
+    cst_cdc (.src_clk(rx_clk[n]), .src_in(cst_hold), .src_send(cst_send), .src_rcv(cst_rcv),
+             .dest_clk(ctrl_clk), .dest_req(cst_req), .dest_ack(1'b0), .dest_out(cst_out));
+    always @(posedge ctrl_clk) if (cst_req) cst_q <= cst_out;
+    assign chk_st[CST_W*n +: CST_W] = cst_q;
+
+    // ---- TX source select ----
+    wire [2:0] hs = {g_tvalid && g_tready,
+                     f_tvalid[2*n+1] && f_tready[2*n+1], f_tvalid[2*n] && f_tready[2*n]};
 
     assign f_tready[2*n]   = (sel == 2'd1) ? tx_tready[n] : 1'b1;   // unselected: drain
     assign f_tready[2*n+1] = (sel == 2'd2) ? tx_tready[n] : 1'b1;
-    assign tx_tvalid[n] = (sel == 2'd1) ? f_tvalid[2*n] : (sel == 2'd2) ? f_tvalid[2*n+1] : 1'b0;
-    assign tx_tdata[16*n +: 16] = (sel == 2'd2) ? f_tdata[16*(2*n+1) +: 16] : f_tdata[16*(2*n) +: 16];
-    assign tx_tkeep[2*n +: 2]   = (sel == 2'd2) ? f_tkeep[2*(2*n+1) +: 2]  : f_tkeep[2*(2*n) +: 2];
-    assign tx_tlast[n]          = (sel == 2'd2) ? f_tlast[2*n+1] : f_tlast[2*n];
-    assign tx_tuser[n]          = (sel == 2'd2) ? f_tuser[2*n+1] : f_tuser[2*n];
+    assign tx_tvalid[n] = (sel == 2'd1) ? f_tvalid[2*n] : (sel == 2'd2) ? f_tvalid[2*n+1] :
+                          (sel == 2'd3) ? g_tvalid : 1'b0;
+    assign tx_tdata[16*n +: 16] = (sel == 2'd3) ? g_tdata :
+                                  (sel == 2'd2) ? f_tdata[16*(2*n+1) +: 16] : f_tdata[16*(2*n) +: 16];
+    assign tx_tkeep[2*n +: 2]   = (sel == 2'd3) ? g_tkeep :
+                                  (sel == 2'd2) ? f_tkeep[2*(2*n+1) +: 2]  : f_tkeep[2*(2*n) +: 2];
+    assign tx_tlast[n]          = (sel == 2'd3) ? g_tlast :
+                                  (sel == 2'd2) ? f_tlast[2*n+1] : f_tlast[2*n];
+    assign tx_tuser[n]          = (sel == 2'd3) ? 1'b0 :
+                                  (sel == 2'd2) ? f_tuser[2*n+1] : f_tuser[2*n];
 
     always @(posedge tx_clk[n]) begin
         if (hs[0]) fin[0] <= !f_tlast[2*n];
         if (hs[1]) fin[1] <= !f_tlast[2*n+1];
-        // change source only when neither FIFO output is inside a frame
-        if (hs == 2'b00 && fin == 2'b00) sel <= target;
+        if (hs[2]) fin[2] <= !g_tlast;
+        // change source only when no source output is inside a frame
+        if (hs == 3'b000 && fin == 3'b000) sel <= target;
         if (tx_rst[n]) begin
             sel <= 2'd0;
-            fin <= 2'b00;
+            fin <= 3'b000;
         end
     end
 
@@ -477,6 +568,10 @@ pktrec_m0_regs #(
     .io(io_s),
     .link_up(link_up),
     .path_mode(path_mode),
+    .gen_cfg(gen_cfg),
+    .chk_cfg(chk_cfg),
+    .gen_st(gen_st),
+    .chk_st(chk_st),
     .s_axi_awaddr(s_axi_awaddr),
     .s_axi_awvalid(s_axi_awvalid),
     .s_axi_awready(s_axi_awready),
