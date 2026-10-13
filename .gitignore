@@ -11,6 +11,7 @@ docs/build/
 bootimages/
 Yocto/offline.txt
 # UPDATER START
+Vivado/zcu106/
 # UPDATER END
 dfx_runtime.txt
 .repo.yaml
