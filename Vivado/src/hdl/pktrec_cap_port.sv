@@ -325,7 +325,9 @@ logic            d_ready;
 
 assign fifo_m.tready = d_ready;
 
-wire dp_fifo_rst = dp_rst | rx_rst_dp;
+// Each side gets its own (synchronous) reset only: the Taxi FIFO carries a
+// reset of either side to the other side through its own reset synchronisers
+// (no combinational logic in front of them, report_cdc CDC-10).
 
 taxi_axis_async_fifo_adapter #(
     .DEPTH(FIFO_BYTES),
@@ -338,10 +340,10 @@ taxi_axis_async_fifo_adapter #(
     .DROP_WHEN_FULL(1'b1)
 ) data_fifo (
     .s_clk(rx_clk),
-    .s_rst(rx_srst),
+    .s_rst(rx_rst),
     .s_axis(fifo_s),
     .m_clk(dp_clk),
-    .m_rst(dp_fifo_rst),
+    .m_rst(dp_rst),
     .m_axis(fifo_m),
     .s_pause_req(1'b0),
     .s_pause_ack(),
