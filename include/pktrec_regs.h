@@ -122,11 +122,13 @@
 /* ------------------------------------------------------------------------- */
 #define PKTREC_M0_ID               0x000   /* RO 0x504B4D30 "PKM0" */
 #define PKTREC_M0_ID_VALUE         0x504B4D30
-#define PKTREC_M0_VERSION          0x004   /* RO 0x00010000 */
+#define PKTREC_M0_VERSION          0x004   /* RO 0x00010001 (1.1: traffic generator + checker) */
+#define PKTREC_M0_VERSION_1_1      0x00010001
 #define PKTREC_M0_PATH_CTRL        0x008   /* RW [2n+1:2n] TX source of port n (reset 0) */
 #define   PKTREC_M0_PATH_IDLE            0u          /* nothing is sent */
 #define   PKTREC_M0_PATH_LOOP            1u          /* own RX (RX n -> TX n) */
 #define   PKTREC_M0_PATH_FWD             2u          /* pair partner's RX (RX n^1 -> TX n) */
+#define   PKTREC_M0_PATH_GEN             3u          /* the port's traffic generator (1.1) */
 #define   PKTREC_M0_PATH_SHIFT(n)        (2 * (n))
 #define PKTREC_M0_CNT_CTRL         0x00C   /* WO [0] 1 = clear all counters and IO_STICKY */
 #define PKTREC_M0_IO_STATUS        0x010   /* RO [3:0] GPIO_0 P0..P3, [7:4] GPIO_1 P0..P3,
@@ -143,6 +145,59 @@
 #define PKTREC_M0_P_DROP_FWD       0x14    /* frames for TX n dropped by the FWD FIFO */
 #define PKTREC_M0_P_GPIO0_EDGES    0x18    /* rising edges of GPIO_0 (RX SFD) */
 #define PKTREC_M0_P_GPIO1_EDGES    0x1C    /* rising edges of GPIO_1 (TX SFD) */
+/* (since M2 the GPIO levels and edges come from the SFD sampler in the capture
+ * block -- pktrec_sfd_io, sampled at ~1 ns -- re-synchronised into ctrl_clk;
+ * IO_STATUS / IO_STICKY / GPIOn_EDGES behave as before) */
+
+/*
+ * pktrec_m0_path: per-port traffic generator (pktrec_gen) and receive checker
+ * (pktrec_gen_chk), register map 1.1, at PKTREC_M0_GEN(n) + offset.
+ * The generator sends when PATH_CTRL selects PKTREC_M0_PATH_GEN for the port
+ * and GEN_CTRL.ENABLE goes 0 -> 1 (which reloads SEQ_FIRST / COUNT and clears
+ * GEN_FRAMES / GEN_BYTES). Change the other GEN_* registers only while stopped.
+ * Frame formats (LEN = bytes without FCS, 60..16383; the MAC appends the FCS):
+ *   FORMAT 0 (PRSQ): the exact layout of test/gen_seq.py (Ethernet / IPv4
+ *     192.0.2.1 -> 192.0.2.2 / UDP 50000 -> 50001 / "PRSQ" / stream u32 BE /
+ *     sequence u64 BE / zeros), so test/check_pcap.py verifies it unchanged
+ *     (stream key "prsq:<GEN_STREAM>")
+ *   FORMAT 1 (raw):  dst / src / GEN_ETYPE / sequence u32 BE / zeros
+ * Rate: one frame start at most every ceil((LEN + 4 + 8 + GEN_IFG) / 2) tx_clk
+ * cycles (16 ns); GEN_IFG = 12 is line rate. Frames longer than the MAC's
+ * TX_MAX_LEN (1518 incl. FCS by default) are cut by the MAC: raise
+ * PKTREC_ETH_P_TX_MAX_LEN for jumbo frames.
+ * The checker counts in-order / lost / duplicate sequence numbers of received
+ * generator frames (CHK_CTRL.FORMAT / ETYPE select the format; one stream per
+ * port); CHK_CTRL.ENABLE 0 -> 1 clears its counters.
+ * 64-bit values: reading _LO latches _HI (one latch per port).
+ */
+#define PKTREC_M0_GEN(n)           (0x200 + (n) * 0x80)
+#define PKTREC_M0_GEN_CTRL         0x00    /* RW */
+#define   PKTREC_M0_GEN_CTRL_ENABLE      (1u << 0)
+#define   PKTREC_M0_GEN_CTRL_RAW         (1u << 1)   /* FORMAT 1 */
+#define   PKTREC_M0_GEN_CTRL_RAND_LEN    (1u << 2)   /* LEN + (LFSR & LEN_MASK) per frame */
+#define PKTREC_M0_GEN_STATUS       0x04    /* RO [0] running, [1] done (COUNT reached) */
+#define PKTREC_M0_GEN_LEN          0x08    /* RW [13:0] bytes without FCS (reset 60) */
+#define PKTREC_M0_GEN_LEN_MASK     0x0C    /* RW [13:0] random length mask (reset 0) */
+#define PKTREC_M0_GEN_IFG          0x10    /* RW [15:0] inter-frame gap, bytes (reset 12) */
+#define PKTREC_M0_GEN_COUNT        0x14    /* RW frames per start, 0 = until stopped */
+#define PKTREC_M0_GEN_DST_LO       0x18    /* RW dst MAC bytes 2..5 (byte 5 = [7:0]) */
+#define PKTREC_M0_GEN_DST_HI       0x1C    /* RW [15:0] dst MAC bytes 0..1 (reset ff:ff:..) */
+#define PKTREC_M0_GEN_SRC_LO       0x20    /* RW src MAC (reset 02:00:00:00:00:0n) */
+#define PKTREC_M0_GEN_SRC_HI       0x24
+#define PKTREC_M0_GEN_ETYPE        0x28    /* RW [15:0] raw format EtherType (0x88B5) */
+#define PKTREC_M0_GEN_STREAM       0x2C    /* RW PRSQ stream id (reset n) */
+#define PKTREC_M0_GEN_SEQ_FIRST    0x30    /* RW first sequence number */
+#define PKTREC_M0_GEN_FRAMES_LO    0x34    /* RO 64: frames sent since the last start */
+#define PKTREC_M0_GEN_FRAMES_HI    0x38
+#define PKTREC_M0_GEN_BYTES_LO     0x3C    /* RO 64: wire bytes incl. FCS (no preamble/IFG) */
+#define PKTREC_M0_GEN_BYTES_HI     0x40
+#define PKTREC_M0_CHK_CTRL         0x48    /* RW [0] ENABLE, [1] FORMAT raw, [31:16] ETYPE */
+#define PKTREC_M0_CHK_FRAMES       0x4C    /* RO good generator frames received */
+#define PKTREC_M0_CHK_LOST         0x50    /* RO sum of sequence gaps */
+#define PKTREC_M0_CHK_ERRORS       0x54    /* RO duplicate / out-of-order sequence numbers */
+#define PKTREC_M0_CHK_BAD          0x58    /* RO generator frames with a MAC error */
+#define PKTREC_M0_CHK_LAST_SEQ_LO  0x5C    /* RO 64: highest sequence number seen */
+#define PKTREC_M0_CHK_LAST_SEQ_HI  0x60
 
 /* ------------------------------------------------------------------------- */
 /* pktrec_capture: capture control, counters and timebase (dp_clk domain)    */
@@ -202,10 +257,13 @@
  */
 #define PKTREC_CAP_ID              0x000   /* RO 0x504B4350 "PKCP" */
 #define PKTREC_CAP_ID_VALUE        0x504B4350
-#define PKTREC_CAP_VERSION         0x004   /* RO 0x00010001: register map 1.1, record format v1
+#define PKTREC_CAP_VERSION         0x004   /* RO 0x00010002: register map 1.2, record format v1
                                               1.1 vs 1.0: TB_STATUS / STATUS[23:16] = MAC clock
-                                              domain valid (no "locked" anymore), new MAC_OFFSET */
+                                              domain valid (no "locked" anymore), new MAC_OFFSET
+                                              1.2: PHY SFD timestamping (PKTREC_SFD_*, 0x400..),
+                                              records carry SFD timestamps (flags bit2/bit3) */
 #define PKTREC_CAP_VERSION_1_1     0x00010001
+#define PKTREC_CAP_VERSION_1_2     0x00010002
 #define PKTREC_CAP_CTRL            0x008   /* RW */
 #define   PKTREC_CAP_CTRL_ENABLE         (1u << 0)   /* global capture enable (reset 0);
                                                         sampled at each frame's start */
@@ -301,5 +359,102 @@
 #define PKTREC_CAP_P_FIFO_HWM        0x38  /* RW 32: frame FIFO high-water mark in bytes;
                                               any write clears it; CTRL.CLEAR clears it too */
 #define PKTREC_CAP_P_SEQ_NEXT        0x3C  /* RO [15:0] seq of the next frame */
+
+/* ------------------------------------------------------------------------- */
+/* pktrec_capture: PHY SFD timestamping (M2, pktrec_sfd), capture block      */
+/* offsets 0x400..0xBFF (dp_clk)                                             */
+/* ------------------------------------------------------------------------- */
+/*
+ * Each DP83867 drives GPIO_0 high from the RX start-of-frame delimiter to the
+ * end of the frame and GPIO_1 likewise for TX (pktrec-phy init: GPIO_MUX_CTRL
+ * 0x0012). The eight pins are oversampled by ISERDESE3 at 4 samples per dp_clk
+ * cycle (~1.0 ns, SFD_RES_PS) and every rising edge that passes the glitch
+ * filter (low for >= SFD_MIN_LOW cycles before, high for >= SFD_MIN_HIGH after)
+ * gets a timestamp of the shared timebase: t_sfd = time of the first high
+ * sample, sampler pipeline removed (SFD_PIPE_NS). Quantisation: the timestamp
+ * is up to 1 sample (1 ns) earlier than the true pin edge (uniform in (-1, 0]
+ * ns in simulation); plus the constant pin/translator/PHY offset, calibrated
+ * per port with RX_OFFSET / TX_OFFSET.
+ *
+ * RX: each edge is queued (16 entries) for port n's capture front end, which
+ * matches it to the received frame (oldest entry whose raw delta d =
+ * MAC_raw - t_sfd lies in [RX_WIN_MIN, RX_WIN_MAX]; MAC_raw = the MAC's cycle
+ * stamp x ~4 ns, MAC_OFFSET NOT applied): match -> record ts = t_sfd +
+ * RX_OFFSET, flags bit2 (TS_MAC) = 0; older entries are dropped as stale
+ * (RX_STALE, flags bit3 SFD_RESYNC on that frame); no entry -> MAC timestamp
+ * (bit2 = 1) and RX_MISMATCH. Every frame consumes its entry, also frames that
+ * are dropped or not captured. The window must stay narrower than one minimum
+ * frame time (672 ns at 1 Gb/s) so that neighbouring frames' SFDs can never
+ * fall inside it.
+ * TX: each edge is paired in order with the MAC's TX completions of port n
+ * (lat = t_sfd - cpl_raw in [TX_WIN_MIN, TX_WIN_MAX]; older completions are
+ * stale): TX_LAT_LAST/MIN/MAX = MAC SFD (cycle stamp, no MAC_OFFSET) -> PHY
+ * TX SFD pin.
+ * All deltas (RX_DELTA_*, RX_HEAD_DELTA, TX_LAT_*) are raw: no RX/TX_OFFSET, no
+ * MAC_OFFSET; signed ns; 0x80000000 = none yet. *_HEAD_* = the delta of the
+ * last entry evaluated, whatever the outcome (use it to place the window).
+ * Log FIFOs (SFD_CTRL.LOG_EN): the last 16 RX / TX SFD timestamps per port
+ * (+ the TX latency of each TX edge) for software, e.g. TAP latency =
+ * TX SFD (P1) - RX SFD (P0) of the same frame. Reading *_LOG_TS_LO pops the
+ * oldest entry and latches _HI (and TX_LOG_LAT); read _LO, _HI, (_LAT).
+ * 64-bit counters: reading _LO latches _HI (per value). CTRL.CLEAR (capture)
+ * and SFD_CTRL.CLEAR clear all SFD counters, min/max and logs.
+ */
+#define PKTREC_SFD_CTRL            0x400   /* RW */
+#define   PKTREC_SFD_CTRL_MATCH_EN       (1u << 0)   /* reset 1; 0 = all records MAC-stamped */
+#define   PKTREC_SFD_CTRL_LOG_EN         (1u << 1)   /* reset 0 */
+#define   PKTREC_SFD_CTRL_CLEAR          (1u << 8)   /* self-clearing */
+#define PKTREC_SFD_STATUS          0x404   /* RO [0] sampler MMCM locked, [1] ISERDES sampler
+                                              (0 = IDDR, 2 ns), [11:8] RX SFD levels P0..P3,
+                                              [15:12] TX SFD levels */
+#define PKTREC_SFD_RES_PS          0x408   /* RO sample spacing, ps (1000) */
+#define PKTREC_SFD_PIPE_NS         0x40C   /* RO sampler pipeline removed from t_sfd (16) */
+#define PKTREC_SFD_RX_WIN_MIN      0x410   /* RW signed ns (reset 100) */
+#define PKTREC_SFD_RX_WIN_MAX      0x414   /* RW signed ns (reset 700) */
+#define PKTREC_SFD_TX_WIN_MIN      0x418   /* RW signed ns (reset 0) */
+#define PKTREC_SFD_TX_WIN_MAX      0x41C   /* RW signed ns (reset 900) */
+#define PKTREC_SFD_MIN_LOW         0x420   /* RW [7:0] dp_clk cycles low before an edge (25) */
+#define PKTREC_SFD_MIN_HIGH        0x424   /* RW [7:0] dp_clk cycles high after an edge (8) */
+
+#define PKTREC_SFD_PORT(n)         (0x800 + (n) * 0x100)
+#define PKTREC_SFD_P_RX_EDGES_LO     0x00  /* RO 64: accepted RX SFD edges */
+#define PKTREC_SFD_P_RX_EDGES_HI     0x04
+#define PKTREC_SFD_P_RX_GLITCH       0x08  /* RO edges rejected by the glitch filter */
+#define PKTREC_SFD_P_RX_FIFO_OVF     0x0C  /* RO edges lost: match queue full */
+#define PKTREC_SFD_P_RX_MATCHED_LO   0x10  /* RO 64: frames with an SFD timestamp */
+#define PKTREC_SFD_P_RX_MATCHED_HI   0x14
+#define PKTREC_SFD_P_RX_STALE        0x18  /* RO SFD entries discarded (no frame) */
+#define PKTREC_SFD_P_RX_MISMATCH     0x1C  /* RO frames that fell back to the MAC ts */
+#define PKTREC_SFD_P_RX_DELTA_LAST   0x20  /* RO signed ns MAC_raw - t_sfd of the last match */
+#define PKTREC_SFD_P_RX_DELTA_MIN    0x24
+#define PKTREC_SFD_P_RX_DELTA_MAX    0x28
+#define PKTREC_SFD_P_RX_HEAD_DELTA   0x2C  /* RO delta of the last evaluated entry */
+#define PKTREC_SFD_P_RX_LAST_TS_LO   0x30  /* RO 64: latest RX SFD time (+ RX_OFFSET) */
+#define PKTREC_SFD_P_RX_LAST_TS_HI   0x34
+#define PKTREC_SFD_P_RX_OFFSET       0x38  /* RW signed ns added to RX SFD times (0) */
+#define PKTREC_SFD_P_RX_LOG_STATUS   0x3C  /* RO [4:0] entries, [31:16] overflows */
+#define PKTREC_SFD_P_RX_LOG_TS_LO    0x40  /* RO pop */
+#define PKTREC_SFD_P_RX_LOG_TS_HI    0x44
+#define PKTREC_SFD_P_TX_EDGES_LO     0x80  /* RO 64: accepted TX SFD edges */
+#define PKTREC_SFD_P_TX_EDGES_HI     0x84
+#define PKTREC_SFD_P_TX_GLITCH       0x88
+#define PKTREC_SFD_P_TX_CPL_OVF      0x8C  /* RO completions lost: pairing queue full */
+#define PKTREC_SFD_P_TX_CPL_LO       0x90  /* RO 64: MAC TX completions (frames sent) */
+#define PKTREC_SFD_P_TX_CPL_HI       0x94
+#define PKTREC_SFD_P_TX_PAIRED       0x98  /* RO TX edges paired with a completion */
+#define PKTREC_SFD_P_TX_CPL_STALE    0x9C  /* RO completions without an SFD edge */
+#define PKTREC_SFD_P_TX_UNPAIRED     0xA0  /* RO TX edges without a completion */
+#define PKTREC_SFD_P_TX_LAT_LAST     0xA4  /* RO signed ns t_sfd - cpl_raw */
+#define PKTREC_SFD_P_TX_LAT_MIN      0xA8
+#define PKTREC_SFD_P_TX_LAT_MAX      0xAC
+#define PKTREC_SFD_P_TX_LAST_TS_LO   0xB0  /* RO 64: latest TX SFD time (+ TX_OFFSET) */
+#define PKTREC_SFD_P_TX_LAST_TS_HI   0xB4
+#define PKTREC_SFD_P_TX_OFFSET       0xB8  /* RW signed ns added to TX SFD times (0) */
+#define PKTREC_SFD_P_TX_LOG_STATUS   0xBC  /* RO [4:0] entries, [31:16] overflows */
+#define PKTREC_SFD_P_TX_LOG_TS_LO    0xC0  /* RO pop */
+#define PKTREC_SFD_P_TX_LOG_TS_HI    0xC4
+#define PKTREC_SFD_P_TX_LOG_LAT      0xC8  /* RO latency of the popped entry (0x80000000 = none) */
+#define PKTREC_SFD_P_TX_HEAD_LAT     0xCC  /* RO latency of the last evaluated completion */
+#define PKTREC_SFD_NONE            0x80000000u
 
 #endif /* PKTREC_REGS_H */
