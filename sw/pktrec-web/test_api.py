@@ -101,6 +101,17 @@ def main():
     print(f"        version: {st['version']}, errors: {st['errors']}")
     check(st["errors"]["pktrec-phy"] is None and st["errors"]["pktrec-cap"] is None,
           "pktrec-phy status and pktrec-cap stats ran")
+    check(st.get("sources") == {"pktrec-phy": "json", "pktrec-cap": "json"},
+          f"tools read through --json ({st.get('sources')})")
+    tb = st["time"].get("discipline") or {}
+    print(f"        timebase: {json.dumps(tb)[:300]}")
+    check(tb.get("fresh") is True and "locked" in tb and "offset_ns" in tb and "ppm" in tb,
+          f"timebase discipline: pktrec-tb running, {'locked' if tb.get('locked') else 'NOT locked'}"
+          f", offset {tb.get('offset_ns')} ns, {tb.get('ppm')} ppm")
+    cal = st.get("calibration") or {}
+    print(f"        calibration: {json.dumps(cal)[:300]}")
+    check(cal.get("present") is True and (cal.get("applied") or {}).get("ok") is True,
+          "calibration file present and applied at boot")
     if not check(st["disk"]["mounted"], "SSD mounted"):
         print("cannot test captures without the SSD")
     if st["capture"]["state"] != "idle":
@@ -178,6 +189,8 @@ def main():
         print(f"        {c['state']} {c.get('elapsed_s', 0):.1f}s file {c.get('file_bytes')} B "
               f"live {json.dumps(live)[:160] if live else None}")
     check(live is not None and "ring_total" in live, "live statistics parsed from pktrec-cap")
+    check(live is not None and live.get("source") == "json" and "written_bytes" in live,
+          "live statistics from pktrec-cap --stats-json")
     s, r, _ = call(base, "GET", "/api/captures")
     check(any(c["name"] == name and c["recording"] for c in r["captures"]),
           "listed as recording")
@@ -188,6 +201,8 @@ def main():
     last = st3["capture"]["last"] if st3 else None
     check(last and last["name"] == name and last["exit_code"] in (0, 2),
           f"result: exit {last and last['exit_code']} {last and last['result']}")
+    check(last and "bytes" in last["result"] and "records" in last["result"],
+          "result fields (bytes, records)")
 
     print("duration-limited capture")
     name2 = tag + "-dur"
@@ -210,6 +225,9 @@ def main():
     s, r, _ = call(base, "GET", f"/api/captures/{name2}/info")
     check(s == 200 and bool(r.get("info_text")) and r.get("snaplen") == 128,
           "info: header fields + pktrec-cap info text")
+    tbd = r.get("tb_discipline")
+    check(isinstance(tbd, dict) and "offset_ns" in tbd and "locked" in tbd,
+          f"info: timebase discipline at start recorded ({json.dumps(tbd)})")
     print("        " + (r.get("info_text") or "").strip().replace("\n", "\n        ")[:900])
 
     print("downloads")

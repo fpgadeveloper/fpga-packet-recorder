@@ -4,22 +4,27 @@
 """mock_tools.py - stand-ins for pktrec-cap and pktrec-phy, for testing
 pktrec-web on a PC (pktrec-web --mock). Host test only; not installed.
 
-They print exactly the text formats of the real tools (sw/pktrec-apps/pktrec-cap.c
-'stats' / live statistics / RESULT line, sw/pktrec-tools/pktrec-phy 'status'),
-so the server's parsers are exercised end to end. State lives in
-$PKTREC_MOCK_STATE (JSON files).
+They print exactly the formats of the real tools: the JSON outputs the server
+uses (sw/pktrec-apps/pktrec-cap.c 'stats --json' / 'record --stats-json',
+sw/pktrec-tools/pktrec-phy 'status --json') and the text formats it falls back
+to ('stats' / live statistics / RESULT line, 'status'), so the server's parsers
+are exercised end to end. State lives in $PKTREC_MOCK_STATE (JSON files).
 
   mock_tools.py cap record [--ports L] [--snaplen N] [--duration S] [--size B]
-                           [--stats S] <file>
-      fake capture: live statistics on stderr every --stats seconds; stops on
+                           [--stats S] [--stats-json] <file>
+      fake capture: live statistics on stderr every --stats seconds (and as JSON
+      lines on stdout with --stats-json); stops on
       SIGTERM/SIGINT, --duration or --size; then writes a real capture file
       with test/make_synth_capture.py (4 ports of sequence-numbered frames,
       whatever --ports says) so pktrec-export can convert it. An output name
       containing 'mockfail' fails at start (exit 1), like a missing /dev/fdrec0.
-  mock_tools.py cap stats
+  mock_tools.py cap stats [--json]
   mock_tools.py cap info <file>
-  mock_tools.py phy status
+  mock_tools.py phy status [--json]
   mock_tools.py phy path <port|all> idle|loop|fwd
+  mock_tools.py tb       refresh the pktrec-tb state files in $PKTREC_MOCK_STATE:
+                         tb.json (a locked daemon), calibration.conf (the shipped
+                         default) and calibration.json (applied at "boot")
 """
 
 import argparse
@@ -81,9 +86,27 @@ def fmt_rate(v, unit):
 
 
 # ---------------------------------------------------------------- cap
-def cap_stats(_a):
+def cap_stats(a):
     c, running, mask = counters()
     tb = time.time_ns()
+    if a.json:                                     # pktrec-cap stats --json
+        print(json.dumps({
+            "time_ns": tb, "cap_version": "0x00010002", "ctrl": f"0x{5 if running else 0:08x}",
+            "enabled": bool(running), "source": "capture" if running else "TPG", "fill": False,
+            "status": "0x00000001", "idle": True, "port_en": mask if running else 0,
+            "snaplen": 0, "fifo_bytes": 16384, "dp_clk_hz": 249975006, "timebase_ns": tb,
+            "timebase": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(tb / 1e9))
+            + f".{tb % 1000000000:09d} UTC", "tb_inc_ns": 4, "tb_inc_frac": 0x0006db8b + 44740,
+            "tb_inc": 4.000441593, "tb_freq_ppb": 10412.0, "tb_status": "0xff",
+            "merge": {"records": sum(x["records"] for x in c), "bytes_out": 0, "fill_units": 0,
+                      "bp_cycles": 0, "srst_aborts": 0, "len_fixups": 0},
+            "ports": [{"port": p, "link": LINK[p], "enabled": bool(running and mask >> p & 1),
+                       "frames_rx": x["frames_rx"], "frames_bad": x["bad"],
+                       "frames_drop": x["drop"], "frames_trunc": x["trunc"],
+                       "bytes_rx": x["bytes_rx"], "bytes_drop": 0, "records": x["records"],
+                       "fifo_hwm": x["hwm"], "seq": x["seq"], "frames_s": None, "bits_s": None}
+                      for p, x in enumerate(c)]}, separators=(",", ":")))
+        return 0
     print(f"capture  version 0x00010001  CTRL 0x{3 if running else 0:08x} "
           f"({'ENABLED' if running else 'disabled'}, source = "
           f"{'capture' if running else 'TPG'})  STATUS 0x00000001 (idle)")
@@ -160,6 +183,19 @@ def cap_record(a):
                              f" {fmt_rate((c[p]['bytes_rx'] - last_c[p]['bytes_rx']) * 8 / dt, 'b')}/s"
                              f" d{c[p]['drop']}")
             print(line, file=sys.stderr, flush=True)
+            if a.stats_json:
+                print(json.dumps({
+                    "type": "stats", "final": False, "elapsed_s": round(el, 3),
+                    "write_mb_s": round(bw / dt / 1e6, 3), "written_bytes": int(written),
+                    "written_gb": written / 1e9, "ring_used": int(el * 7) % 9, "ring_total": 32,
+                    "backpressure_pct": 0.0, "drops": sum(c[p]["drop"] for p in range(4)
+                                                          if mask >> p & 1),
+                    "ports": {str(p): {"frames_s": (c[p]["frames_rx"] - last_c[p]["frames_rx"]) / dt,
+                                       "bits_s": (c[p]["bytes_rx"] - last_c[p]["bytes_rx"]) * 8 / dt,
+                                       "drops": c[p]["drop"], "frames_rx": c[p]["frames_rx"],
+                                       "bytes_rx": c[p]["bytes_rx"], "fifo_hwm": c[p]["hwm"]}
+                              for p in range(4) if mask >> p & 1}},
+                    separators=(",", ":")), flush=True)
             last_t, last_c = now, c
             if a.size and written >= a.size:
                 stop["why"] = "size"
@@ -180,6 +216,8 @@ def cap_record(a):
             flags |= {"time": 8, "size": 4}.get(stop["why"], 0)
             struct.pack_into("<I", raw, 20, flags)
             struct.pack_into("<QQ", raw, 48, int(t0 * 1e9), int(t1 * 1e9))
+            # tb_disc_*: valid, daemon, locked, NTP synced; +1.234 us, +10.412 ppm
+            struct.pack_into("<IIqqQ", raw, 568, 0xF, 600, 1234, 10412, int(t0 * 1e9))
             f.seek(0)
             f.write(raw)
     data = os.path.getsize(a.file) - 4096
@@ -187,6 +225,11 @@ def cap_record(a):
           f"({data / max(t1 - t0, 1e-3) / 1e6:.1f} MB/s) [MOCK]")
     print(f"RESULT bytes={data} records={frames * 4} seconds={t1 - t0:.3f} drops=0 "
           "rec_drop_beats=0 len_fixups=0 error=0")
+    if a.stats_json:
+        print(json.dumps({"type": "result", "exit_code": 0, "bytes": data,
+                          "records": frames * 4, "seconds": round(t1 - t0, 3), "drops": 0,
+                          "rec_drop_beats": 0, "dma_errors": 0, "len_fixups": 0, "error": 0},
+                         separators=(",", ":")), flush=True)
     return 0
 
 
@@ -209,8 +252,26 @@ def cap_info(a):
 PHY_ADDR = [0x01, 0x03, 0x0C, 0x0F]
 
 
-def phy_status(_a):
+def phy_status(a):
     paths = load("phy.json", ["idle"] * 4)
+    if a.json:                                     # pktrec-phy status --json
+        ports = []
+        for n in range(4):
+            up = LINK[n] != "down"
+            ports.append({
+                "port": n, "phy_addr": PHY_ADDR[n],
+                "copper": {"up": up, "speed": LINK[n] if up else None,
+                           "full_duplex": True if up else None, "error": None},
+                "pcs": {"sync": int(up), "an": "done" if up else "idle", "an_timeout": False,
+                        "lp_link": int(up), "speed": "1G", "full_duplex": True},
+                "lp_adv": 0xd801 if up else 0, "link_up": int(up), "gpio0": 0, "gpio1": 0,
+                "path": paths[n]})
+        pairs = [{"pair": p, "ports": [2 * p, 2 * p + 1],
+                  "mode": "tap" if paths[2 * p] == paths[2 * p + 1] == "fwd" else "monitor"}
+                 for p in range(2)]
+        print(json.dumps({"gtpowergood": 1, "qpll0_lock": 1, "phy_reset_n": 15, "pg_1v0": 1,
+                          "pg_2v5": 1, "ports": ports, "pairs": pairs}, indent=1))
+        return 0
     print("eth_ports: gtpowergood=1 qpll0_lock=1 phy_reset_n=0xf PG_1V0=1 PG_2V5=1")
     print("port phy  copper            sgmii/pcs                         lp_adv  link_up "
           "gpio0 gpio1 path")
@@ -236,6 +297,43 @@ def phy_path(a):
     return 0
 
 
+# ---------------------------------------------------------------- tb
+CAL_DEFAULT = os.path.normpath(os.path.join(HERE, "..", "..", "Yocto", "meta-pktrec", "recipes-apps",
+                                            "pktrec-tb", "files", "calibration.conf"))
+
+
+def tb_state(_a):
+    """What pktrec-tb daemon / apply-calibration leave in /run/pktrec and /etc/pktrec."""
+    now = time.time_ns()
+    st = load("tb.json", None)
+    t0 = st["started_ns"] if st else now
+    locked_since = t0 + 40 * 10 ** 9
+    locked = now >= locked_since
+    off = int(((now // 10 ** 9) * 7919) % 4001) - 2000          # +-2 us, deterministic
+    save("tb.json", {
+        "version": 1, "pid": None, "running": True, "state": "tracking",
+        "locked": locked, "locked_since_ns": locked_since if locked else None,
+        "locked_since": None, "offset_ns": off, "offset_abs_max_30s_ns": 2000,
+        "offset_rms_30s_ns": 1150, "latency_ns": 1650, "freq_ppb": 10412.3 + off / 5,
+        "freq_est_ppb": 10412.3, "ppm": round((10412.3 + off / 5) / 1e3, 6),
+        "inc_raw": "0x0400074779", "inc_ns": 4.000441593, "dp_clk_hz": 249975006,
+        "last_set_ns": t0, "last_set": None, "last_set_reason": "start-up",
+        "sets": 2, "adj_steps": 0, "adj_total_ns": 0, "steps_detected": 0,
+        "ntp_synced": True, "capture_running": bool(counters()[1]), "started_ns": t0,
+        "interval_s": 1.0, "lock_threshold_ns": 10000.0, "lock_time_s": 30.0,
+        "max_ppm": 200.0, "max_adj_ns": 1000.0, "step_threshold_ns": 1e9,
+        "source": "mock", "message": "mock daemon", "updated_ns": now, "updated": None})
+    cal = os.path.join(STATE, "calibration.conf")
+    if not os.path.exists(cal) and os.path.isfile(CAL_DEFAULT):
+        with open(CAL_DEFAULT) as f, open(cal, "w") as g:
+            g.write(f.read())
+    if load("calibration.json", None) is None:
+        save("calibration.json", {"applied_ns": t0, "applied": None, "file": cal, "ok": True,
+                                  "values": {"timebase.ppm": 0.0}, "errors": [],
+                                  "warnings": []})
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     tool = ap.add_subparsers(dest="tool", required=True)
@@ -246,18 +344,24 @@ def main():
     p.add_argument("--duration", type=float)
     p.add_argument("--size", type=int)
     p.add_argument("--stats", type=float, default=1.0)
+    p.add_argument("--stats-json", action="store_true")
     p.add_argument("file")
     p.set_defaults(fn=cap_record)
-    cap.add_parser("stats").set_defaults(fn=cap_stats)
+    p = cap.add_parser("stats")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cap_stats)
     p = cap.add_parser("info")
     p.add_argument("file")
     p.set_defaults(fn=cap_info)
     phy = tool.add_parser("phy").add_subparsers(dest="cmd", required=True)
-    phy.add_parser("status").set_defaults(fn=phy_status)
+    p = phy.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=phy_status)
     p = phy.add_parser("path")
     p.add_argument("port")
     p.add_argument("mode", choices=["idle", "loop", "fwd"])
     p.set_defaults(fn=phy_path)
+    tool.add_parser("tb").set_defaults(fn=tb_state)
     a = ap.parse_args()
     return a.fn(a)
 

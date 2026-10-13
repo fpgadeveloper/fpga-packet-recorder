@@ -74,6 +74,24 @@ $("pairs").addEventListener("click", async (ev) => {
   pollStatus();
 });
 
+// ---- timebase discipline (pktrec-tb) and calibration ----
+function usec(ns) { return ns === null || ns === undefined ? "—" : (ns >= 0 ? "+" : "") + (ns / 1e3).toFixed(1) + " µs"; }
+function renderTimebase() {
+  if (!status) return;
+  const t = (status.time && status.time.discipline) || {}, c = status.calibration || {};
+  let state, cls;
+  if (!t.daemon || !t.fresh) { state = "not disciplined (pktrec-tb not running): timestamps drift from wall-clock time"; cls = "warn"; }
+  else if (t.locked) { state = `locked to system time${t.ntp_synced === false ? " (system clock NOT NTP-synced)" : t.ntp_synced ? " (NTP)" : ""}`; cls = t.ntp_synced === false ? "warn" : "ok"; }
+  else { state = `tracking, not locked yet (${esc(t.state || "?")})`; cls = "warn"; }
+  const ap = c.applied;
+  const calTxt = !c.present ? "no calibration file (design defaults)" :
+    ap ? `calibration ${ap.ok ? "applied" : "applied with errors"} ${(ap.applied || "").replace("T", " ").replace(/\.\d+Z$/, " UTC")}` : "calibration file present, not applied since boot";
+  $("tb").innerHTML = `<div class="pair">
+      <span><b>Timebase</b> <small class="${cls}">${state}</small></span>
+      <span><small>offset ${usec(t.offset_ns)}${t.offset_rms_ns != null ? ` (rms ${(t.offset_rms_ns / 1e3).toFixed(1)} µs)` : ""} · trim ${t.ppm != null ? (t.ppm >= 0 ? "+" : "") + t.ppm.toFixed(3) + " ppm" : "—"} · ${esc(calTxt)}</small></span>
+    </div>`;
+}
+
 // ---- capture ----
 function renderCapture(cap, disk) {
   const running = cap.state !== "idle";
@@ -190,6 +208,7 @@ async function pollStatus() {
   try {
     status = await api("GET", "/api/status");
     renderPorts();
+    renderTimebase();
     const v = status.version || {}, t = status.time || {};
     $("footer").textContent = `pktrec-web ${v.web || "?"} · capture block ${v.capture_block || "?"} · ${v.image || "image ?"} · board time ${t.system ? t.system.replace("T", " ").replace(/\.\d+Z$/, " UTC") : "?"}` +
       (status.errors && (status.errors["pktrec-phy"] || status.errors["pktrec-cap"]) ? ` · tool error: ${status.errors["pktrec-phy"] || status.errors["pktrec-cap"]}` : "");

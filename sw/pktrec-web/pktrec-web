@@ -7,16 +7,24 @@ A small HTTP server (Python 3 standard library only) that serves a single-page
 UI and a JSON API on the board's PS Ethernet port. It drives the existing
 command-line tools as subprocesses:
 
-  pktrec-phy status / path        port link state, per-pair TAP/monitor mode
-  pktrec-cap stats                capture block counters (per port), timebase
-  pktrec-cap record               one capture at a time, to <rec-dir>/captures
+  pktrec-phy status --json / path port link state, per-pair TAP/monitor mode
+  pktrec-cap stats --json         capture block counters (per port), timebase
+  pktrec-cap record --stats-json  one capture at a time, to <rec-dir>/captures;
+                                  live statistics as JSON lines on its stdout
   pktrec-cap info                 capture file header (text, for the info view)
   pktrec-export <file> -o -       streamed to the browser as pcapng (no temp file)
+  /run/pktrec/tb.json             timebase discipline state (pktrec-tb daemon)
+  /etc/pktrec/calibration.conf    calibration file (+ /run/pktrec/calibration.json:
+                                  applied at boot by pktrec-calibration.service)
+
+(The text outputs of pktrec-phy status / pktrec-cap stats are still parsed as a
+fallback when a tool does not know --json.)
 
 There is no authentication: run it on a trusted network only.
 
 API (all JSON, errors as {"error": "..."} with an HTTP status code):
-  GET    /api/status                 ports, pair modes, capture, disk, time, versions
+  GET    /api/status                 ports, pair modes, capture, disk, time (with the
+                                     timebase discipline), calibration, versions
   GET    /api/stats                  live counters and rates (poll every second)
   POST   /api/mode                   {"pair": 0|1, "mode": "tap"|"monitor"}
   POST   /api/capture/start          {"ports": [0..3], "snaplen": N, "duration_s": S,
@@ -64,6 +72,8 @@ CHUNK = 256 * 1024
 HDR_SIZE = 4096
 HDR_FMT = "<8s10I9Q32s64s32s"
 PORT_FMT = "<7QII16s"
+TBD_FMT = "<IIqqQ"                # tb_disc_* after the port array (zeros = not recorded)
+TBD_VALID, TBD_DAEMON, TBD_LOCKED, TBD_NTP, TBD_SET = 1, 2, 4, 8, 16
 MAGIC = b"PKTRCAP\x00"
 FF_COMPLETE, FF_TB_REALTIME, FF_LIMIT_SIZE, FF_LIMIT_TIME, FF_DMA_ERROR = 1, 2, 4, 8, 16
 FPORT_ENABLED, FPORT_LINK_UP = 1, 2
@@ -98,6 +108,13 @@ def parse_header(raw):
             "speed_mbps": p[7], "link_up": bool(p[8] & FPORT_LINK_UP),
         })
     complete = bool(flags & FF_COMPLETE)
+    tf, tlock, toff, tppb, tt = struct.unpack_from(TBD_FMT, raw, n + NUM_PORTS * pn)
+    tbd = None
+    if tf & TBD_VALID:
+        tbd = {"daemon": bool(tf & TBD_DAEMON), "locked": bool(tf & TBD_LOCKED),
+               "ntp_synced": bool(tf & TBD_NTP), "set_at_start": bool(tf & TBD_SET),
+               "locked_s": tlock, "offset_ns": toff, "freq_ppb": tppb, "ppm": tppb / 1e3,
+               "measured": iso_ns(tt)}
     return {
         "header_version": hver, "record_format": recfmt, "complete": complete,
         "flags": {"tb_realtime": bool(flags & FF_TB_REALTIME),
@@ -111,6 +128,7 @@ def parse_header(raw):
         "start_time": iso_ns(t0), "stop_time": iso_ns(t1) if complete else None,
         "duration_s": (t1 - t0) / 1e9 if complete and t1 >= t0 else None,
         "tb_start_ns": tb0, "tb_stop_ns": tb1, "tb_inc_ns": tb_inc / 2 ** 32,
+        "tb_discipline": tbd,
         "data_bytes": data_bytes, "records": records,
         "rec_drop_beats": drop_beats, "dma_errors": dma_err,
         "drops": sum(p["frames_drop"] for p in ports if p["enabled"]) if complete else None,
@@ -218,6 +236,92 @@ def parse_phy_status(text):
     return ports
 
 
+def cap_stats_from_json(doc):
+    """'pktrec-cap stats --json' -> the dict parse_cap_stats() builds from the text."""
+    d = {"cap_version": doc["cap_version"], "enabled": bool(doc["enabled"]),
+         "port_en": doc["port_en"], "snaplen": doc["snaplen"], "fifo_bytes": doc["fifo_bytes"],
+         "timebase_ns": doc["timebase_ns"], "timebase": doc["timebase"],
+         "tb_status": doc["tb_status"], "tb_inc_ns": doc.get("tb_inc"),
+         "tb_freq_ppb": doc.get("tb_freq_ppb"), "merge": doc.get("merge"), "ports": {}}
+    for p in doc["ports"]:
+        d["ports"][p["port"]] = {k: p[k] for k in (
+            "link", "frames_rx", "frames_bad", "frames_drop", "frames_trunc", "bytes_rx",
+            "records", "fifo_hwm")}
+        d["ports"][p["port"]]["bytes_drop"] = p.get("bytes_drop")
+    return d
+
+
+def phy_status_from_json(doc):
+    """'pktrec-phy status --json' -> ({port: state}, [pair modes] or None)."""
+    ports = {}
+    for p in doc["ports"]:
+        cu, pcs = p.get("copper") or {}, p.get("pcs") or {}
+        up = bool(cu.get("up"))
+        fd = cu.get("full_duplex")
+        ports[p["port"]] = {
+            "link": up, "speed": cu.get("speed") if up else None,
+            "duplex": None if not up or fd is None else ("full" if fd else "half"),
+            "error": cu.get("error"), "sgmii_sync": bool(pcs.get("sync")) if pcs else None,
+            "pcs_link": bool(p.get("link_up")), "path": p.get("path")}
+    pairs = [q.get("mode") for q in doc.get("pairs") or []] or None
+    return ports, pairs
+
+
+def live_from_json(obj):
+    """A {"type": "stats"} line of 'pktrec-cap record --stats-json'."""
+    d = {k: obj.get(k) for k in ("elapsed_s", "write_mb_s", "written_bytes", "written_gb",
+                                  "ring_used", "ring_total", "backpressure_pct", "drops")}
+    d["ports"] = {int(n): v for n, v in (obj.get("ports") or {}).items()}
+    d["source"] = "json"
+    return d
+
+
+def read_json_file(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def tb_discipline(path):
+    """The pktrec-tb daemon state (/run/pktrec/tb.json) as shown by the API."""
+    st = read_json_file(path)
+    if not isinstance(st, dict):
+        return {"daemon": False, "fresh": False, "locked": False, "state": None,
+                "message": "pktrec-tb is not running (no state file)"}
+    age = (time.time_ns() - (st.get("updated_ns") or 0)) / 1e9
+    alive = True
+    if st.get("pid"):
+        try:
+            os.kill(st["pid"], 0)
+        except ProcessLookupError:
+            alive = False
+        except OSError:
+            pass
+    fresh = bool(alive and st.get("running") and -5 < age < 3 * (st.get("interval_s") or 1) + 5)
+    return {"daemon": True, "fresh": fresh, "locked": bool(fresh and st.get("locked")),
+            "state": st.get("state") if fresh else "stopped", "age_s": round(age, 1),
+            "offset_ns": st.get("offset_ns"), "offset_rms_ns": st.get("offset_rms_30s_ns"),
+            "offset_max_ns": st.get("offset_abs_max_30s_ns"),
+            "ppm": st.get("ppm"), "freq_est_ppm": (st.get("freq_est_ppb") / 1e3
+                                                   if st.get("freq_est_ppb") is not None else None),
+            "locked_since": st.get("locked_since"), "last_set": st.get("last_set"),
+            "last_set_reason": st.get("last_set_reason"), "sets": st.get("sets"),
+            "ntp_synced": st.get("ntp_synced"), "capture_running": st.get("capture_running"),
+            "lock_threshold_ns": st.get("lock_threshold_ns"), "message": st.get("message")}
+
+
+def calibration_state(cal_file, applied_file):
+    d = {"file": cal_file, "present": os.path.isfile(cal_file), "mtime": None, "applied": None}
+    if d["present"]:
+        d["mtime"] = iso_ns(int(os.stat(cal_file).st_mtime * 1e9))
+    ap = read_json_file(applied_file)
+    if isinstance(ap, dict):
+        d["applied"] = {k: ap.get(k) for k in ("applied", "file", "ok", "errors", "warnings")}
+    return d
+
+
 def pair_mode_from_paths(paths):
     if all(p == "fwd" for p in paths):
         return "tap"
@@ -272,6 +376,7 @@ class Backend:
             self.cmd_cap = [args.pktrec_cap]
             self.cmd_phy = [args.pktrec_phy]
         self.cmd_export = [args.pktrec_export]
+        self.cmd_mock = mock if args.mock else None
         self.lock = threading.Lock()          # capture state
         self.hw_lock = threading.Lock()       # stats / phy caches
         self.proc = None
@@ -293,6 +398,21 @@ class Backend:
         except subprocess.TimeoutExpired:
             raise ApiError(504, f"{os.path.basename(cmd[0])} timed out")
         return r
+
+    def run_safe(self, cmd, timeout):
+        """run(), with a missing / hung tool reported as a failed run (keep serving)."""
+        try:
+            return self.run(cmd, timeout=timeout)
+        except ApiError as e:
+            return subprocess.CompletedProcess(cmd, 1, "", e.msg)
+
+    def timebase(self):
+        if self.cmd_mock:                      # the mock daemon refreshes its state file
+            self.run_safe(self.cmd_mock + ["tb"], 5)
+        return tb_discipline(self.a.tb_state)
+
+    def calibration(self):
+        return calibration_state(self.a.cal_file, self.a.cal_state)
 
     def _image_version(self):
         v = {"web": VERSION}
@@ -333,14 +453,22 @@ class Backend:
             now = time.monotonic()
             if cached is not None and now - t < 0.8:
                 return cached
-            try:
-                r = self.run(self.cmd_cap + ["stats"], timeout=5)
-            except ApiError as e:               # tool missing / hung: report, keep serving
-                r = subprocess.CompletedProcess([], 1, "", e.msg)
-            if r.returncode != 0:
+            d = None
+            r = self.run_safe(self.cmd_cap + ["stats", "--json"], 5)
+            if r.returncode == 0:
+                try:
+                    d = cap_stats_from_json(json.loads(r.stdout))
+                    d["source"] = "json"
+                except (ValueError, KeyError, TypeError):
+                    d = None
+            if d is None:                       # an older pktrec-cap: text fallback
+                r = self.run_safe(self.cmd_cap + ["stats"], 5)
+            if d is None and r.returncode != 0:
                 d = {"error": (r.stderr.strip() or "pktrec-cap stats failed")[-300:], "ports": {}}
-            else:
+            elif d is None:
                 d = parse_cap_stats(r.stdout)
+                d["source"] = "text"
+            if "error" not in d:
                 if self.prev_counters:
                     t0, prev = self.prev_counters
                     dt = now - t0
@@ -364,15 +492,21 @@ class Backend:
             now = time.monotonic()
             if cached is not None and now - t < max_age:
                 return cached
-            try:
-                r = self.run(self.cmd_phy + ["status"], timeout=10)
-            except ApiError as e:
-                r = subprocess.CompletedProcess([], 1, "", e.msg)
-            if r.returncode != 0:
-                d = {"error": (r.stderr.strip() or "pktrec-phy status failed")[-300:],
-                     "ports": {}}
-            else:
-                d = {"error": None, "ports": parse_phy_status(r.stdout)}
+            d = None
+            r = self.run_safe(self.cmd_phy + ["status", "--json"], 10)
+            if r.returncode == 0:
+                try:
+                    ports, pairs = phy_status_from_json(json.loads(r.stdout))
+                    d = {"error": None, "ports": ports, "pair_modes": pairs, "source": "json"}
+                except (ValueError, KeyError, TypeError):
+                    d = None
+            if d is None:                       # an older pktrec-phy: text fallback
+                r = self.run_safe(self.cmd_phy + ["status"], 10)
+                if r.returncode != 0:
+                    d = {"error": (r.stderr.strip() or "pktrec-phy status failed")[-300:],
+                         "ports": {}}
+                else:
+                    d = {"error": None, "ports": parse_phy_status(r.stdout), "source": "text"}
             self.phy_cache = (now, d)
             return d
 
@@ -420,7 +554,7 @@ class Backend:
             if os.path.exists(path):
                 raise ApiError(409, f"capture '{name}' already exists")
             cmd = self.cmd_cap + ["record", "--ports", ",".join(map(str, ports)),
-                                  "--snaplen", str(snaplen), "--stats", "1"]
+                                  "--snaplen", str(snaplen), "--stats", "1", "--stats-json"]
             if dur is not None:
                 cmd += ["--duration", f"{dur:g}"]
             if size is not None:
@@ -436,10 +570,12 @@ class Backend:
             self.cap = {"name": name, "file": path, "ports": ports, "snaplen": snaplen,
                         "duration_s": dur, "size_bytes": size, "started": time.time(),
                         "t0": time.monotonic(), "live": None, "log": [], "stdout": [],
-                        "stopping": False}
+                        "result": None, "stopping": False}
             cap = self.cap
             threading.Thread(target=self._read_stderr, args=(proc, cap), daemon=True).start()
-            threading.Thread(target=self._reap, args=(proc, cap), daemon=True).start()
+            reader = threading.Thread(target=self._read_stdout, args=(proc, cap), daemon=True)
+            reader.start()
+            threading.Thread(target=self._reap, args=(proc, cap, reader), daemon=True).start()
         # an immediate failure (no device, no hugepages, ...) is reported here
         try:
             proc.wait(timeout=1.5)
@@ -463,16 +599,38 @@ class Backend:
         for line in proc.stderr:
             line = line.rstrip("\r\n")
             live = parse_live_line(line)
-            if live:
-                cap["live"] = live
+            if live:                            # text fallback (no --stats-json)
+                if not (cap["live"] or {}).get("source") == "json":
+                    live["source"] = "text"
+                    cap["live"] = live
             elif line:
                 cap["log"] = (cap["log"] + [line])[-40:]
 
-    def _reap(self, proc, cap):
-        out = proc.stdout.read()
+    def _read_stdout(self, proc, cap):
+        """--stats-json lines ({"type": "stats"|"result"}) and the summary text."""
+        for line in proc.stdout:
+            line = line.rstrip("\r\n")
+            if line.startswith("{"):
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    obj = None
+                if isinstance(obj, dict) and obj.get("type") == "stats":
+                    cap["live"] = live_from_json(obj)
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "result":
+                    cap["result"] = obj
+                    continue
+            cap["stdout"].append(line)
+
+    def _reap(self, proc, cap, reader):
+        reader.join()
         code = proc.wait()
+        out = "\n".join(cap["stdout"])
         result = {}
-        for line in out.splitlines():
+        if cap["result"]:
+            result = {k: v for k, v in cap["result"].items() if k not in ("type", "exit_code")}
+        for line in out.splitlines() if not result else ():
             m = RESULT_RE.match(line)
             if m:
                 for kv in m.group(1).split():
@@ -745,10 +903,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ---- views ----
     def pairs(self, phy):
         out = []
+        modes = phy.get("pair_modes") or []
         for i, pp in enumerate(PAIRS):
             paths = [phy["ports"].get(p, {}).get("path") for p in pp]
-            out.append({"pair": i, "ports": list(pp), "paths": paths,
-                        "mode": pair_mode_from_paths(paths) if all(paths) else None})
+            mode = pair_mode_from_paths(paths) if all(paths) else None
+            if i < len(modes) and modes[i] in ("tap", "monitor") and mode != "other":
+                mode = modes[i]                 # PAIR_MODE register (pktrec-phy --json)
+            out.append({"pair": i, "ports": list(pp), "paths": paths, "mode": mode})
         return out
 
     def stats(self):
@@ -761,6 +922,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         b = self.backend
         hw = b.hw_stats()
         phy = b.phy_status()
+        tb = b.timebase()
         ports = []
         for n in range(NUM_PORTS):
             p = dict(phy["ports"].get(n, {}))
@@ -775,10 +937,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {
             "version": dict(b.version, capture_block=hw.get("cap_version")),
             "time": {"system": iso_ns(time.time_ns()), "timebase_ns": hw.get("timebase_ns"),
-                     "timebase": hw.get("timebase"), "tb_status": hw.get("tb_status")},
+                     "timebase": hw.get("timebase"), "tb_status": hw.get("tb_status"),
+                     "tb_inc_ns": hw.get("tb_inc_ns"), "tb_freq_ppb": hw.get("tb_freq_ppb"),
+                     "discipline": tb},
+            "calibration": b.calibration(),
             "ports": ports, "pairs": self.pairs(phy),
             "capture": b.capture_state(), "disk": b.disk(),
             "errors": {"pktrec-phy": phy.get("error"), "pktrec-cap": hw.get("error")},
+            "sources": {"pktrec-phy": phy.get("source"), "pktrec-cap": hw.get("source")},
         }
 
     # ---- downloads ----
@@ -918,6 +1084,12 @@ def main():
     ap.add_argument("--pktrec-cap", default="pktrec-cap")
     ap.add_argument("--pktrec-phy", default="pktrec-phy")
     ap.add_argument("--pktrec-export", default="pktrec-export")
+    ap.add_argument("--tb-state", default=None,
+                    help="pktrec-tb daemon state (default /run/pktrec/tb.json)")
+    ap.add_argument("--cal-file", default=None,
+                    help="calibration file (default /etc/pktrec/calibration.conf)")
+    ap.add_argument("--cal-state", default=None,
+                    help="calibration apply record (default /run/pktrec/calibration.json)")
     ap.add_argument("--mock", action="store_true",
                     help="fake pktrec-cap/pktrec-phy with mock_tools.py (host test); "
                          "pktrec-export is still run (give a host build)")
@@ -948,6 +1120,12 @@ def main():
     if a.mock:
         os.environ.setdefault("PKTREC_MOCK_STATE", os.path.join(a.rec_dir, ".mock-state"))
         os.makedirs(os.environ["PKTREC_MOCK_STATE"], exist_ok=True)
+    ms = os.environ.get("PKTREC_MOCK_STATE", "") if a.mock else None
+    a.tb_state = a.tb_state or (os.path.join(ms, "tb.json") if a.mock else "/run/pktrec/tb.json")
+    a.cal_file = a.cal_file or (os.path.join(ms, "calibration.conf") if a.mock
+                                else "/etc/pktrec/calibration.conf")
+    a.cal_state = a.cal_state or (os.path.join(ms, "calibration.json") if a.mock
+                                  else "/run/pktrec/calibration.json")
 
     backend = Backend(a)
     Handler.backend = backend

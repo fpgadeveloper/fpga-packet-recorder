@@ -83,3 +83,7 @@ dialog { border: 1px solid var(--line); border-radius: 8px; background: var(--ca
   max-width: min(900px, 94vw); width: 100%; }
 dialog::backdrop { background: rgba(0,0,0,.4); }
 pre { overflow: auto; font-size: 12px; background: var(--bg); padding: 10px; border-radius: 6px; max-height: 60vh; }
+
+/* timebase line (pktrec-tb state) */
+#tb small.ok { color: var(--ok); }
+#tb small.warn { color: var(--warn, #b7791f); }
