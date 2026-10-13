@@ -615,6 +615,9 @@ for {set n 0} {$n < 4} {incr n} {
     create_bd_pin -dir I -from 63 -to 0 eth_ports/$p
     connect_bd_net [get_bd_pins eth_ports/$p] [get_bd_pins $ep/$p]
   }
+  # MAC TX completions (TX timestamp per frame) for the SFD TX pairing (M2)
+  create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 eth_ports/M_AXIS_TX_CPL_$n
+  connect_bd_intf_net [get_bd_intf_pins $ep/m_axis_tx_cpl_$n] [get_bd_intf_pins eth_ports/M_AXIS_TX_CPL_$n]
 }
 foreach p {rx_stat_pkt_good rx_stat_pkt_bad tx_stat_pkt_good tx_stat_err_underflow link_up} {
   connect_bd_net [get_bd_pins $ep/$p] [get_bd_pins $mp/$p]
@@ -632,9 +635,11 @@ create_bd_port -dir IO mdio
 connect_bd_net [get_bd_pins eth_ports/mdio] [get_bd_ports mdio]
 create_bd_port -dir O -from 3 -to 0 phy_reset_n
 connect_bd_net [get_bd_pins eth_ports/phy_reset_n] [get_bd_ports phy_reset_n]
+# PHY GPIO_0/1 (RX/TX SFD): the pins go to the capture hierarchy's ISERDES
+# sampler (pktrec_sfd_io, M2); eth_ports/pktrec_m0_path gets the sampled
+# levels (phy_gpio*_lvl, dp_clk) for IO_STATUS and its edge counters
 foreach p {phy_gpio0 phy_gpio1} {
   create_bd_port -dir I -from 3 -to 0 $p
-  connect_bd_net [get_bd_ports $p] [get_bd_pins eth_ports/$p]
 }
 foreach p {pg_1v0 pg_2v5} {
   create_bd_port -dir I $p
@@ -677,6 +682,14 @@ create_bd_pin -dir I -type clk capture/dp_clk
 create_bd_pin -dir I -type rst capture/dp_resetn
 create_bd_pin -dir O capture/cap_sel
 create_bd_pin -dir I capture/rec_srst
+foreach p {phy_gpio0 phy_gpio1} {
+  create_bd_pin -dir I -from 3 -to 0 capture/$p
+  create_bd_pin -dir O -from 3 -to 0 capture/${p}_lvl
+  connect_bd_net [get_bd_pins capture/$p] [get_bd_pins $cp/$p]
+  connect_bd_net [get_bd_pins $cp/${p}_lvl] [get_bd_pins capture/${p}_lvl]
+  connect_bd_net [get_bd_ports $p] [get_bd_pins capture/$p]
+  connect_bd_net [get_bd_pins capture/${p}_lvl] [get_bd_pins eth_ports/$p]
+}
 connect_bd_intf_net [get_bd_intf_pins capture/S_AXI] [get_bd_intf_pins $cp/s_axi]
 connect_bd_intf_net [get_bd_intf_pins $cp/m_axis_rec] [get_bd_intf_pins capture/M_AXIS_REC]
 foreach p {dp_clk dp_resetn rec_srst} {
@@ -698,8 +711,11 @@ for {set n 0} {$n < 4} {incr n} {
     create_bd_pin -dir O -from 63 -to 0 capture/$p
     connect_bd_net [get_bd_pins $cp/$p] [get_bd_pins capture/$p]
   }
+  create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 capture/S_AXIS_TX_CPL_$n
+  connect_bd_intf_net [get_bd_intf_pins capture/S_AXIS_TX_CPL_$n] [get_bd_intf_pins $cp/s_axis_tx_cpl_$n]
   # eth_ports <-> capture
   connect_bd_intf_net [get_bd_intf_pins eth_ports/M_AXIS_MON_$n] [get_bd_intf_pins capture/S_AXIS_RX_$n]
+  connect_bd_intf_net [get_bd_intf_pins eth_ports/M_AXIS_TX_CPL_$n] [get_bd_intf_pins capture/S_AXIS_TX_CPL_$n]
   foreach p [list rx_clk_$n tx_clk_$n rx_aresetn_$n tx_aresetn_$n] {
     connect_bd_net [get_bd_pins eth_ports/$p] [get_bd_pins capture/$p]
   }
