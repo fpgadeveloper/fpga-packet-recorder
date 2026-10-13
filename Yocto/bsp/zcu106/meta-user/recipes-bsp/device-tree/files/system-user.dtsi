@@ -100,3 +100,13 @@
 &eth_ports_pktrec_m0_path_0 {
    compatible = "generic-uio";
 };
+
+/*
+ * Capture path (block-design hierarchy capture, M1): capture control, per-port
+ * counters, record merge statistics and the shared timebase, for pktrec-cap
+ * (sw/pktrec-apps), which finds the UIO device by its address.
+ *   capture_pktrec_capture_0      0x4_2003_0000   4K  include/pktrec_regs.h PKTREC_CAP_*
+ */
+&capture_pktrec_capture_0 {
+   compatible = "generic-uio";
+};

@@ -23,13 +23,20 @@
 #   concat_interrupts          pl_ps_irq0
 #   eth_ports                  Ethernet FMC Max (OP080) on HPC0: 4-port 1G SGMII
 #                              MAC/PCS/GTH (pktrec_eth_ports, Taxi) + the M0 bring-up
-#                              datapath (pktrec_m0_path: per-port idle/loopback/forward)
+#                              datapath (pktrec_m0_path: per-port idle/loopback/forward,
+#                              and a plain copy of each RX stream for the capture path)
+#   capture                    M1 monitor-mode capture path (pktrec_capture): RX taps ->
+#                              per-port frame FIFOs -> records -> round-robin merge ->
+#                              fdrec_core/S_AXIS_CAP; shared timebase (PHC) feeding the
+#                              MACs' timestamp inputs
 #
 # Names that software depends on (do not rename without updating
 # Yocto/bsp/zcu106/.../system-user.dtsi): fdrec_core/fdrec_core_0 (DT label
 # fdrec_core_fdrec_core_0), axi_dma_0, eth_ports/pktrec_eth_ports_0 and
 # eth_ports/pktrec_m0_path_0 (DT labels eth_ports_pktrec_eth_ports_0 and
-# eth_ports_pktrec_m0_path_0, bound to generic-uio for sw/pktrec-tools).
+# eth_ports_pktrec_m0_path_0, bound to generic-uio for sw/pktrec-tools),
+# capture/pktrec_capture_0 (DT label capture_pktrec_capture_0, generic-uio for
+# sw/pktrec-apps pktrec-cap).
 #
 # Ethernet FMC Max (OP080) on HPC0 (hierarchy eth_ports): GTH quad 226
 # (GTHE4_CHANNEL_X0Y12..X0Y15, refclk GBTCLK0_M2C V8/V7), MDIO, PHY resets, PHY
@@ -44,6 +51,7 @@
 #   axi_dma_0 S_AXI_LITE          0x04_2000_0000   64K
 #   fdrec_core_0 s_axi            0x04_2001_0000    4K
 #   eth_ports/pktrec_m0_path_0    0x04_2002_0000    4K   (M0 path registers)
+#   capture/pktrec_capture_0      0x04_2003_0000    4K   (capture + timebase registers)
 #   eth_ports/pktrec_eth_ports_0  0x04_2008_0000  512K   (MAC/PCS/MDIO regs + GT APB)
 #   pl_ps_irq0[0..2]  xdma_0 interrupt_out, MSI 0-31, MSI 32-63  (GIC SPI 89..91)
 #   pl_ps_irq0[3..5]  reserved, tied low                         (GIC SPI 92..94)
@@ -417,6 +425,9 @@ create_bd_pin -dir O fdrec_core/tpg_seq_rst
 create_bd_pin -dir O -from 31 -to 0 fdrec_core/tpg_rate_inc
 create_bd_pin -dir I -from 63 -to 0 fdrec_core/tpg_seq_next
 create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 fdrec_core/S_AXIS_MM2S
+create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 fdrec_core/S_AXIS_CAP
+create_bd_pin -dir I fdrec_core/cap_sel
+create_bd_pin -dir O fdrec_core/rec_srst
 create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 fdrec_core/M_AXIS_SNK
 create_bd_pin -dir O fdrec_core/chk_enable
 create_bd_pin -dir O fdrec_core/chk_reset
@@ -430,7 +441,7 @@ set_property -dict [list CONFIG.SRC_CLK_HZ $src_clk_hz \
   CONFIG.FIFO_DEPTH {4096} \
   CONFIG.EGR_FIFO_DEPTH {4096}] [get_bd_cells fdrec_core/fdrec_core_0]
 foreach p [concat {src_clk src_resetn dp_clk dp_resetn tpg_enable tpg_seq_rst tpg_rate_inc tpg_seq_next \
-                   chk_enable chk_reset chk_rate_inc} $chk_counters] {
+                   chk_enable chk_reset chk_rate_inc cap_sel rec_srst} $chk_counters] {
   connect_bd_net [get_bd_pins fdrec_core/$p] [get_bd_pins fdrec_core/fdrec_core_0/$p]
 }
 connect_bd_intf_net [get_bd_intf_pins fdrec_core/S_AXIS] [get_bd_intf_pins fdrec_core/fdrec_core_0/s_axis]
@@ -438,6 +449,7 @@ connect_bd_intf_net [get_bd_intf_pins fdrec_core/M_AXIS] [get_bd_intf_pins fdrec
 connect_bd_intf_net [get_bd_intf_pins fdrec_core/S_AXI] [get_bd_intf_pins fdrec_core/fdrec_core_0/s_axi]
 connect_bd_intf_net [get_bd_intf_pins fdrec_core/S_AXIS_MM2S] [get_bd_intf_pins fdrec_core/fdrec_core_0/s_axis_mm2s]
 connect_bd_intf_net [get_bd_intf_pins fdrec_core/M_AXIS_SNK] [get_bd_intf_pins fdrec_core/fdrec_core_0/m_axis_snk]
+connect_bd_intf_net [get_bd_intf_pins fdrec_core/S_AXIS_CAP] [get_bd_intf_pins fdrec_core/fdrec_core_0/s_axis_cap]
 
 # Source -> core, core -> sink, and their control/status signals
 connect_bd_intf_net [get_bd_intf_pins user_data_source/M_AXIS] [get_bd_intf_pins fdrec_core/S_AXIS]
@@ -522,7 +534,8 @@ add_irq axi_dma_0/mm2s_introut 7
 #                      pktrec_m0_path_0 (8 async frame FIFOs: per TX port n a LOOP
 #                      FIFO from RX n and a FWD FIFO from RX n^1; PATH_CTRL selects;
 #                      counters; PHY GPIO_0/1 + PG levels and edge counters;
-#                      placeholder timestamp counters -> tx/rx_ptp_ts_n)
+#                      copies of the RX streams for the capture path; the MAC
+#                      timestamp inputs come from capture/pktrec_timebase)
 #
 # ctrl_clk = pl_clk0 (100 MHz) for both s_axi ports, the MDIO master and the Taxi
 # transceiver reset/DRP logic. The GT wizard IP declares a 62.5 MHz free-running
@@ -587,8 +600,21 @@ for {set n 0} {$n < 4} {incr n} {
   }
   connect_bd_intf_net [get_bd_intf_pins $ep/m_axis_rx_$n] [get_bd_intf_pins $mp/s_axis_rx_$n]
   connect_bd_intf_net [get_bd_intf_pins $mp/m_axis_tx_$n] [get_bd_intf_pins $ep/s_axis_tx_$n]
-  connect_bd_net [get_bd_pins $mp/tx_ptp_ts_$n] [get_bd_pins $ep/tx_ptp_ts_$n]
-  connect_bd_net [get_bd_pins $mp/rx_ptp_ts_$n] [get_bd_pins $ep/rx_ptp_ts_$n]
+  # capture tap, MAC clocks/resets and the MAC timestamp inputs (from capture)
+  create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 eth_ports/M_AXIS_MON_$n
+  connect_bd_intf_net [get_bd_intf_pins $mp/m_axis_mon_$n] [get_bd_intf_pins eth_ports/M_AXIS_MON_$n]
+  foreach p [list rx_clk_$n tx_clk_$n] {
+    create_bd_pin -dir O -type clk eth_ports/$p
+    connect_bd_net [get_bd_pins $ep/$p] [get_bd_pins eth_ports/$p]
+  }
+  foreach p [list rx_aresetn_$n tx_aresetn_$n] {
+    create_bd_pin -dir O -type rst eth_ports/$p
+    connect_bd_net [get_bd_pins $ep/$p] [get_bd_pins eth_ports/$p]
+  }
+  foreach p [list rx_ptp_ts_$n tx_ptp_ts_$n] {
+    create_bd_pin -dir I -from 63 -to 0 eth_ports/$p
+    connect_bd_net [get_bd_pins eth_ports/$p] [get_bd_pins $ep/$p]
+  }
 }
 foreach p {rx_stat_pkt_good rx_stat_pkt_bad tx_stat_pkt_good tx_stat_err_underflow link_up} {
   connect_bd_net [get_bd_pins $ep/$p] [get_bd_pins $mp/$p]
@@ -622,6 +648,73 @@ add_periph_slave eth_ports/S_AXI_ETH $ps/pl_clk0 rst_pl_clk0/peripheral_aresetn
 add_periph_slave eth_ports/S_AXI_M0 $ps/pl_clk0 rst_pl_clk0/peripheral_aresetn
 
 # ------------------------------------------------------------------------------
+# Capture path (M1, monitor mode): hierarchy capture
+# ------------------------------------------------------------------------------
+#
+#  eth_ports/M_AXIS_MON_n (rx_clk_n, copy of MAC RX stream n, no tready)
+#        |  x4
+#        v
+#  pktrec_capture_0: per port frame FIFO (16 KB, whole-frame drop + counters)
+#        -> 16-byte record header (include/pktrec_format.h) -> 4:1 round robin
+#        merge over whole records -> M_AXIS_REC (dp_clk, back-pressure)
+#        -> fdrec_core/S_AXIS_CAP (packetizer source while CTRL.SRC_SEL = 1)
+#  pktrec_timebase: 64-bit ns PHC on dp_clk; its cycle counter goes Gray-coded
+#        into every MAC clock -> eth_ports rx_ptp_ts_n / tx_ptp_ts_n
+#  s_axi on dp_clk: include/pktrec_regs.h PKTREC_CAP_*
+#
+# The forward path (pktrec_m0_path) is unchanged: the RX streams have no
+# back-pressure, so the tap is a plain fan-out.
+
+create_bd_cell -type hier capture
+create_bd_cell -type module -reference pktrec_capture capture/pktrec_capture_0
+set_property -dict [list CONFIG.DP_CLK_HZ $dp_clk_hz CONFIG.FIFO_BYTES {16384}] \
+  [get_bd_cells capture/pktrec_capture_0]
+set cp capture/pktrec_capture_0
+
+create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 capture/S_AXI
+create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 capture/M_AXIS_REC
+create_bd_pin -dir I -type clk capture/dp_clk
+create_bd_pin -dir I -type rst capture/dp_resetn
+create_bd_pin -dir O capture/cap_sel
+create_bd_pin -dir I capture/rec_srst
+connect_bd_intf_net [get_bd_intf_pins capture/S_AXI] [get_bd_intf_pins $cp/s_axi]
+connect_bd_intf_net [get_bd_intf_pins $cp/m_axis_rec] [get_bd_intf_pins capture/M_AXIS_REC]
+foreach p {dp_clk dp_resetn rec_srst} {
+  connect_bd_net [get_bd_pins capture/$p] [get_bd_pins $cp/$p]
+}
+connect_bd_net [get_bd_pins $cp/cap_sel] [get_bd_pins capture/cap_sel]
+for {set n 0} {$n < 4} {incr n} {
+  create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 capture/S_AXIS_RX_$n
+  connect_bd_intf_net [get_bd_intf_pins capture/S_AXIS_RX_$n] [get_bd_intf_pins $cp/s_axis_rx_$n]
+  foreach p [list rx_clk_$n tx_clk_$n] {
+    create_bd_pin -dir I -type clk capture/$p
+    connect_bd_net [get_bd_pins capture/$p] [get_bd_pins $cp/$p]
+  }
+  foreach p [list rx_aresetn_$n tx_aresetn_$n] {
+    create_bd_pin -dir I -type rst capture/$p
+    connect_bd_net [get_bd_pins capture/$p] [get_bd_pins $cp/$p]
+  }
+  foreach p [list rx_ptp_ts_$n tx_ptp_ts_$n] {
+    create_bd_pin -dir O -from 63 -to 0 capture/$p
+    connect_bd_net [get_bd_pins $cp/$p] [get_bd_pins capture/$p]
+  }
+  # eth_ports <-> capture
+  connect_bd_intf_net [get_bd_intf_pins eth_ports/M_AXIS_MON_$n] [get_bd_intf_pins capture/S_AXIS_RX_$n]
+  foreach p [list rx_clk_$n tx_clk_$n rx_aresetn_$n tx_aresetn_$n] {
+    connect_bd_net [get_bd_pins eth_ports/$p] [get_bd_pins capture/$p]
+  }
+  foreach p [list rx_ptp_ts_$n tx_ptp_ts_$n] {
+    connect_bd_net [get_bd_pins capture/$p] [get_bd_pins eth_ports/$p]
+  }
+}
+connect_bd_intf_net [get_bd_intf_pins capture/M_AXIS_REC] [get_bd_intf_pins fdrec_core/S_AXIS_CAP]
+connect_bd_net [get_bd_pins capture/cap_sel] [get_bd_pins fdrec_core/cap_sel]
+connect_bd_net [get_bd_pins fdrec_core/rec_srst] [get_bd_pins capture/rec_srst]
+connect_bd_net [get_bd_pins $ps/pl_clk1] [get_bd_pins capture/dp_clk]
+connect_bd_net [get_bd_pins rst_dp_clk/peripheral_aresetn] [get_bd_pins capture/dp_resetn]
+add_periph_slave capture/S_AXI $ps/pl_clk1 rst_dp_clk/peripheral_aresetn
+
+# ------------------------------------------------------------------------------
 # Address map
 # ------------------------------------------------------------------------------
 
@@ -630,6 +723,7 @@ assign_ps_addr pcie_ssd1/xdma_0/S_AXI_LITE 0x0400000000 512M
 assign_ps_addr axi_dma_0/S_AXI_LITE        0x0420000000 64K
 assign_ps_addr fdrec_core/fdrec_core_0/s_axi 0x0420010000 4K
 assign_ps_addr eth_ports/pktrec_m0_path_0/s_axi   0x0420020000 4K
+assign_ps_addr capture/pktrec_capture_0/s_axi     0x0420030000 4K
 assign_ps_addr eth_ports/pktrec_eth_ports_0/s_axi 0x0420080000 512K
 # Everything else: the masters' (PCIe M_AXI_B, DMA SG/S2MM/MM2S) view of PS DDR
 assign_bd_address
