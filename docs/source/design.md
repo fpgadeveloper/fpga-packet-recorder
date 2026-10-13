@@ -704,3 +704,169 @@ used any more (`EXT_TX_IFG` = 1). The block keeps its historical name `pktrec_m0
   `FLUSH`, none corrupted, truncated or reordered; lossless after the last switch.
 
 The other testbenches (`tb_pktrec_m0_path`, `tb_pktrec_gen`, ...) pass unchanged.
+
+## Replay (M6)
+
+A capture can be played back out of a port with its original timing, scaled, at a fixed
+interval or back to back at line rate. The data path is the recorder's playback path; the
+timing is decided in hardware, against the same timebase that stamped the frames.
+
+```
+capture file --(pktrec-replay: selects one interface, copies its records)--> hugepage ring
+  --> AXI DMA MM2S --> fdrec_core egress FIFO (64 KB, src_clk)
+  --> replay/pktrec_replay_0:  SEL = 0: passed on to user_data_sink (fdrec_check, fdplay)
+                               SEL = 1: async FIFO --> dp_clk:
+        record parser --> frame store (128 KB data + 2048 frames metadata)
+        --> scheduler (timebase from capture/tb_now) --> 128 -> 16 bit, tdest = port
+  --> eth_ports/pktrec_m0_path: replay FIFO of the port (64 B, cut-through, dp_clk -> tx_clk)
+      --> TX source "path mode 4 REPLAY" (PATH_RPL) --> Taxi MAC --> PHY
+```
+
+### Parser and frame store
+
+The parser reads the record stream exactly as written by the capture (record format v1:
+16-byte header + frame bytes padded to 16, all-zero fill units skipped). Every header is
+checked like in `pktrec-export` (marker nibble `0xA`, port < 4, 1 <= cap_len <= 16384,
+cap_len + 4 <= orig_len, TRUNC flag consistent). A unit that is neither a header nor fill
+counts one `PARSE_ERRORS` and the parser tests every following unit until a header passes
+(resynchronisation). Optional filters: a port filter (pktrec-replay sets it to the
+selected interface as a safety net) and the bad-frame policy (below); filtered records
+count as `SKIPPED`.
+
+A frame's bytes go into the data FIFO; its metadata (timestamp, length, bad flag) is
+written only with its last beat. The scheduler therefore never sees a frame that is not
+complete: **no partial frame is ever released**. When the store is full, the parser stops
+reading and the back-pressure stalls the DMA; nothing is lost.
+
+### Scheduler
+
+| Mode | Release of frame i |
+|------|--------------------|
+| TIMED (default) | `target_i = T0 + ((ts_i - ts_first) * RATE_INV) >> 16`; `RATE_INV` 16.16, `0x10000` = original timing, `0x8000` = twice as fast, `0x20000` = half speed |
+| BACK-TO-BACK (`--topspeed`) | as soon as the MAC takes it (line rate, 12-byte gaps) |
+| FIXED (`--gap`) | `target_i = T0 + i * GAP_NS` |
+
+`T0 = TB_NOW + START_DELAY` is latched by the GO command; `ts_first` is the first frame's
+timestamp. The comparison runs every dp_clk cycle against `timebase + floor(INC)` and the
+release (first 16-bit word into the port's replay FIFO) happens in the next cycle, so a
+frame is **never released early and at most one timebase step (about 4 ns) late** when the
+TX path is free. The output of a frame is never interrupted: it is written at dp_clk, four
+times faster than the MAC reads it, from a store that holds the whole frame (the Taxi TX
+MAC aborts a frame whose input stalls).
+
+From release to the wire the delay is constant except for the 62.5 MHz MAC clock: the
+replay FIFO crosses into `tx_clk` and the MAC starts a frame on a 16-ns cycle. The
+expected wire timing error is therefore about +-16 ns per frame (simulation: max 15 ns,
+mean 4..7 ns). It does not accumulate: every target is absolute.
+
+The timebase discipline (`pktrec-tb`) only trims `INC` during a replay (pktrec-replay
+creates `/run/pktrec/tb-hold.<pid>`, so the daemon does not step the timebase). A step
+(TB_SET / TB_ADJ) during a run would move every later release by the step.
+
+### Underruns and lateness
+
+Timing is never corrected: a frame that could not be sent at its target is sent late
+and counted.
+
+* **LATE** counts frames released more than `LATE_THRESH` (100 ns) after their target;
+  `MAX_LATE`, `LAST_LATE` and `LATE_SUM` (mean = LATE_SUM / FRAMES) describe the lateness.
+  A frame is late when the stream starved (below) or when the capture holds frames closer
+  together than the replay port can send them (for example original line-rate traffic
+  from a sender whose clock was faster than our TX clock, or `--rate` above what the line
+  carries).
+* **UNDERRUNS** counts the times the store ran empty and the next frame then arrived
+  after its target (TIMED / FIXED), or, back to back, the store ran empty before the end
+  of the stream. STATUS.UNDERRUN is sticky; pktrec-replay exits with code 2.
+
+The playback path is much faster than one port's 125 MB/s (an NVMe SSD reads several
+hundred MB/s, the DMA/egress path runs at GB/s), and the 128 KB store + 64 KB egress FIFO cover the
+DMA's descriptor restart gaps (13-15 us), so underruns indicate a slow disk or a busy CPU.
+
+### Frame content, bad frames, runts
+
+* The frame sent is the captured bytes (`cap_len`, FCS excluded); the MAC appends a new
+  FCS. MAC padding is off on all ports, so frames shorter than 60 bytes go out as runts,
+  as captured. Records truncated by a snap length go out truncated.
+* Records with the BAD flag (`CTRL.BAD_MODE`): 2 = skipped (pktrec-replay default),
+  1 = sent error-terminated (TX `tuser[0]`: the PCS sends /V/ in place of the FCS, the
+  receiver counts an RX error; `--keep-bad`), 0 = sent as good frames with a valid FCS
+  (`--bad-as-good`). The original FCS value cannot be reproduced (the MAC strips it on
+  receive), see "Bad frames" in the TAP section.
+* Frames longer than the MAC's `TX_MAX_LEN` (1518 incl. FCS by default) are cut by the MAC.
+
+### Ports, directions and TAP mode
+
+One capture interface (port Pn: the frames received on Pn) is replayed out of one port at
+a time; the replay block has one scheduler. A TAP-mode capture has two interfaces per pair
+(P0 = received on P0 = the direction P0 -> P1, P1 = the other direction): replay one
+direction per run. Replaying both directions of a pair at the same time is not
+implemented (it would need a second scheduler and a merged, time-ordered record stream).
+
+The output port is put into **path mode 4 REPLAY** (`PATH_RPL` bit n, map 1.3), which
+overrides PATH_CTRL. **Replay and TAP forwarding on the same pair are mutually
+exclusive**: pktrec-replay refuses a port whose pair is in TAP mode (or whose partner
+forwards), `pktrec-phy path n replay` refuses likewise, and `pktrec-phy mode p tap` /
+`path m fwd` are refused while a port of the pair is in replay. The other pair is not
+affected (it may forward or capture).
+
+### Replay and capture at the same time
+
+The recorder's DMA path has one user at a time (`/dev/fdrec0` opens once, one direction
+per session, and terminating either AXI DMA channel resets the whole AXI DMA). A replay
+streamed from the SSD therefore cannot run while `pktrec-cap` records. For the timing
+test (replay out of P2, capture on P3) pktrec-replay `--preload` loads up to 128 KB /
+2048 frames into the replay store, stops the DMA and closes the device; `pktrec-cap` then
+records while the store is played out (`--wait-capture` starts the replay once the
+capture runs). A capture's START (recorder soft reset) does not touch the replay store.
+
+### Registers (pktrec_replay, 0x4_2004_0000, map 1.0)
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `0x000` | ID | `0x504B5250` "PKRP" |
+| `0x004` | VERSION | `0x00010000` |
+| `0x008` | CTRL | [0] SEL, [2:1] MODE (0 timed, 1 back-to-back, 2 fixed), [5:4] BAD_MODE, [6] FILTER_EN, [9:8] FILTER_PORT, [13:12] TX_PORT |
+| `0x00C` | CMD | write 1: [0] ARM, [1] GO, [2] STOP, [3] ABORT |
+| `0x010` | STATUS | [2:0] state (0 idle, 1 armed, 2 running, 3 done, 4 aborting), [3] STOP requested, [8] UNDERRUN, [9] PARSE_ERROR, [10] LATE (sticky until ARM), [11] TX port in REPLAY, [12] input idle, [13] scheduler busy, [14] frames in the store |
+| `0x014` | RATE_INV | 16.16 interval scale (`0x10000`) |
+| `0x018` | START_DELAY | ns from GO to T0 (1 ms) |
+| `0x01C` | LATE_THRESH | ns (100) |
+| `0x020` | GAP_NS | FIXED mode interval (672) |
+| `0x024/0x028` | EXPECT | records that will be streamed (0 = unknown: end with STOP) |
+| `0x02C` | STORE_LEVEL | [15:0] data beats, [31:16] frames |
+| `0x030` / `0x034` | STORE_BEATS / MAX_CAP | 8192 (128 KB) / 16384 |
+| `0x038` / `0x040` / `0x048` | T0 / TS_FIRST / LAST_TARGET | 64-bit |
+| `0x050` / `0x054` | MAX_LATE / LAST_LATE | ns |
+| `0x080..0x0E4` | counters (64-bit, LO latches HI) | RECORDS, FRAMES, BYTES, PARSE_ERRORS, FILL, SKIPPED, UNDERRUNS, LATE, LATE_SUM, BEATS_IN, DISCARD, BAD_SENT, RECORDS_DONE |
+
+Run control: ARM (from idle/done: clears counters, the parser fills the store) -> GO
+(T0 latched, releases start) -> DONE when EXPECT records have been processed, or after
+STOP once the input has been idle for 256 cycles and everything is sent. ABORT completes
+the frame on the wire, drops everything buffered and returns to idle. While SEL = 1 and
+the block is not armed/running, input is accepted and discarded (`DISCARD`), so the DMA
+can always drain.
+
+`pktrec_m0_path` map **1.3** (`VERSION` = `0x00010003`): `0x020` PATH_RPL ([n] = port n in
+replay), `EFF_PATH` [8+n] = port n sends replay frames now. `pktrec_capture` exports its
+timebase (`tb_now`, `tb_inc_ns`) to the replay block; its register map is unchanged.
+
+### Verification (M6)
+
+`tb_pktrec_replay` drives the record stream at src_clk (random stalls, pauses) through
+`pktrec_replay_top` and the real `pktrec_m0_path` into Taxi 1000BASE-X TX MACs and far-end
+receivers (`taxi_axis_basex_tx_16` / `_rx_16`), with a timebase model:
+
+* TIMED 1x, 150 frames of 60..1514 bytes, port-3 records mixed in (filtered), fill units,
+  one corrupted unit (`PARSE_ERRORS` = 1, resynchronised), bad frames sent errored: every
+  frame complete and in order; **release - target 0..3 ns (mean 1.5)**; wire start
+  intervals vs the schedule max 15 ns (one MAC clock); all counters exact; DONE.
+* Rate 0.5x and 2x: release max 2-3 ns late, wire max 10-11 ns.
+* Back to back, 600 x 64-byte frames: every start exactly 672 ns apart (line rate).
+* Fixed gap 2500 ns (on P1): exact.
+* Underrun: source paused 150 us mid-stream: `UNDERRUNS` and LATE counted and flagged,
+  frames still complete; back to back with EXPECT and a pause: `UNDERRUNS` > 0.
+* ABORT while a 1514-byte frame is on the wire: that frame completes, nothing after it,
+  store empty, the rest of the stream discarded; STOP-terminated run: DONE.
+* SEL = 0: the stream reaches the fdrec_check port unchanged.
+
+`tb_pktrec_m0_path` and `tb_pktrec_tap` pass with the replay input idle (VERSION 1.3).

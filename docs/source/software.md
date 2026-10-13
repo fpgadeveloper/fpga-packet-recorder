@@ -416,6 +416,90 @@ exactly that.
 Calibrate again after every bitstream change. The SFD sampler's clock phase can move
 between builds.
 
+## Replaying: pktrec-replay
+
+`pktrec-replay` (C, `sw/pktrec-apps`) plays the frames one interface received in a
+capture file back out of a port, with the original timing, scaled, at a fixed interval
+or back to back. The timing is done by the replay block in the FPGA (see "Replay (M6)" in
+the design notes); the program selects the records, streams them through the recorder's
+playback path (io_uring `O_DIRECT` reads of the file, hugepage ring, AXI DMA MM2S, the
+fdrec driver's `PLAY_*` ioctls like `fdplay`) and reports.
+
+```
+pktrec-replay <capture.cap> --iface P<n> --port <m>
+              [--rate X | --topspeed | --gap NS] [--loop N] [--start-delay MS]
+              [--keep-bad | --bad-as-good] [--late-thresh NS]
+              [--preload [--wait-capture S]] [--force] [--keep-path]
+              [--buffers N] [--buf-size B] [--device D] [--devmem] [--json] [-q] [--dry-run]
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--iface P<n>` | capture interface to replay: the frames received on port Pn |
+| `--port <m>` | output port 0..3; put into path mode 4 REPLAY for the run and restored afterwards (`--keep-path` leaves it) |
+| (default) | original timing: frame i leaves `ts_i - ts_first` after the first |
+| `--rate X` | intervals divided by X (2 = twice as fast, 0.5 = half speed; 1/65536..65536) |
+| `--topspeed` | back to back at line rate, timestamps ignored |
+| `--gap NS` | fixed start-to-start interval, timestamps ignored |
+| `--loop N` | play the selection N times; the timestamps continue (one mean interval between the last frame and the next loop) |
+| `--start-delay MS` | first frame this long after the start (default 10 ms) |
+| `--keep-bad` / `--bad-as-good` | frames captured with an error: sent errored (the receiver counts an RX error) / sent with a valid FCS. Default: skipped |
+| `--late-thresh NS` | lateness above which a frame counts as LATE (default 100 ns) |
+| `--preload` | load the frames into the replay store (128 KB / 2048 frames; the rest is ignored with a note), release the recorder, then play: a capture can run during the replay |
+| `--wait-capture S` | with `--preload`: start once `pktrec-cap` has started a capture (at most S seconds) |
+| `--force` | replay although the pair is in TAP mode, the port has no link, or the replay block is busy (aborts it) |
+| `--dry-run` | only read the file: records selected, bytes, time span |
+| `--json` | one JSON summary object on stdout |
+
+Only capture files (`pktrec-cap`) can be replayed, not pcapng: the record headers carry
+the hardware timestamps, port and flags, and the exporter direction is one-way.
+
+**Interfaces and TAP captures.** Each record belongs to the port that received it. In
+monitor mode Pn is the traffic seen on port n; in a TAP-mode capture P0 is the direction
+P0 -> P1 and P1 the direction P1 -> P0. One interface is replayed out of one port per run;
+to replay both directions of a TAP capture, run pktrec-replay twice (one direction each);
+replaying both at the same time is not implemented.
+
+**Mutual exclusion with TAP mode.** pktrec-replay refuses an output port whose pair is
+in TAP mode or whose partner forwards (`pktrec-phy mode <pair> monitor` first, or
+`--force`). While a port is in replay, `pktrec-phy mode <pair> tap` and `pktrec-phy path
+<partner> fwd` are refused (`mode ... tap --force` takes the port out of replay).
+`pktrec-phy path <m> replay` selects the path by hand.
+
+**Sequence.** Checks (replay block present and idle, m0 map >= 1.3, TAP, link) ->
+`/run/pktrec/tb-hold.<pid>` (the timebase daemon does not step the timebase while the
+file exists; removed on exit) -> output port into REPLAY -> CTRL (SEL, mode, bad-frame
+policy, port filter, TX port), RATE_INV, START_DELAY -> ARM -> `PLAY_START` (without the
+checker: no recorder soft reset) -> the selected records are copied into the ring and
+submitted; once the ring is full the store has primed -> GO -> streaming continues while
+the hardware sends -> STOP after the last buffer -> wait for DONE -> counters ->
+`PLAY_STOP`, SEL = 0, path restored, hold file removed. Ctrl-C aborts cleanly (ABORT: the
+frame on the wire is completed).
+
+**Output.** A progress line (frames sent, frames in the store, underruns, late, max
+lateness) and the summary: frames and bytes sent, errored frames sent, skipped, underruns,
+lateness (max, mean, count above the threshold), parse errors, duration.
+Exit code 0 = every selected frame sent, no underrun, no parse error; 2 = completed with
+underruns, parse errors or frames missing; 1 = error.
+
+**Replay and capture at the same time.** The recorder serves one direction at a time,
+so a streamed replay cannot run while `pktrec-cap` records. Use `--preload`:
+
+```
+pktrec-replay /mnt/rec/captures/p3.cap --iface P3 --port 2 --preload --wait-capture 30 &
+pktrec-cap record --ports 3 --duration 5 /mnt/rec/captures/replayed.cap
+wait
+pktrec-export /mnt/rec/captures/p3.cap -o p3.pcapng
+pktrec-export /mnt/rec/captures/replayed.cap -o replayed.pcapng
+python3 test/compare_replay.py p3.pcapng --orig-iface P3 replayed.pcapng --replay-iface P3
+```
+
+`test/compare_replay.py` pairs the frames by their bytes and reports lost, extra and
+reordered frames and the inter-frame interval error (mean, standard deviation, max) of
+the replay against the original (`--rate X` for a scaled replay, `--topspeed` for a
+back-to-back one). Expected accuracy: within about +-16 ns per interval (MAC clock) plus
+the receiving side's timestamp spread.
+
 ## Capture file format
 
 A capture file is a 4096-byte header followed by the record stream:
