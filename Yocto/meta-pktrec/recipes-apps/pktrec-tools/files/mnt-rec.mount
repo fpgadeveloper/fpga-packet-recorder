@@ -1,0 +1,26 @@
+# FPGA Packet Recorder: the capture SSD (OP063 / HPC1, /dev/nvme0n1, XFS as
+# 'fdsetup-raid0.sh --single /dev/nvme0n1' formats it) mounted at /mnt/rec.
+# A missing or blank SSD never blocks the boot: no ordering before
+# local-fs.target (DefaultDependencies=no), the start job gives up after 20 s
+# when the device does not appear, and a failed mount only leaves this unit
+# failed. Services that need the SSD add Wants=/After=mnt-rec.mount (pktrec-web).
+# A RAID0 array (/dev/md0) is not covered: mount it by hand or override What=
+# with a drop-in (systemctl edit mnt-rec.mount).
+[Unit]
+Description=Packet recorder SSD (/dev/nvme0n1, XFS) at /mnt/rec
+DefaultDependencies=no
+Conflicts=umount.target
+Before=umount.target
+After=local-fs-pre.target
+JobTimeoutSec=20s
+
+[Mount]
+What=/dev/nvme0n1
+Where=/mnt/rec
+Type=xfs
+Options=nofail,noatime
+DirectoryMode=0755
+TimeoutSec=60s
+
+[Install]
+WantedBy=multi-user.target
