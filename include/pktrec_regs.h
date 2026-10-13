@@ -18,6 +18,10 @@
  *                 capture): capture control, per-port capture counters, record
  *                 merge statistics and the shared timebase (PHC)
  *                 PS address 0x4_2003_0000, 4 KB
+ *   PKTREC_RPL_*  pktrec_replay (Vivado/src/hdl/pktrec_replay.sv; hierarchy
+ *                 replay, M6): capture replay - record parser, frame store,
+ *                 scheduler against the timebase, output into one port's TX
+ *                 PS address 0x4_2004_0000, 4 KB
  *
  * Both blocks are bound to generic-uio in the device tree (user space maps them
  * through /dev/uioN; sw/pktrec-tools/pktrec-phy). All registers are 32 bits wide;
@@ -41,6 +45,8 @@
 #define PKTREC_M0_SIZE             0x1000
 #define PKTREC_CAP_BASE            0x420030000ULL
 #define PKTREC_CAP_SIZE            0x1000
+#define PKTREC_RPL_BASE            0x420040000ULL
+#define PKTREC_RPL_SIZE            0x1000
 
 #define PKTREC_NUM_PORTS           4
 #define PKTREC_PHY_ADDR(n)         ((n) == 0 ? 0x01 : (n) == 1 ? 0x03 : (n) == 2 ? 0x0C : 0x0F)
@@ -129,6 +135,7 @@
                                               IFG, FWD FIFO 16 KB + fill, FLUSH, GEN BAD) */
 #define PKTREC_M0_VERSION_1_1      0x00010001
 #define PKTREC_M0_VERSION_1_2      0x00010002
+#define PKTREC_M0_VERSION_1_3      0x00010003   /* 1.3 (M6): PATH_RPL, EFF_PATH[11:8] */
 #define PKTREC_M0_PATH_CTRL        0x008   /* RW [2n+1:2n] TX source of port n (reset 0) */
 #define   PKTREC_M0_PATH_IDLE            0u          /* nothing is sent */
 #define   PKTREC_M0_PATH_LOOP            1u          /* own RX (RX n -> TX n) */
@@ -148,7 +155,18 @@
 #define   PKTREC_M0_PAIR_SHIFT(p)        (2 * (p))
 #define PKTREC_M0_EFF_PATH         0x01C   /* RO (1.2) [2n+1:2n] TX source port n uses now
                                               (PATH_CTRL coding; follows PATH_CTRL at the
-                                              next frame boundary) */
+                                              next frame boundary). (1.3) [8+n] = port n
+                                              sends replay frames now ([2n+1:2n] read 0) */
+#define   PKTREC_M0_EFF_RPL(n)           (1u << (8 + (n)))
+#define PKTREC_M0_PATH_RPL         0x020   /* RW (1.3) [n] = TX port n in path mode 4 REPLAY:
+                                              its TX source is the replay scheduler
+                                              (PKTREC_RPL_*), overriding PATH_CTRL
+                                              [2n+1:2n] (keep those at IDLE). A port's
+                                              replay FIFO is drained while the bit is 0.
+                                              Replay and TAP forwarding on the same pair
+                                              are mutually exclusive (software rule:
+                                              pktrec-phy / pktrec-replay refuse). Reset 0 */
+#define   PKTREC_M0_PATH_REPLAY          4u          /* path mode 4 (software name) */
 
 /* pktrec_m0_path: per-port 32-bit counters (wrap) at PKTREC_M0_PORT(n) + offset */
 #define PKTREC_M0_PORT(n)          (0x100 + (n) * 0x40)
@@ -493,5 +511,111 @@
 #define PKTREC_SFD_P_TX_LOG_LAT      0xC8  /* RO latency of the popped entry (0x80000000 = none) */
 #define PKTREC_SFD_P_TX_HEAD_LAT     0xCC  /* RO latency of the last evaluated completion */
 #define PKTREC_SFD_NONE            0x80000000u
+
+/* ------------------------------------------------------------------------- */
+/* pktrec_replay: capture replay (M6, dp_clk), PS 0x4_2004_0000              */
+/* ------------------------------------------------------------------------- */
+/*
+ * The recorder plays a capture's record stream (include/pktrec_format.h) back
+ * through the AXI DMA MM2S and the fdrec_core egress FIFO (fdrec driver PLAY_*
+ * ioctls, like fdplay); with CTRL.SEL = 1 that stream goes to this block
+ * instead of the fdrec_check sink. The block parses the records, keeps whole
+ * frames in a 128 KB store (a frame is released only when complete) and releases
+ * each frame into the TX MAC of CTRL.TX_PORT (which must be in path mode 4
+ * REPLAY: PKTREC_M0_PATH_RPL) when the shared timebase reaches its target:
+ *   TIMED:  target_i = T0 + ((ts_i - TS_FIRST) * RATE_INV) >> 16
+ *   B2B:    as soon as the MAC takes it (line rate)
+ *   FIXED:  target_i = T0 + i * GAP_NS
+ * T0 = TB_NOW + START_DELAY at CMD.GO. The frame bytes are the captured bytes
+ * (cap_len, FCS excluded); the MAC appends a new FCS. Frames shorter than 60
+ * bytes go out as runts (the MAC's padding is off), truncated records (snaplen)
+ * go out truncated.
+ *
+ * Sequence (pktrec-replay):
+ *   1. PATH_RPL bit of the port set (pair not in TAP mode), STATUS.TX_REPLAY = 1
+ *   2. CTRL (SEL = 1, mode, BAD_MODE, TX_PORT), RATE_INV / GAP_NS / START_DELAY,
+ *      EXPECT = number of records that will be streamed
+ *   3. CMD.ARM (clears counters; the parser now fills the store)
+ *   4. FDREC PLAY_START (without FDREC_PLAY_CHECK: no recorder soft reset, so a
+ *      capture may run at the same time) + PLAY_SUBMIT; when the store is full
+ *      (STORE_LEVEL) or all is submitted: CMD.GO
+ *   5. wait for STATUS.STATE = DONE (EXPECT records processed; or CMD.STOP once
+ *      everything is submitted: DONE when the input has been idle and all is sent)
+ *   6. CMD.ABORT at any time: the frame on the wire is completed, everything
+ *      buffered is dropped, the input is drained (DISCARD_BEATS) -> IDLE.
+ * While SEL = 1 and the block is IDLE / DONE / ABORTING, input beats are taken
+ * and discarded so the DMA can always drain.
+ * Timebase: TB_SET / TB_ADJ steps during a run move every later release
+ * (pktrec-replay holds the pktrec-tb daemon's steps off); INC trims are fine.
+ */
+#define PKTREC_RPL_ID              0x000   /* RO 0x504B5250 "PKRP" */
+#define PKTREC_RPL_ID_VALUE        0x504B5250
+#define PKTREC_RPL_VERSION         0x004   /* RO 0x00010000 */
+#define PKTREC_RPL_CTRL            0x008   /* RW */
+#define   PKTREC_RPL_CTRL_SEL            (1u << 0)   /* playback stream -> replay (0: -> fdrec_check) */
+#define   PKTREC_RPL_CTRL_MODE_SHIFT     1           /* [2:1] */
+#define   PKTREC_RPL_MODE_TIMED          0u
+#define   PKTREC_RPL_MODE_B2B            1u
+#define   PKTREC_RPL_MODE_FIXED          2u
+#define   PKTREC_RPL_CTRL_BAD_SHIFT      4           /* [5:4] records with the BAD flag: */
+#define   PKTREC_RPL_BAD_GOOD            0u          /*   sent as good frames (new valid FCS) */
+#define   PKTREC_RPL_BAD_ERROR           1u          /*   sent error-terminated (TX tuser: /V/) */
+#define   PKTREC_RPL_BAD_SKIP            2u          /*   not sent (SKIPPED) */
+#define   PKTREC_RPL_CTRL_FILTER_EN      (1u << 6)   /* replay only records of FILTER_PORT */
+#define   PKTREC_RPL_CTRL_FILTER_SHIFT   8           /* [9:8] */
+#define   PKTREC_RPL_CTRL_TXPORT_SHIFT   12          /* [13:12] output port (latched at GO) */
+#define PKTREC_RPL_CMD             0x00C   /* WO (write 1) */
+#define   PKTREC_RPL_CMD_ARM             (1u << 0)   /* IDLE/DONE -> ARMED, clears counters */
+#define   PKTREC_RPL_CMD_GO              (1u << 1)   /* ARMED -> RUNNING, latches T0 */
+#define   PKTREC_RPL_CMD_STOP            (1u << 2)   /* no more input: DONE when all is sent */
+#define   PKTREC_RPL_CMD_ABORT           (1u << 3)   /* -> IDLE (frame on the wire completed) */
+#define PKTREC_RPL_STATUS          0x010   /* RO */
+#define   PKTREC_RPL_ST_STATE_MASK       0x7u        /* [2:0] */
+#define   PKTREC_RPL_STATE_IDLE          0u
+#define   PKTREC_RPL_STATE_ARMED         1u
+#define   PKTREC_RPL_STATE_RUNNING       2u
+#define   PKTREC_RPL_STATE_DONE          3u
+#define   PKTREC_RPL_STATE_ABORTING      4u
+#define   PKTREC_RPL_ST_STOP_REQ         (1u << 3)
+#define   PKTREC_RPL_ST_UNDERRUN         (1u << 8)   /* sticky until ARM */
+#define   PKTREC_RPL_ST_PARSE_ERROR      (1u << 9)   /* sticky until ARM */
+#define   PKTREC_RPL_ST_LATE             (1u << 10)  /* sticky until ARM */
+#define   PKTREC_RPL_ST_TX_REPLAY        (1u << 11)  /* CTRL.TX_PORT is in REPLAY (m0 EFF_PATH) */
+#define   PKTREC_RPL_ST_INPUT_IDLE       (1u << 12)  /* no input beat for 256 dp_clk cycles */
+#define   PKTREC_RPL_ST_SCHED_BUSY       (1u << 13)  /* a frame is being scheduled / sent */
+#define   PKTREC_RPL_ST_STORE_FRAMES     (1u << 14)  /* complete frames wait in the store */
+#define PKTREC_RPL_RATE_INV        0x014   /* RW 16.16 interval scale, TIMED (0x00010000 = 1x;
+                                              0x8000 = twice as fast; 0x20000 = half speed) */
+#define PKTREC_RPL_START_DELAY     0x018   /* RW ns from GO to T0 (1000000) */
+#define PKTREC_RPL_LATE_THRESH     0x01C   /* RW ns: release later than target + this = LATE (100) */
+#define PKTREC_RPL_GAP_NS          0x020   /* RW FIXED mode start-to-start interval, ns (672) */
+#define PKTREC_RPL_EXPECT_LO       0x024   /* RW 64: records that will be streamed (0 = unknown, */
+#define PKTREC_RPL_EXPECT_HI       0x028   /*    end the run with CMD.STOP) */
+#define PKTREC_RPL_STORE_LEVEL     0x02C   /* RO [15:0] data beats in the store, [31:16] frames
+                                              (metadata FIFO: 2048 frames) */
+#define PKTREC_RPL_STORE_BEATS     0x030   /* RO store size in 16-byte beats (8192 = 128 KB) */
+#define PKTREC_RPL_MAX_CAP         0x034   /* RO largest cap_len accepted (16384) */
+#define PKTREC_RPL_T0_LO           0x038   /* RO 64: T0 (timebase ns) */
+#define PKTREC_RPL_T0_HI           0x03C
+#define PKTREC_RPL_TS_FIRST_LO     0x040   /* RO 64: ts of the first frame of the run */
+#define PKTREC_RPL_TS_FIRST_HI     0x044
+#define PKTREC_RPL_LAST_TARGET_LO  0x048   /* RO 64: target of the last scheduled frame */
+#define PKTREC_RPL_LAST_TARGET_HI  0x04C
+#define PKTREC_RPL_MAX_LATE        0x050   /* RO ns, release - target, max (saturates) */
+#define PKTREC_RPL_LAST_LATE       0x054   /* RO ns, of the last frame */
+/* 64-bit counters (read LO first: it latches HI), cleared by CMD.ARM */
+#define PKTREC_RPL_RECORDS         0x080   /* valid record headers parsed */
+#define PKTREC_RPL_FRAMES          0x088   /* frames sent */
+#define PKTREC_RPL_BYTES           0x090   /* frame bytes sent (FCS excluded) */
+#define PKTREC_RPL_PARSE_ERRORS    0x098   /* framing lost (re-synchronised) */
+#define PKTREC_RPL_FILL            0x0A0   /* fill units skipped */
+#define PKTREC_RPL_SKIPPED         0x0A8   /* records not sent (filter / BAD_SKIP) */
+#define PKTREC_RPL_UNDERRUNS       0x0B0   /* the store ran empty and a frame was late for it */
+#define PKTREC_RPL_LATE            0x0B8   /* frames released > LATE_THRESH after target */
+#define PKTREC_RPL_LATE_SUM        0x0C0   /* sum of (release - target), ns: mean = / FRAMES */
+#define PKTREC_RPL_BEATS_IN        0x0C8   /* 16-byte beats parsed */
+#define PKTREC_RPL_DISCARD         0x0D0   /* beats discarded (not ARMED/RUNNING) */
+#define PKTREC_RPL_BAD_SENT        0x0D8   /* frames sent error-terminated */
+#define PKTREC_RPL_RECORDS_DONE    0x0E0   /* records fully processed (sent or skipped) */
 
 #endif /* PKTREC_REGS_H */
