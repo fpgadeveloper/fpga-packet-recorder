@@ -14,6 +14,12 @@
 //
 // DEPTH is in bytes (Taxi counts tkeep units); 4096 = 2048 x 16-bit beats.
 //
+// FRAME_FIFO = 0 (M6 replay path): plain cut-through FIFO with back-pressure
+// (s_tready), nothing dropped. Only for a writer that delivers each frame
+// without pauses and faster than the reader (pktrec_replay writes from dp_clk,
+// 4x the MAC rate, out of a store that holds the whole frame), so the output
+// never drops tvalid inside a frame.
+//
 // Status strobes (one s_clk cycle per frame): s_drop (frame dropped: FIFO full or
 // oversize), s_good (frame committed). m_depth (m_clk): current fill in bytes as seen
 // by the read side (Taxi m_status_depth: everything written and not yet read,
@@ -27,7 +33,9 @@
 
 module pktrec_axis_async_fifo #(
     parameter int DEPTH = 4096,
-    parameter int RAM_PIPELINE = 2
+    parameter int RAM_PIPELINE = 2,
+    parameter bit FRAME_FIFO = 1'b1,
+    parameter RAMSTYLE = "auto"
 )(
     input  wire logic        s_clk,
     input  wire logic        s_rst,
@@ -74,12 +82,13 @@ assign m_axis.tready = m_tready;
 taxi_axis_async_fifo #(
     .DEPTH(DEPTH),
     .RAM_PIPELINE(RAM_PIPELINE),
-    .FRAME_FIFO(1'b1),
+    .FIFO_RAMSTYLE(RAMSTYLE),
+    .FRAME_FIFO(FRAME_FIFO),
     .USER_BAD_FRAME_VALUE(1'b1),
     .USER_BAD_FRAME_MASK(1'b1),
-    .DROP_OVERSIZE_FRAME(1'b1),
+    .DROP_OVERSIZE_FRAME(FRAME_FIFO),
     .DROP_BAD_FRAME(1'b0),
-    .DROP_WHEN_FULL(1'b1)
+    .DROP_WHEN_FULL(FRAME_FIFO)
 ) fifo_inst (
     .s_clk(s_clk),
     .s_rst(s_rst),

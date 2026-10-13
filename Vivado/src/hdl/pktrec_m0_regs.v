@@ -6,8 +6,9 @@
 // same map is in include/pktrec_regs.h, keep both in sync):
 //
 //   0x000 ID         RO  0x504B4D30 ("PKM0")
-//   0x004 VERSION    RO  0x00010002 (1.1: generator + checker; 1.2: TAP mode - pair
-//                        mode, effective path, dynamic IFG, FIFO fill, FLUSH)
+//   0x004 VERSION    RO  0x00010003 (1.1: generator + checker; 1.2: TAP mode - pair
+//                        mode, effective path, dynamic IFG, FIFO fill, FLUSH;
+//                        1.3: REPLAY path - PATH_RPL, EFF_PATH[11:8])
 //   0x008 PATH_CTRL  RW  [2n+1:2n] TX source of port n: 0 IDLE, 1 LOOP (own RX),
 //                        2 FWD (pair partner's RX: P0<->P1, P2<->P3), 3 GEN. Reset 0.
 //   0x00C CNT_CTRL   WO  [0] 1 = clear every counter and IO_STICKY (reads 0)
@@ -20,7 +21,11 @@
 //                        stores it in the capture file header. Reset 0.
 //   0x01C EFF_PATH   RO  [2n+1:2n] TX source port n actually uses now (PATH_CTRL
 //                        coding); differs from PATH_CTRL only until the TX side reaches
-//                        a frame boundary
+//                        a frame boundary. (1.3) [8+n] = port n sends replay frames
+//                        now (then [2n+1:2n] reads 0)
+//   0x020 PATH_RPL   RW  (1.3) [n] = TX port n is in path mode 4 REPLAY: its TX source
+//                        is the replay scheduler (pktrec_replay, M6), overriding
+//                        PATH_CTRL [2n+1:2n]. Reset 0
 //   per port n at 0x100 + n * 0x40 (32-bit counters, wrap):
 //   +0x00 RX_GOOD    frames received without error (MAC)
 //   +0x04 RX_BAD     frames received with an error (bad FCS, framing, oversize)
@@ -76,12 +81,13 @@ module pktrec_m0_regs #(
     input  wire [9:0]  io,
     input  wire [3:0]  link_up,
     output wire [7:0]  path_mode,
+    output wire [3:0]  path_rpl,
     output wire [4*255-1:0] gen_cfg,     // per port, see pktrec_m0_path GCFG_W
     output wire [4*18-1:0]  chk_cfg,
     input  wire [4*130-1:0] gen_st,      // {bytes, frames, done, running}
     input  wire [4*192-1:0] chk_st,      // {last_seq, bad, errors, lost, frames}
     input  wire [7:0]       flush_evt,   // [2n+k] frame flushed from TX n's FIFO k
-    input  wire [7:0]       eff_path,
+    input  wire [11:0]      eff_path,    // [3n+2:3n] TX source of port n (4 = replay)
     output wire [4*50-1:0]  ifg_cfg,     // per port {gen_bad, lo, hi, min, nom, en}
     input  wire [4*121-1:0] ifg_st,      // {red_cyc 48, entries 32, fill_max, fill, ifg, reduced}
     output reg              ifg_clr_tgl = 1'b0,
@@ -106,18 +112,29 @@ module pktrec_m0_regs #(
 );
 
 localparam [31:0] REG_ID      = 32'h504B4D30;
-localparam [31:0] REG_VERSION = 32'h00010002;
+localparam [31:0] REG_VERSION = 32'h00010003;
 
 assign s_axi_bresp = 2'b00;
 assign s_axi_rresp = 2'b00;
 
 reg [7:0]  path_mode_reg = 8'd0;
+reg [3:0]  path_rpl_reg = 4'd0;
 reg [7:0]  sticky_reg = 8'd0;
 reg [7:0]  gpio_d = 8'd0;
 reg        clr = 1'b0;
 reg [31:0] cnt [0:31];          // [8n + i]: i 0..5 = evt, 6 = GPIO0, 7 = GPIO1
 
 assign path_mode = path_mode_reg;
+assign path_rpl  = path_rpl_reg;
+
+// EFF_PATH read value: PATH_CTRL coding in [2n+1:2n], replay flags in [11:8]
+wire [7:0] eff_code;
+wire [3:0] eff_rpl;
+genvar ge;
+generate for (ge = 0; ge < 4; ge = ge + 1) begin : g_eff
+    assign eff_rpl[ge] = (eff_path[3*ge +: 3] == 3'd4);
+    assign eff_code[2*ge +: 2] = eff_rpl[ge] ? 2'd0 : eff_path[3*ge +: 2];
+end endgenerate
 
 // generator / checker configuration, port n
 reg [2:0]  g_ctrl  [0:3];
@@ -266,6 +283,7 @@ always @(posedge clk) begin
                          ifg_clr_tgl <= !ifg_clr_tgl;
                      end
             10'h006: if (s_axi_wstrb[0]) pair_mode_reg <= s_axi_wdata[3:0];
+            10'h008: if (s_axi_wstrb[0]) path_rpl_reg <= s_axi_wdata[3:0];
             10'h005: if (s_axi_wstrb[0]) sticky_reg <= (sticky_reg | gpio_rise) & ~s_axi_wdata[7:0];
             default: if (wa[11:8] == 4'h1 && wa[5]) begin
                 // 0x100 + n * 0x40 + 0x20: dynamic IFG configuration
@@ -311,7 +329,8 @@ always @(posedge clk) begin
                 6'h04: s_axi_rdata <= {12'd0, link_up, 6'd0, io[9:8], io[7:0]};
                 6'h05: s_axi_rdata <= {24'd0, sticky_reg};
                 6'h06: s_axi_rdata <= {28'd0, pair_mode_reg};
-                6'h07: s_axi_rdata <= {24'd0, eff_path};
+                6'h07: s_axi_rdata <= {20'd0, eff_rpl, eff_code};
+                6'h08: s_axi_rdata <= {28'd0, path_rpl_reg};
                 default: ;
             endcase
         end else if (ra[11:8] == 4'h1 && ra[5] == 1'b0) begin
@@ -341,6 +360,7 @@ always @(posedge clk) begin
         s_axi_arready <= 1'b0;
         s_axi_rvalid  <= 1'b0;
         path_mode_reg <= 8'd0;
+        path_rpl_reg  <= 4'd0;
         pair_mode_reg <= 4'd0;
         sticky_reg    <= 8'd0;
         clr           <= 1'b1;

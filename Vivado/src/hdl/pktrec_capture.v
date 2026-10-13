@@ -23,6 +23,8 @@
 // m_axis_rec (dp_clk): the merged record stream to fdrec_core s_axis_cap;
 // cap_sel: CTRL.SRC_SEL (dp_clk level) selects it in fdrec_core; rec_srst: the
 // recorder's soft reset (dp_clk level) from fdrec_core.
+// tb_now / tb_inc_ns (dp_clk): the timebase's current ns value and the integer
+// part of its increment, for the replay scheduler (pktrec_replay, M6).
 //
 // Copyright (c) 2026 Opsero Electronic Design Inc.
 
@@ -182,6 +184,9 @@ module pktrec_capture #(
     input  wire          m_axis_rec_tready,
     output wire          cap_sel,
     input  wire          rec_srst,
+    // ---- shared timebase (dp_clk) for the replay scheduler (M6) ----
+    output wire [63:0]   tb_now,
+    output wire [7:0]    tb_inc_ns,
     // ---- PHY SFD pins (OP080 GPIO_0 = RX SFD, GPIO_1 = TX SFD; asynchronous) ----
     input  wire [3:0]    phy_gpio0,
     input  wire [3:0]    phy_gpio1,
@@ -266,6 +271,8 @@ pktrec_capture_core #(
     .m_rec_tready(m_axis_rec_tready),
     .cap_sel(cap_sel),
     .rec_srst(rec_srst),
+    .tb_now(tb_now),
+    .tb_inc_ns_out(tb_inc_ns),
     .s_axi_awaddr(s_axi_awaddr),
     .s_axi_awvalid(s_axi_awvalid),
     .s_axi_awready(s_axi_awready),

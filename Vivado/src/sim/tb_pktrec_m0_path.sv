@@ -98,6 +98,10 @@ module tb_pktrec_m0_path;
   initial for (k = 0; k < 4; k = k + 1) begin rx_tdata[k] = 0; rx_tkeep[k] = 0; end
 
   pktrec_m0_path #(.FIFO_DEPTH(FIFO_DEPTH)) dut (
+    // replay input (M6) unused here
+    .dp_clk(1'b0), .dp_aresetn(1'b0), .s_axis_rpl_tdata(16'd0), .s_axis_rpl_tkeep(2'd0),
+    .s_axis_rpl_tvalid(1'b0), .s_axis_rpl_tready(), .s_axis_rpl_tlast(1'b0), .s_axis_rpl_tuser(1'b0),
+    .s_axis_rpl_tdest(2'd0), .rpl_eff(),
     .ctrl_clk(ctrl_clk), .ctrl_aresetn(ctrl_aresetn),
     .rx_clk_0(rx_clk[0]), .rx_aresetn_0(rx_aresetn[0]),
     .s_axis_rx_0_tdata(rx_tdata[0]), .s_axis_rx_0_tkeep(rx_tkeep[0]), .s_axis_rx_0_tvalid(rx_tvalid[0]),
@@ -369,7 +373,7 @@ module tb_pktrec_m0_path;
 
     // 1. identification and reset values
     expect_reg(R_ID, 32'h504B4D30, "ID");
-    expect_reg(R_VERSION, 32'h00010002, "VERSION");
+    expect_reg(R_VERSION, 32'h00010003, "VERSION");
     expect_reg(R_PATH_CTRL, 32'h0, "PATH_CTRL reset");
     expect_reg(12'h0FC, 32'h0, "unmapped");
 

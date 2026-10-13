@@ -12,6 +12,15 @@
 //   3 GEN   the port's hardware traffic generator (pktrec_gen, M2): sequence-
 //           numbered test frames, register-controlled (GEN_* registers); each
 //           port also has a receive checker (pktrec_gen_chk, CHK_*) on its RX
+//   4 REPLAY (M6) frames from the replay scheduler (pktrec_replay): selected by
+//           PATH_RPL bit n, which overrides PATH_CTRL [2n+1:2n]. The replay
+//           stream s_axis_rpl (dp_clk, 16 bit, tdest = TX port) enters one small
+//           cut-through async FIFO per port (dp_clk -> tx_clk[n], 64 bytes);
+//           pktrec_replay holds every frame complete before it releases it and
+//           writes at dp_clk (4x the MAC rate), so the MAC never sees a gap
+//           inside a frame. While a port is not in REPLAY its replay FIFO is
+//           drained (frames discarded), like an unselected LOOP/FWD FIFO.
+//           rpl_eff[n] (ctrl_clk) = port n's TX source is the replay FIFO now.
 // Each (TX port, source) pair has its own store-and-forward async frame FIFO
 // (pktrec_axis_async_fifo, rx_clk[src] -> tx_clk[n]; LOOP FIFO_DEPTH = 4 KB, FWD
 // FWD_FIFO_DEPTH = 16 KB since M3): 8 FIFOs in total. A FIFO
@@ -55,8 +64,31 @@ module pktrec_m0_path #(
     parameter TX_TAG_W   = 8,
     parameter FIFO_DEPTH = 4096,     // bytes per LOOP FIFO
     parameter FWD_FIFO_DEPTH = 16384, // bytes per FWD (TAP) FIFO
-    parameter C_S_AXI_ADDR_WIDTH = 12
+    parameter C_S_AXI_ADDR_WIDTH = 12,
+    parameter RPL_FIFO_DEPTH = 64     // bytes per replay FIFO (cut-through, M6)
 )(
+    // ---- replay stream from pktrec_replay (dp_clk, M6) ----
+    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 dp_clk CLK" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axis_rpl, ASSOCIATED_RESET dp_aresetn" *)
+    input  wire                dp_clk,
+    (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 dp_aresetn RST" *)
+    (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
+    input  wire                dp_aresetn,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_rpl TDATA" *)
+    input  wire [15:0]         s_axis_rpl_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_rpl TKEEP" *)
+    input  wire [1:0]          s_axis_rpl_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_rpl TVALID" *)
+    input  wire                s_axis_rpl_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_rpl TREADY" *)
+    output wire                s_axis_rpl_tready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_rpl TLAST" *)
+    input  wire                s_axis_rpl_tlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_rpl TUSER" *)
+    input  wire [0:0]          s_axis_rpl_tuser,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_rpl TDEST" *)
+    input  wire [1:0]          s_axis_rpl_tdest,
+    output wire [3:0]          rpl_eff,               // ctrl_clk: port n sends replay frames
     // ---- control clock / reset (s_axi, counters) ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 ctrl_clk CLK" *)
     (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi, ASSOCIATED_RESET ctrl_aresetn" *)
@@ -359,6 +391,7 @@ assign {m_axis_mon_3_tuser, m_axis_mon_2_tuser, m_axis_mon_1_tuser, m_axis_mon_0
 // Control / status
 // ---------------------------------------------------------------------------
 wire [7:0]  path_mode;          // ctrl_clk, [2n+1:2n] = mode of TX port n
+wire [3:0]  path_rpl;           // ctrl_clk, [n] = TX port n in REPLAY (overrides path_mode)
 wire [31:0] mode_rx_all;        // path_mode synchronised into rx_clk[n]: [8n+7:8n]
 wire [31:0] mode_tx_all;        // path_mode synchronised into tx_clk[n]: [8n+7:8n]
 wire [23:0] evt_tgl;            // event toggles, [6n+i] (i: see pktrec_m0_regs)
@@ -372,7 +405,7 @@ localparam IST_W  = 1 + 8 + 16 + 16 + 32 + 48;
 wire [4*ICFG_W-1:0] ifg_cfg;
 wire [4*IST_W-1:0]  ifg_st;
 wire                ifg_clr_tgl;    // ctrl_clk toggle: clear max fill / counters
-wire [7:0]          eff_path;       // TX source in use per port (synchronised to ctrl_clk)
+wire [11:0]         eff_path;       // TX source in use per port (sel, 3 bits, ctrl_clk)
 wire [7:0]          flush_tgl;      // [2n+k] frame flushed from FIFO 2n+k (tx_clk[n])
 // generator / checker configuration (ctrl_clk) and status (into ctrl_clk)
 localparam GCFG_W = 3 + 14 + 14 + 16 + 32 + 48 + 48 + 16 + 32 + 32;   // 255
@@ -391,7 +424,42 @@ wire [7:0]      f_tvalid, f_tready, f_tlast, f_tuser;
 
 genvar n, f;
 
+// replay FIFOs (M6): one per TX port, dp_clk -> tx_clk[n], cut-through
+wire        dp_rst = !dp_aresetn;
+wire [63:0] r_tdata;
+wire [7:0]  r_tkeep;
+wire [3:0]  r_tvalid, r_tready, r_tlast, r_tuser, r_s_tready;
+assign s_axis_rpl_tready = r_s_tready[s_axis_rpl_tdest];
+
 generate
+for (n = 0; n < 4; n = n + 1) begin : g_rpl_fifo
+    pktrec_axis_async_fifo #(
+        .DEPTH(RPL_FIFO_DEPTH),
+        .RAM_PIPELINE(1),
+        .FRAME_FIFO(1'b0),
+        .RAMSTYLE("distributed")
+    ) rpl_fifo_inst (
+        .s_clk(dp_clk),
+        .s_rst(dp_rst),
+        .s_tdata(s_axis_rpl_tdata),
+        .s_tkeep(s_axis_rpl_tkeep),
+        .s_tvalid(s_axis_rpl_tvalid && s_axis_rpl_tdest == n),
+        .s_tready(r_s_tready[n]),
+        .s_tlast(s_axis_rpl_tlast),
+        .s_tuser(s_axis_rpl_tuser[0]),
+        .m_clk(tx_clk[n]),
+        .m_rst(tx_rst[n]),
+        .m_tdata(r_tdata[16*n +: 16]),
+        .m_tkeep(r_tkeep[2*n +: 2]),
+        .m_tvalid(r_tvalid[n]),
+        .m_tready(r_tready[n]),
+        .m_tlast(r_tlast[n]),
+        .m_tuser(r_tuser[n]),
+        .s_drop(),
+        .s_good(),
+        .m_depth()
+    );
+end
 for (f = 0; f < 8; f = f + 1) begin : g_fifo
     localparam integer DST  = f / 2;
     localparam integer KIND = f % 2;
@@ -457,10 +525,13 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
         .clk(tx_clk[n]), .in(path_mode), .out(mode_tx_all[8*n +: 8]));
 
     // ---- TX source select (tx_clk[n]) ----
+    wire [3:0] rpl_tx;
+    taxi_sync_signal #(.WIDTH(4), .N(2)) rpl_tx_sync_inst (
+        .clk(tx_clk[n]), .in(path_rpl), .out(rpl_tx));
     wire [1:0] tmode  = mode_tx_all[8*n + 2*n +: 2];
-    wire [1:0] target = tmode;
-    reg  [1:0] sel = 2'd0;          // 0 none, 1 LOOP FIFO (2n), 2 FWD FIFO (2n+1), 3 GEN
-    reg  [2:0] fin = 3'b000;        // FIFO / generator output is inside a frame
+    wire [2:0] target = rpl_tx[n] ? 3'd4 : {1'b0, tmode};
+    reg  [2:0] sel = 3'd0;          // 0 none, 1 LOOP FIFO (2n), 2 FWD FIFO (2n+1), 3 GEN, 4 REPLAY
+    reg  [3:0] fin = 4'b0000;       // FIFO / generator / replay output is inside a frame
 
     // ---- dynamic IFG / generator-bad configuration (tx_clk[n]) ----
     wire [ICFG_W-1:0] icfg;
@@ -481,10 +552,10 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
     wire [1:0]  g_tkeep;
     wire        g_tvalid, g_tlast, g_running, g_done;
     wire [63:0] g_frames, g_bytes;
-    wire        g_tready = (sel == 2'd3) ? tx_tready[n] : 1'b0;
+    wire        g_tready = (sel == 3'd3) ? tx_tready[n] : 1'b0;
     pktrec_gen gen_inst (
         .clk(tx_clk[n]), .rst(tx_rst[n]),
-        .enable(gcfg[0]), .allow(sel == 2'd3), .fmt_raw(gcfg[1]), .rand_len(gcfg[2]),
+        .enable(gcfg[0]), .allow(sel == 3'd3), .fmt_raw(gcfg[1]), .rand_len(gcfg[2]),
         .len(gcfg[3 +: 14]), .len_mask(gcfg[17 +: 14]), .ifg(gcfg[31 +: 16]),
         .count(gcfg[47 +: 32]), .dst(gcfg[79 +: 48]), .src(gcfg[127 +: 48]),
         .etype(gcfg[175 +: 16]), .stream(gcfg[191 +: 32]), .seq_first(gcfg[223 +: 32]),
@@ -545,39 +616,41 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
     assign chk_st[CST_W*n +: CST_W] = cst_q;
 
     // ---- TX source select ----
-    wire [2:0] hs = {g_tvalid && g_tready,
+    wire [3:0] hs = {r_tvalid[n] && r_tready[n], g_tvalid && g_tready,
                      f_tvalid[2*n+1] && f_tready[2*n+1], f_tvalid[2*n] && f_tready[2*n]};
 
-    assign f_tready[2*n]   = (sel == 2'd1) ? tx_tready[n] : 1'b1;   // unselected: drain
-    assign f_tready[2*n+1] = (sel == 2'd2) ? tx_tready[n] : 1'b1;
-    assign tx_tvalid[n] = (sel == 2'd1) ? f_tvalid[2*n] : (sel == 2'd2) ? f_tvalid[2*n+1] :
-                          (sel == 2'd3) ? g_tvalid : 1'b0;
-    assign tx_tdata[16*n +: 16] = (sel == 2'd3) ? g_tdata :
-                                  (sel == 2'd2) ? f_tdata[16*(2*n+1) +: 16] : f_tdata[16*(2*n) +: 16];
-    assign tx_tkeep[2*n +: 2]   = (sel == 2'd3) ? g_tkeep :
-                                  (sel == 2'd2) ? f_tkeep[2*(2*n+1) +: 2]  : f_tkeep[2*(2*n) +: 2];
-    assign tx_tlast[n]          = (sel == 2'd3) ? g_tlast :
-                                  (sel == 2'd2) ? f_tlast[2*n+1] : f_tlast[2*n];
-    assign tx_tuser[n]          = (sel == 2'd3) ? i_gen_bad :
-                                  (sel == 2'd2) ? f_tuser[2*n+1] : f_tuser[2*n];
+    assign f_tready[2*n]   = (sel == 3'd1) ? tx_tready[n] : 1'b1;   // unselected: drain
+    assign f_tready[2*n+1] = (sel == 3'd2) ? tx_tready[n] : 1'b1;
+    assign r_tready[n]     = (sel == 3'd4) ? tx_tready[n] : 1'b1;
+    assign tx_tvalid[n] = (sel == 3'd1) ? f_tvalid[2*n] : (sel == 3'd2) ? f_tvalid[2*n+1] :
+                          (sel == 3'd3) ? g_tvalid : (sel == 3'd4) ? r_tvalid[n] : 1'b0;
+    assign tx_tdata[16*n +: 16] = (sel == 3'd4) ? r_tdata[16*n +: 16] : (sel == 3'd3) ? g_tdata :
+                                  (sel == 3'd2) ? f_tdata[16*(2*n+1) +: 16] : f_tdata[16*(2*n) +: 16];
+    assign tx_tkeep[2*n +: 2]   = (sel == 3'd4) ? r_tkeep[2*n +: 2] : (sel == 3'd3) ? g_tkeep :
+                                  (sel == 3'd2) ? f_tkeep[2*(2*n+1) +: 2]  : f_tkeep[2*(2*n) +: 2];
+    assign tx_tlast[n]          = (sel == 3'd4) ? r_tlast[n] : (sel == 3'd3) ? g_tlast :
+                                  (sel == 3'd2) ? f_tlast[2*n+1] : f_tlast[2*n];
+    assign tx_tuser[n]          = (sel == 3'd4) ? r_tuser[n] : (sel == 3'd3) ? i_gen_bad :
+                                  (sel == 3'd2) ? f_tuser[2*n+1] : f_tuser[2*n];
 
     always @(posedge tx_clk[n]) begin
         if (hs[0]) fin[0] <= !f_tlast[2*n];
         if (hs[1]) fin[1] <= !f_tlast[2*n+1];
         if (hs[2]) fin[2] <= !g_tlast;
+        if (hs[3]) fin[3] <= !r_tlast[n];
         // change source only when no source output is inside a frame
-        if (hs == 3'b000 && fin == 3'b000) sel <= target;
+        if (hs == 4'b0000 && fin == 4'b0000) sel <= target;
         if (tx_rst[n]) begin
-            sel <= 2'd0;
-            fin <= 3'b000;
+            sel <= 3'd0;
+            fin <= 4'b0000;
         end
     end
 
     // ---- frames discarded from an unselected FIFO (mode switch) -> FLUSH ----
     reg [1:0] fl_tgl = 2'b00;
     always @(posedge tx_clk[n]) begin
-        if (sel != 2'd1 && f_tvalid[2*n]   && f_tlast[2*n])   fl_tgl[0] <= !fl_tgl[0];
-        if (sel != 2'd2 && f_tvalid[2*n+1] && f_tlast[2*n+1]) fl_tgl[1] <= !fl_tgl[1];
+        if (sel != 3'd1 && f_tvalid[2*n]   && f_tlast[2*n])   fl_tgl[0] <= !fl_tgl[0];
+        if (sel != 3'd2 && f_tvalid[2*n+1] && f_tlast[2*n+1]) fl_tgl[1] <= !fl_tgl[1];
     end
     assign flush_tgl[2*n +: 2] = fl_tgl;
 
@@ -641,8 +714,9 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
     assign ifg_st[IST_W*n +: IST_W] = ist_q;
 
     // effective TX source back into ctrl_clk (EFF_PATH)
-    taxi_sync_signal #(.WIDTH(2), .N(3)) eff_sync_inst (
-        .clk(ctrl_clk), .in(sel), .out(eff_path[2*n +: 2]));
+    taxi_sync_signal #(.WIDTH(3), .N(3)) eff_sync_inst (
+        .clk(ctrl_clk), .in(sel), .out(eff_path[3*n +: 3]));
+    assign rpl_eff[n] = (eff_path[3*n +: 3] == 3'd4);
 
     // ---- event toggles (source domains) ----
     reg rx_good_tgl = 1'b0, rx_bad_tgl = 1'b0, tx_good_tgl = 1'b0, tx_unf_tgl = 1'b0;
@@ -692,6 +766,7 @@ pktrec_m0_regs #(
     .io(io_s),
     .link_up(link_up),
     .path_mode(path_mode),
+    .path_rpl(path_rpl),
     .gen_cfg(gen_cfg),
     .chk_cfg(chk_cfg),
     .gen_st(gen_st),

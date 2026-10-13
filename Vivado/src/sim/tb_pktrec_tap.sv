@@ -21,7 +21,7 @@
 // local TX clock (QPLL). P2/P3 are not used (clocks stopped).
 //
 // Tests:
-//   1. Registers: VERSION 1.2, IFG_CTRL / IFG_THRESH reset values, PAIR_MODE RW,
+//   1. Registers: VERSION 1.3, IFG_CTRL / IFG_THRESH reset values, PAIR_MODE RW,
 //      EFF_PATH follows PATH_CTRL.
 //   2. Bad-frame forwarding: frames sent error-terminated (TX tuser -> /V/ over the
 //      FCS) and frames with a bit error on the line (bad FCS) arrive at P0/P1, are
@@ -428,6 +428,10 @@ module tb_pktrec_tap;
   wire [31:0] rdata;
 
   pktrec_m0_path dut (
+    // replay input (M6) unused here
+    .dp_clk(1'b0), .dp_aresetn(1'b0), .s_axis_rpl_tdata(16'd0), .s_axis_rpl_tkeep(2'd0),
+    .s_axis_rpl_tvalid(1'b0), .s_axis_rpl_tready(), .s_axis_rpl_tlast(1'b0), .s_axis_rpl_tuser(1'b0),
+    .s_axis_rpl_tdest(2'd0), .rpl_eff(),
     .ctrl_clk(ctrl_clk), .ctrl_aresetn(ctrl_aresetn),
     .rx_clk_0(rx_clk[0]), .rx_aresetn_0(rx_aresetn[0]),
     .s_axis_rx_0_tdata(rx_tdata[0]), .s_axis_rx_0_tkeep(rx_tkeep[0]), .s_axis_rx_0_tvalid(rx_tvalid[0]),
@@ -629,7 +633,7 @@ module tb_pktrec_tap;
 
     // ---- 1. registers ----
     expect_reg(R_ID, 32'h504B4D30, "ID");
-    expect_reg(R_VERSION, 32'h00010002, "VERSION");
+    expect_reg(R_VERSION, 32'h00010003, "VERSION");
     for (int p = 0; p < 4; p++) begin
       expect_reg(preg(p, P_IFG_CTRL), 32'h00080C01, "IFG_CTRL reset");
       expect_reg(preg(p, P_IFG_THRESH), 32'h08000C00, "IFG_THRESH reset");

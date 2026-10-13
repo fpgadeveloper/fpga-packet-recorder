@@ -57,6 +57,9 @@ module pktrec_capture_core #(
     input  wire logic             m_rec_tready,
     output wire logic             cap_sel,
     input  wire logic             rec_srst,
+    // timebase for other dp_clk blocks (M6 replay scheduler)
+    output wire logic [63:0]      tb_now,
+    output wire logic [7:0]       tb_inc_ns_out,
 
     input  wire logic [11:0]      s_axi_awaddr,
     input  wire logic             s_axi_awvalid,
@@ -98,6 +101,8 @@ for (g = 0; g < N; g = g + 1) begin : g_ts
 end
 
 // ---- timebase ----
+assign tb_now        = tb_ns;
+assign tb_inc_ns_out = tb_inc_ns;
 pktrec_timebase #(.CLK_HZ(DP_CLK_HZ), .N(N)) tb_inst (
     .clk(dp_clk), .rst(dp_rst),
     .inc_load(tb_inc_load), .inc_ns_in(tb_inc_ns_wr), .inc_frac_in(tb_inc_frac_wr),
