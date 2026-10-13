@@ -165,6 +165,26 @@ def test_controller(tb):
     run_for(d, clock, 60)
     check(d.st["locked"], "locked again")
 
+    print("tb-hold file (another timebase user, e.g. replay): no steps while it exists")
+    with tempfile.TemporaryDirectory() as td:
+        old = tb.RUN_DIR
+        tb.RUN_DIR = td
+        hold = os.path.join(td, f"tb-hold.{os.getpid()}")
+        open(hold, "w").close()
+        n_log = len(hw.log)
+        clock.rt_off += 3e9
+        run_for(d, clock, 5)
+        check(not any(e[1] in ("set", "adj") for e in hw.log[n_log:]) and d.st["steps_held"],
+              "3 s offset with tb-hold.<own pid>: no TB_SET / TB_ADJ")
+        os.unlink(hold)
+        open(os.path.join(td, "tb-hold.999999999"), "w").close()   # stale: process gone
+        run_for(d, clock, 2)
+        check(any(e[1] == "set" for e in hw.log[n_log:]) and not d.st["steps_held"],
+              "hold released (stale pid ignored): TB_SET")
+        tb.RUN_DIR = old
+    run_for(d, clock, 60)
+    check(d.st["locked"], "locked again")
+
     print("2 s system-clock step, idle: TB_SET")
     n_sets = d.st["sets"]
     clock.rt_off += 2e9

@@ -46,6 +46,9 @@ Daemon (controller, see docs/source/software.md "Timebase discipline"):
   while a capture runs. While a capture runs the phase is corrected through the
   frequency only (an INC change moves a frame waiting in a FIFO by
   cycles x dINC, picoseconds; a TB_ADJ step would move it by the step).
+  Another user of the timebase (e.g. replay, which releases frames against it)
+  holds steps off the same way by creating $PKTREC_RUN_DIR/tb-hold.<pid>
+  (ignored once that process is gone) or tb-hold (until removed).
   locked = |offset| < --lock-threshold (10 us) for --lock-time (30 s); lost
   after 3 samples with |offset| > 5 x the threshold, or after a SET / step.
 
@@ -324,6 +327,29 @@ def ppb_to_inc(ppb, dp_clk_hz):
     return round(nominal_inc_raw(dp_clk_hz) * (1.0 + ppb * 1e-9))
 
 
+def steps_held(run_dir=None):
+    """True while a tb-hold[.<pid>] file asks the daemon not to step the timebase."""
+    run_dir = run_dir or RUN_DIR
+    try:
+        names = os.listdir(run_dir)
+    except OSError:
+        return False
+    for n in names:
+        if n == "tb-hold":
+            return True
+        if n.startswith("tb-hold."):
+            try:
+                os.kill(int(n[8:]), 0)
+                return True
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                return True
+            except ValueError:
+                continue
+    return False
+
+
 def measure(hw, clock, samples=7):
     """Timebase - CLOCK_REALTIME (ns) from the read pair with the shortest latency."""
     best = None
@@ -512,7 +538,9 @@ class Daemon:
         o, hw = self.o, self.hw
         mono = self.clock.monotonic()
         x, lat, t_rt = measure(hw, self.clock, o.samples)
-        cap = hw.capture_running()
+        held = steps_held()
+        cap = hw.capture_running() or held
+        self.st["steps_held"] = held
         if mono - self.ntp_t > 10:
             self.st["ntp_synced"] = ntp_synced()
             self.ntp_t = mono

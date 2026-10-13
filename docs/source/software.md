@@ -328,7 +328,10 @@ ts = TB_NOW - cycles_since_SFD * INC + MAC_OFFSET
 * An `INC` change moves them only by cycles × ΔINC. For example, 1000 cycles at 50 ppm is
   0.2 ns, below the resolution.
 
-So while `CTRL.ENABLE` or `FILL` is set, the daemon only writes `INC`. A capture may still
+So while `CTRL.ENABLE` or `FILL` is set, the daemon only writes `INC`. Another program that
+depends on the timebase can hold steps off the same way. Replay, for example, releases
+frames against the timebase. It creates `/run/pktrec/tb-hold.<pid>`, which is ignored once
+that process has exited, or `/run/pktrec/tb-hold`, which holds until it is removed. A capture may still
 see a frequency slew of up to 200 ppm right after the system clock jumps. Inter-frame
 intervals are then off by up to that fraction (0.2 ns per µs of interval), and the
 timestamps stay monotonic.
