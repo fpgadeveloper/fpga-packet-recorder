@@ -35,7 +35,9 @@ PKTREC_TARGET ?= "${@d.getVar('MACHINE').replace('pktrec-', '', 1)}"
 EXTRA_OEMAKE = "PKTREC_TARGET='${PKTREC_TARGET}'"
 
 do_compile() {
-    oe_runmake
+    # -B: never reuse binaries left in the source tree by a host build
+    # (test/selftest_export.py builds pktrec-export for the PC in place)
+    oe_runmake -B
 }
 
 do_install() {
