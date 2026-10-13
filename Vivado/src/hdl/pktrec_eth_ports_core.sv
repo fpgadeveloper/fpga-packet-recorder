@@ -255,6 +255,11 @@ taxi_eth_mac_1g_basex_us #(
     .QPLL1_PD(1'b1),
     .GT_TX_POLARITY(GT_TX_POLARITY),
     .GT_RX_POLARITY(GT_RX_POLARITY),
+    // LPM receive equaliser on all lanes (Taxi default is DFE). 1.25 Gb/s SGMII over
+    // a few cm of FMC trace is a low-loss channel: the M1 bench (m1_bench.md) saw
+    // intermittent 10b code-group bit errors (up to 60 % bad FCS) in DFE mode on all
+    // ports and clean lanes for > 1 h with RXLPMEN = 1 set live through the GT APB.
+    .GT_RX_LPM_EN(4'b1111),
     .COMBINED_MAC_PCS(1'b1),
     .SGMII_EN(1'b1),
     .AN_EN(1'b1),

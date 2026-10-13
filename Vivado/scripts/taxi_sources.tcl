@@ -112,6 +112,17 @@ lappend pktrec_rtl $pktrec_shell
 if {[llength [get_ips -quiet taxi_eth_phy_1g_basex_us_gth_ll_full]] == 0} {
     source "$taxi_dir/src/eth/rtl/us/taxi_eth_phy_1g_basex_us_gth_125.tcl"
 }
+# Receive equaliser: LPM (the Taxi script leaves RX_EQ_MODE = AUTO, and the MAC's
+# GT_RX_LPM_EN parameter default is DFE). With LPM the wizard tunes the channel
+# attributes for LPM; the RXLPMEN port is driven to 1 by pktrec_eth_ports_core
+# (GT_RX_LPM_EN = 4'b1111). DFE corrupted frames on the bench (m1_bench.md).
+foreach ip {taxi_eth_phy_1g_basex_us_gth_full taxi_eth_phy_1g_basex_us_gth_ch
+            taxi_eth_phy_1g_basex_us_gth_ll_full taxi_eth_phy_1g_basex_us_gth_ll_ch} {
+    set gt_ip [get_ips -quiet $ip]
+    if {[llength $gt_ip] && [get_property CONFIG.RX_EQ_MODE $gt_ip] ne "LPM"} {
+        set_property CONFIG.RX_EQ_MODE {LPM} $gt_ip
+    }
+}
 if {$pktrec_gt_ll} {
     set pktrec_unused_ips {taxi_eth_phy_1g_basex_us_gth_full taxi_eth_phy_1g_basex_us_gth_ch}
 } else {
