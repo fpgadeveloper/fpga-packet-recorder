@@ -130,12 +130,18 @@ Both blocks are bound to `generic-uio` in the device tree. The `pktrec-phy` tool
 
 * mirror mode on,
 * SGMII with SGMII auto-negotiation,
-* SFD indications on GPIO_0 (RX) and GPIO_1 (TX),
+* SFD indications on GPIO_0 (RX) and GPIO_1 (TX): GPIO_MUX_CTRL (0x0172) = 0x0012,
+  RXFCFG (0x0134) = 0x1080, SYNC_FIFO_CTRL (0x00E9) = 0xDF22. Verified on the bench:
+  GPIO_0 edges equal RX_GOOD and GPIO_1 edges equal TX_GOOD on every port,
 * a soft restart.
 
-The DP83867 sends its SGMII status word to the MAC only once after a restart. Until M1
-moves this into the fabric, keep `pktrec-phy watch` running, or run `init` again after
-plugging a cable.
+The DP83867 sends its SGMII status word to the MAC only once after a restart. The
+image runs `pktrec-phy-watch.service` (systemd, enabled by default): it runs
+`pktrec-phy init --1000-only` at boot and then `pktrec-phy watch`, which re-triggers the
+status word on every copper link change. All MDIO accesses of `pktrec-phy` hold an
+flock on `/run/lock/pktrec-mdio`, so the service and command-line calls never
+interleave on the single MDIO master. To use other advertisement settings, stop the
+service (`systemctl stop pktrec-phy-watch`) and run `pktrec-phy init` by hand.
 
 The OP080 has no bypass relays. If the board is unpowered or reconfiguring, every port
 link is broken, including a TAP pair.

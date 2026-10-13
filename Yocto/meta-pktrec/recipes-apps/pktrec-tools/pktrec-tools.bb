@@ -14,16 +14,23 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 # Sources come straight from this repository (PKTREC_REPO_ROOT: layer.conf).
 FILESEXTRAPATHS:prepend := "${PKTREC_REPO_ROOT}:"
-SRC_URI = "file://sw/pktrec-tools"
+SRC_URI = "file://sw/pktrec-tools \
+           file://pktrec-phy-watch.service"
 S = "${WORKDIR}/sw/pktrec-tools"
 
-inherit allarch
+inherit allarch systemd
+
+# PHY init (--1000-only) + SGMII link watcher at boot
+SYSTEMD_SERVICE:${PN} = "pktrec-phy-watch.service"
+SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 
 do_compile[noexec] = "1"
 
 do_install() {
     install -d ${D}${bindir}
     install -m 0755 ${S}/pktrec-phy ${D}${bindir}/pktrec-phy
+    install -d ${D}${systemd_system_unitdir}
+    install -m 0644 ${WORKDIR}/pktrec-phy-watch.service ${D}${systemd_system_unitdir}/
 }
 
 RDEPENDS:${PN} = "python3-core python3-mmap"

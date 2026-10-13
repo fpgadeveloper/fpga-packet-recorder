@@ -23,9 +23,16 @@ Commands:
                          PHY's copper link changes (DP83867 sends it only once)
   mdio <phy> <reg> [val] raw PHY register access (phy: p0..p3 or MDIO address;
                          reg > 0x1f uses the extended REGCR/ADDAR indirection)
+
+There is one MDIO master for the four PHYs: every MDIO access (including the
+4-step extended-register sequences and read-modify-writes) holds an flock on
+/run/lock/pktrec-mdio, so 'watch' (pktrec-phy-watch.service) and CLI commands
+never interleave on the bus.
 """
 
 import argparse
+import contextlib
+import fcntl
 import mmap
 import os
 import sys
@@ -115,6 +122,30 @@ class Board:
             raise SystemExit(f"pktrec-phy: m0_path ID 0x{self.m0.rd(M0_ID):08x}, "
                              f"expected 0x{M0_ID_VALUE:08x}")
 
+    # ---- MDIO bus lock (flock, re-entrant within this process) ----
+    MDIO_LOCK = "/run/lock/pktrec-mdio"
+    _lock_fd = None
+    _lock_depth = 0
+
+    @contextlib.contextmanager
+    def mdio_lock(self):
+        if self._lock_depth == 0:
+            try:
+                os.makedirs(os.path.dirname(self.MDIO_LOCK), exist_ok=True)
+                self._lock_fd = os.open(self.MDIO_LOCK, os.O_RDWR | os.O_CREAT, 0o666)
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+            except OSError:
+                self._lock_fd = None          # no lock directory: run unlocked
+        self._lock_depth += 1
+        try:
+            yield
+        finally:
+            self._lock_depth -= 1
+            if self._lock_depth == 0 and self._lock_fd is not None:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                os.close(self._lock_fd)
+                self._lock_fd = None
+
     # ---- MDIO (Taxi taxi_mdio_master behind the shell's MDIO_CMD/STATUS/RDATA) ----
     def _mdio_wait(self, want_rd, timeout=0.05):
         t0 = time.monotonic()
@@ -136,28 +167,31 @@ class Board:
         return self.eth.rd(ETH_MDIO_RDATA) & 0xFFFF if op == 2 else None
 
     def mdio_rd(self, phy, reg):
-        if reg <= 0x1F:
-            return self._mdio(2, phy, reg)
-        self._mdio(1, phy, REGCR, 0x001F)
-        self._mdio(1, phy, ADDAR, reg)
-        self._mdio(1, phy, REGCR, 0x401F)
-        return self._mdio(2, phy, ADDAR)
+        with self.mdio_lock():
+            if reg <= 0x1F:
+                return self._mdio(2, phy, reg)
+            self._mdio(1, phy, REGCR, 0x001F)
+            self._mdio(1, phy, ADDAR, reg)
+            self._mdio(1, phy, REGCR, 0x401F)
+            return self._mdio(2, phy, ADDAR)
 
     def mdio_wr(self, phy, reg, val):
-        if reg <= 0x1F:
-            self._mdio(1, phy, reg, val)
-            return
-        self._mdio(1, phy, REGCR, 0x001F)
-        self._mdio(1, phy, ADDAR, reg)
-        self._mdio(1, phy, REGCR, 0x401F)
-        self._mdio(1, phy, ADDAR, val)
+        with self.mdio_lock():
+            if reg <= 0x1F:
+                self._mdio(1, phy, reg, val)
+                return
+            self._mdio(1, phy, REGCR, 0x001F)
+            self._mdio(1, phy, ADDAR, reg)
+            self._mdio(1, phy, REGCR, 0x401F)
+            self._mdio(1, phy, ADDAR, val)
 
     def mdio_rmw(self, phy, reg, clr, setb):
-        v = self.mdio_rd(phy, reg)
-        n = (v & ~clr) | setb
-        if n != v:
-            self.mdio_wr(phy, reg, n)
-        return v
+        with self.mdio_lock():
+            v = self.mdio_rd(phy, reg)
+            n = (v & ~clr) | setb
+            if n != v:
+                self.mdio_wr(phy, reg, n)
+            return v
 
     # ---- helpers ----
     def eth_port(self, n, off):
@@ -194,9 +228,12 @@ def init_phy(b, n, only1000, sfd):
         b.mdio_rmw(a, ANAR, 0, 0x01E0)         # strap default: 10/100/1000 HD+FD
         b.mdio_rmw(a, CFG1, 0, 0x0300)
     if sfd:
-        # TI SNLA242: TX SFD on GPIO_1, RX SFD on GPIO_0 (RGZ package)
+        # GPIO_MUX_CTRL 0x0012: GPIO_0 = RX SFD, GPIO_1 = TX SFD. Verified on the
+        # bench (2026-10-13): GPIO0 edges == RX_GOOD and GPIO1 edges == TX_GOOD on
+        # all ports. (0x0120, from a reading of TI SNLA242, only put RX SFD on
+        # GPIO_1 and left GPIO_0 at its default.)
         b.mdio_wr(a, RXFCFG, 0x1080)
-        b.mdio_wr(a, GPIO_MUX_CTRL, 0x0120)
+        b.mdio_wr(a, GPIO_MUX_CTRL, 0x0012)
         b.mdio_wr(a, SYNC_FIFO_CTRL, 0xDF22)
     b.mdio_rmw(a, BMCR, 0x0C00, 0x1000)        # AN on, not powered down / isolated
     b.mdio_wr(a, CTRL, 0x4000)                 # SW_RESTART (registers kept)

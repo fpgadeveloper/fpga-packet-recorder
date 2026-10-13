@@ -1,0 +1,18 @@
+# Ethernet FMC Max (OP080): configure the four DP83867 PHYs at boot and keep
+# the SGMII status word fresh on every copper link change (the DP83867 sends it
+# only once, see pktrec-phy 'watch'). Runs as a service so it survives SSH
+# sessions (nohup/setsid copies die with the session).
+[Unit]
+Description=OP080 PHY init and SGMII link watcher (pktrec-phy)
+After=systemd-udev-settle.service local-fs.target
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/pktrec-phy init --1000-only
+ExecStart=/usr/bin/python3 -u /usr/bin/pktrec-phy watch
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
