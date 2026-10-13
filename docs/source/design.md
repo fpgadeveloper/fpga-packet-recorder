@@ -250,7 +250,8 @@ domain. The MAC latches the count at the start of frame. When the header is buil
 | sampling jitter of the cycle-count copy | at most 8 ns (simulation: 12..14 cycles of delay) |
 | PHY, PCS and transceiver latency | constant, not calibrated in M1 |
 
-M2 replaces the MAC timestamps with the PHYs' SFD pulses, sampled in `dp_clk`.
+Since M2 the record timestamp normally comes from the PHYs' SFD pins instead (see
+[SFD timestamping](#sfd-timestamping-m2)); the MAC timestamp remains the fallback.
 
 Taxi's PTP clock-domain-crossing module (`taxi_ptp_clock_cdc`, a digital PLL per clock
 domain) was tried first. In simulation, with the 125..250 ppm frequency offsets expected
@@ -259,7 +260,8 @@ around the master. The cycle-count scheme has no lock time and only a constant o
 
 ### Capture register map
 
-`pktrec_capture` (`0x04_2003_0000`, 4 KB, `generic-uio`), register map 1.1. The full
+`pktrec_capture` (`0x04_2003_0000`, 4 KB, `generic-uio`), register map 1.2 (1.1 plus the
+SFD block at `0x400`..`0xBFF`, see [SFD timestamping](#sfd-timestamping-m2)). The full
 definitions, including the start and stop protocol with the fdrec driver, are in
 `include/pktrec_regs.h`. 64-bit counters are `_LO`/`_HI` pairs: reading `_LO` latches
 the matching `_HI`.
@@ -267,7 +269,7 @@ the matching `_HI`.
 | Offset | Name | Description |
 |--------|------|-------------|
 | `0x000` | ID | `0x504B4350` |
-| `0x004` | VERSION | `0x00010001` |
+| `0x004` | VERSION | `0x00010002` |
 | `0x008` | CTRL | [0] ENABLE, [1] FILL, [2] SRC_SEL (recorder source: 1 = capture), [8] CLEAR (self-clearing) |
 | `0x00C` | STATUS | [0] IDLE, [1] merge busy, [11:8] port idle, [15:12] port receiving a captured frame, [23:16] MAC clock domains out of reset |
 | `0x010` | PORT_EN | [3:0] per-port enable (reset `0xF`) |
@@ -306,3 +308,188 @@ Self-checking testbenches (`Vivado/scripts/sim.tcl`):
 * `tb_pktrec_capture`: the four ports, the merge, the registers and `fdrec_core` in
   capture mode with a DMA model. It follows the start and stop protocol and checks the
   recorded stream frame by frame, then cuts records in flight with a recorder soft reset.
+
+## SFD timestamping (M2)
+
+Each DP83867 raises its GPIO_0 when it receives a start-of-frame delimiter on the cable
+and keeps it high until the end of the frame; GPIO_1 does the same for transmitted
+frames (`pktrec-phy init` sets `GPIO_MUX_CTRL` = `0x0012`). The reference point is the
+MDI (cable) side of the PHY, which is what a capture timestamp should describe: the
+PHY, SGMII, transceiver and PCS latencies, and their variation, are all behind it.
+
+### Sampling and resolution
+
+The eight pins reach the FPGA through the OP080's SN74AVC4T245 translators (LVCMOS18,
+HP banks 67/68) and go straight from their input buffers into ISERDESE3 primitives
+(`pktrec_sfd_io`):
+
+* An MMCM takes `dp_clk` (249.975 MHz) and makes, from one VCO (4 x `dp_clk`), a 2x
+  clock (~500 MHz, BUFGCE) and a 1x clock (~250 MHz, BUFGCE). The two are phase
+  aligned by construction, and to `dp_clk` by the MMCM's feedback compensation.
+  (A BUFGCE_DIV for the 1x clock was avoided: its divided edge can come up on either
+  2x edge, which would shift the samples by 2 ns from one configuration to the next.)
+* ISERDESE3 in component mode, DATA_WIDTH 4, DDR on the 2x clock: four samples per
+  `dp_clk` cycle, one every ~1.0 ns. The 4-bit words cross into `dp_clk` as an
+  ordinary timed path (same frequency, phase locked).
+* `pktrec_sfd_edge` finds the first high sample after a low one: the timestamp is the
+  timebase value of that cycle plus the sample index (ns), minus the fixed sampler
+  pipeline (`SFD_PIPE_NS` = 16).
+
+**Resolution: 1 ns** (`SFD_RES_PS` = 1000). In simulation with the real ISERDESE3 and
+MMCME4 models, 8 pins x 150 edges at random sub-ns phases gave a timestamp error
+uniformly within (-1, 0] ns (the timestamp is the first sample at or after the edge).
+The IDDR fallback (`SFD_SAMPLER = "IDDR"`, no MMCM, 2 samples per cycle) gives 2 ns.
+The DP83867 itself adds a receive SFD variation of up to +-8 ns that changes with every
+link-up (it is constant while the link stays up; register `0x0055` reports it in 8 ns
+steps) and none on transmit at 1000 Mb/s.
+
+Glitch filter: an edge counts only if the pin was low for at least `SFD_MIN_LOW`
+cycles before (reset 25 = 100 ns; real frames are at least 160 ns apart at 1 Gb/s) and
+stays high for `SFD_MIN_HIGH` cycles after (reset 8 = 32 ns; a minimum frame keeps it
+high for 512 ns). Rejected edges are counted (`RX_GLITCH`, `TX_GLITCH`).
+
+### Matching receive SFDs to frames
+
+Each accepted receive edge goes into a 16-entry queue in the port's capture front end
+(`pktrec_cap_port`, dp_clk to rx_clk). From the first beat of every frame - captured,
+dropped by the FIFO or not enabled alike, since every frame had an SFD - the oldest
+entry is compared with the frame's MAC timestamp (the cycle stamp the Taxi MAC took at
+its own SFD detection):
+
+    d = MAC_raw - t_sfd        (ns; MAC_raw = MAC cycle stamp x 4 ns, no MAC_OFFSET)
+
+| Condition | Action |
+|-----------|--------|
+| `d` > `RX_WIN_MAX` | stale entry (a pulse without a frame): dropped, `RX_STALE`, record flag bit3; try the next |
+| `RX_WIN_MIN` <= `d` <= `RX_WIN_MAX` | match: record ts = `t_sfd` + `RX_OFFSET`, flag bit2 (TS_MAC) = 0 |
+| `d` < `RX_WIN_MIN` | the entry belongs to a later frame: kept; this frame falls back |
+| queue empty | wait until the frame's last beat, then fall back |
+
+A frame without a match gets the MAC timestamp (`+ MAC_OFFSET`, flag bit2 = 1) and
+counts `RX_MISMATCH`. A missing pulse costs only its own frame and an extra one is
+discarded at the next frame: nothing ever shifts. The window (reset 100..700 ns)
+must stay narrower than a minimum frame time (672 ns at 1 Gb/s), so that the SFDs of
+neighbouring frames can never fall inside it. `RX_DELTA_LAST/MIN/MAX` record `d` of
+the matches, `RX_HEAD_DELTA` the `d` of the last entry evaluated whatever the outcome
+(use it to place the window when nothing matches). In simulation, with the pin pulsed
+350 ns before the frame entered the MAC model, `d` was 303 ns.
+
+Record flags (`include/pktrec_format.h`): bit2 TS_MAC = 1 when the frame fell back to
+the MAC timestamp; bit3 SFD_RESYNC (`PKTREC_REC_FLAG_SFD_MISMATCH`) = 1 when stale
+entries were discarded while this frame was matched (independent of bit2).
+
+### Transmit SFDs and latency
+
+Transmit edges are paired, in order, with the MAC's TX completions of the same port
+(one per frame sent, with the MAC's cycle stamp): `lat` = `t_sfd` - `cpl_raw` within
+`TX_WIN_MIN`..`TX_WIN_MAX` (reset 0..900 ns) pairs, older completions are stale
+(`TX_CPL_STALE`), an edge without a completion counts `TX_UNPAIRED`. `TX_LAT_LAST/MIN/MAX`
+give the MAC-to-cable transmit latency (raw cycle stamp, no offsets); `TX_EDGES` versus
+`TX_CPL` checks the counts. The transmit timestamps are not stored in records; they are
+for calibration and for TAP latency measurements.
+
+`RX_LAST_TS` / `TX_LAST_TS` hold the latest timestamps of each port (with the port's
+offset). With `SFD_CTRL.LOG_EN`, per-port log FIFOs keep the last 16 receive and 16
+transmit timestamps (transmit with its latency) for software (`pktrec-phy sfd log`).
+
+### SFD registers
+
+Capture block offsets (`include/pktrec_regs.h` `PKTREC_SFD_*`):
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `0x400` | SFD_CTRL | [0] MATCH_EN (reset 1), [1] LOG_EN, [8] CLEAR (also cleared by CTRL.CLEAR) |
+| `0x404` | SFD_STATUS | [0] sampler locked, [1] ISERDES sampler, [11:8] RX levels, [15:12] TX levels |
+| `0x408` / `0x40C` | SFD_RES_PS / SFD_PIPE_NS | 1000 / 16 |
+| `0x410` / `0x414` | RX_WIN_MIN / MAX | signed ns (100 / 700) |
+| `0x418` / `0x41C` | TX_WIN_MIN / MAX | signed ns (0 / 900) |
+| `0x420` / `0x424` | MIN_LOW / MIN_HIGH | glitch filter, `dp_clk` cycles (25 / 8) |
+| `0x800 + n*0x100` | port n, receive | +0x00 RX_EDGES (64), +0x08 RX_GLITCH, +0x0C RX_FIFO_OVF, +0x10 RX_MATCHED (64), +0x18 RX_STALE, +0x1C RX_MISMATCH, +0x20..0x28 RX_DELTA_LAST/MIN/MAX, +0x2C RX_HEAD_DELTA, +0x30 RX_LAST_TS (64), +0x38 RX_OFFSET (RW), +0x3C RX_LOG_STATUS, +0x40 RX_LOG_TS (64, LO read pops) |
+| `0x880 + n*0x100` | port n, transmit | +0x00 TX_EDGES (64), +0x08 TX_GLITCH, +0x0C TX_CPL_OVF, +0x10 TX_CPL (64), +0x18 TX_PAIRED, +0x1C TX_CPL_STALE, +0x20 TX_UNPAIRED, +0x24..0x2C TX_LAT_LAST/MIN/MAX, +0x30 TX_LAST_TS (64), +0x38 TX_OFFSET (RW), +0x3C TX_LOG_STATUS, +0x40 TX_LOG_TS (64, LO read pops), +0x48 TX_LOG_LAT, +0x4C TX_HEAD_LAT |
+
+Deltas and latencies are signed ns; `0x80000000` means "none yet".
+
+### Calibration
+
+What a timestamp means: the time the PHY's SFD indication reached the FPGA sampler, on
+the shared timebase. Between the cable and that point are the PHY's SFD detection, the
+translator and the routing; they are constant per port (apart from the PHY's per-link
+receive variation of up to +-8 ns) and are removed with `RX_OFFSET` / `TX_OFFSET`.
+With P2 and P3 connected by a short cable (both run by the same 25 MHz PHY clock tree):
+
+1. `pktrec-phy init --1000-only`, `pktrec-phy sfd config --log on`,
+   `pktrec-phy sfd status --clear`.
+2. Generate on P2, receive on P3: `pktrec-phy gen 2 start --size 64 --rate 1000
+   --count 10000` (and `pktrec-phy chk 3 start`).
+3. `pktrec-phy sfd log 2 --dir tx` and `pktrec-phy sfd log 3 --dir rx` (repeat while
+   running, 16 entries per read): for the same frames, `RX_SFD(P3) - TX_SFD(P2)` =
+   cable delay (about 5 ns/m) + (receive indication delay - transmit indication delay,
+   including both translators). Record its mean and spread; the spread is the PHY's
+   receive SFD variation plus the 1 ns sampling. Repeat in the other direction (gen 3,
+   log tx 3 / rx 2). Setting `TX_OFFSET` of both ports to 0 and `RX_OFFSET(p)` =
+   `-(mean - cable delay)` makes a frame's receive timestamp equal its transmit
+   timestamp plus the cable delay. TI defines the transmit indication as "symbol
+   presented on the line", so the transmit SFD is taken as the cable-side reference;
+   only its (small, constant) translator and routing delay remains unknown, and it
+   cancels in every difference between two ports of this board.
+   Re-measure after a link-up to see the per-link variation (read register `0x0055`).
+4. `RX_DELTA_MIN/MAX` (P3) give the spread of `MAC_raw - t_sfd`. Center the receive
+   window on it with generous margin but keep it narrower than 672 ns, e.g.
+   `sfd config --rx-win <min-150> <max+150>`. Likewise `TX_LAT_MIN/MAX` for
+   `--tx-win`.
+5. MAC fallback: set `MAC_OFFSET` = `RX_OFFSET` - median(`RX_DELTA`) so that a frame that
+   falls back to its MAC timestamp lands on the same scale (within the MAC's 16 ns
+   quantisation).
+6. TAP latency (M3): with P0/P1 forwarding, the latency of a frame received on P0 and
+   sent on P1 is `TX_SFD(P1) - RX_SFD(P0)` from the two log FIFOs (or
+   `TX_LAST_TS(P1) - RX_LAST_TS(P0)` at low rates).
+
+Repeat at 100 Mb/s if needed: the PHY latencies differ there, so the windows and
+offsets must be re-measured (registers, no rebuild).
+
+## Traffic generator (M2)
+
+Each port's TX path has a fourth source (`PATH_CTRL` mode 3, `gen`): `pktrec_gen`
+sends sequence-numbered test frames from the fabric at up to line rate, so P2 and P3
+can drive each other (and the bench can load P0/P1) without external equipment. A
+receive checker (`pktrec_gen_chk`) on every port counts the sequence numbers it sees.
+
+* Format 0 (PRSQ, default): byte-identical to `test/gen_seq.py` - Ethernet, IPv4
+  192.0.2.1 to 192.0.2.2, UDP 50000 to 50001, payload `"PRSQ"`, stream id (u32),
+  sequence number (u64), zeros - so `test/check_pcap.py` verifies captures of
+  generator traffic unchanged (stream key `prsq:<stream>`).
+* Format 1 (raw): destination, source, EtherType (`GEN_ETYPE`, default `0x88B5`), a u32
+  sequence number at payload offset 0, zeros.
+* Length 60..16383 bytes without the FCS (the MAC appends it); optional random
+  lengths `LEN + (LFSR & LEN_MASK)`. Frames above the MAC's `TX_MAX_LEN` (1518 incl.
+  FCS by default) need `PKTREC_ETH_P_TX_MAX_LEN` raised.
+* Rate: a frame starts at most every `ceil((LEN + 4 + 8 + IFG) / 2)` `tx_clk` cycles
+  (IFG in bytes; 12 = line rate: 1.488 Mframes/s at 64 bytes).
+* `COUNT` frames (0 = until stopped); `GEN_CTRL.ENABLE` 0 to 1 starts (reloading
+  `SEQ_FIRST`, clearing `GEN_FRAMES` / `GEN_BYTES`), 0 stops after the current frame.
+  Frames are never cut.
+* Checker: `CHK_FRAMES`, `CHK_LOST` (sum of sequence gaps), `CHK_ERRORS` (duplicates or
+  reordering), `CHK_BAD` (MAC errors), `CHK_LAST_SEQ`; enabling it clears them.
+
+Registers: `pktrec_m0_path` (`0x04_2002_0000`, map 1.1) at `0x200 + n*0x80`
+(`PKTREC_M0_GEN_*`, `PKTREC_M0_CHK_*` in `include/pktrec_regs.h`). Command line:
+
+    pktrec-phy gen 2 start --size 64 --count 0       # line rate, P2 path = gen
+    pktrec-phy chk 3 start; pktrec-phy chk 3 status
+    pktrec-phy gen 2 stop
+
+### Verification (M2)
+
+* `tb_pktrec_sfd`: the real ISERDESE3/MMCME4 models and timebase; resolution over 8 pins
+  x 150 random-phase edges (error within (-1, 0] ns; IDDR within 2 ns), queue overflow,
+  glitch filter, TX pairing with missing and extra completions, log FIFOs and offsets.
+* `tb_pktrec_sfd_match`: normal matching with exact timestamps, missing pulses, extra
+  pulses, entries too young / too old, frames dropped by the FIFO and frames on a
+  disabled port consuming their entries, `MATCH_EN` = 0, a 1-beat runt, queue overflow;
+  all counters and delta statistics exact.
+* `tb_pktrec_capture` test 5: SFD pulses on a pin through the whole capture block and
+  recorder: every record SFD-stamped, timestamp differences equal to the pin time
+  differences within 1 ns.
+* `tb_pktrec_gen`: frame content byte for byte against a `gen_seq.py` model, line-rate
+  spacing, IFG spacing, random lengths, count, stop, and the checker (loss, duplicate,
+  bad frames).
