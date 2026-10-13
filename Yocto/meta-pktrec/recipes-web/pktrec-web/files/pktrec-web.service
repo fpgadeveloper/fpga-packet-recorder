@@ -6,7 +6,7 @@
 [Unit]
 Description=FPGA Packet Recorder web interface (pktrec-web)
 Wants=network-online.target
-After=network-online.target pktrec-phy-watch.service local-fs.target
+After=network-online.target pktrec-phy-watch.service local-fs.target mnt-rec.mount
 
 [Service]
 Type=simple
