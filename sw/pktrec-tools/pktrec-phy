@@ -21,11 +21,16 @@ Commands:
                          configure all four PHYs (see init_phy) and re-trigger the
                          SGMII status word on every copper link that comes up
   status [--json]        per port: PHY link/speed/duplex, SGMII/PCS state, GPIO levels
-  path <port|all> idle|loop|fwd|gen   select the TX source of a port (also keeps
-                         PAIR_MODE consistent: a pair is "tap" when both ports are fwd)
+  path <port|all> idle|loop|fwd|gen|replay   select the TX source of a port (also keeps
+                         PAIR_MODE consistent: a pair is "tap" when both ports are fwd).
+                         replay (m0 map 1.3, M6) = path mode 4: frames from the replay
+                         scheduler (pktrec-replay sets it itself); refused on a pair
+                         that forwards (TAP), and fwd is refused next to a replay port
   mode <pair 0|1> tap|monitor [--force]   per-pair mode: tap = both ports forward to
                          each other (inline TAP), monitor = both ports receive only.
-                         Refused while a capture runs (capture CTRL.ENABLE) unless --force
+                         Refused while a capture runs (capture CTRL.ENABLE) unless --force;
+                         tap is refused while a port of the pair is in replay (--force
+                         takes the port out of replay)
   mode status [--json]   PAIR_MODE, PATH_CTRL and the effective path per pair
   ifg <port|all> [--enable on|off] [--nom B] [--min B] [--hi B] [--lo B] [--json]
                          dynamic inter-frame gap of the TAP forward path: settings,
@@ -95,6 +100,7 @@ M0_COUNTERS = ["RX_GOOD", "RX_BAD", "TX_GOOD", "TX_UNDERFLOW", "DROP_LOOP", "DRO
                "GPIO0_EDGES", "GPIO1_EDGES"]
 # m0 map 1.2 (M3): pair mode, effective path, dynamic IFG, FWD FIFO fill, FLUSH
 M0_PAIR_MODE, M0_EFF_PATH = 0x018, 0x01C
+M0_PATH_RPL = 0x020          # m0 map 1.3 (M6): [n] = port n in path mode 4 REPLAY
 (P_IFG_CTRL, P_IFG_THRESH, P_FWD_FILL, P_IFG_STATUS, P_IFG_RED_CYC, P_IFG_RED_ENT,
  P_FLUSH) = (0x20, 0x24, 0x28, 0x2C, 0x30, 0x38, 0x3C)
 PAIR_MODES = {"monitor": 0, "tap": 1}
@@ -233,6 +239,13 @@ class Board:
         if c.rd(0) != CAP_ID_VALUE:
             return None
         return bool(c.rd(CAP_CTRL) & CAP_CTRL_ENABLE)
+
+    def has_replay(self):
+        """m0 map 1.3 (M6): PATH_RPL (path mode 4 replay)."""
+        return self.m0.rd(M0_VERSION) >= 0x00010003
+
+    def replay_ports(self):
+        return self.m0.rd(M0_PATH_RPL) & 0xF if self.has_replay() else 0
 
     def write_path(self, m):
         """PATH_CTRL = m, and PAIR_MODE derived from it (pair = tap iff both ports fwd)."""
@@ -473,13 +486,32 @@ def cmd_status(b, args):
 def cmd_path(b, args):
     ports = range(4) if args.port == "all" else [int(args.port.lstrip("pP"))]
     m = b.m0.rd(M0_PATH_CTRL) & 0xFF
+    rpl = b.replay_ports()
     for n in ports:
         if not 0 <= n <= 3:
             raise SystemExit("port must be 0..3 or all")
-        m = (m & ~(3 << (2 * n))) | (MODES[args.mode] << (2 * n))
+        partner = n ^ 1
+        if args.mode == "replay":
+            if not b.has_replay():
+                raise SystemExit("pktrec-phy: this bitstream has no replay path (m0 map < 1.3)")
+            if ((m >> (2 * n)) & 3) == MODES["fwd"] or ((m >> (2 * partner)) & 3) == MODES["fwd"]:
+                raise SystemExit(f"pktrec-phy: pair {n // 2} forwards (TAP): replay and TAP "
+                                 f"forwarding on the same pair are mutually exclusive "
+                                 f"(pktrec-phy mode {n // 2} monitor first)")
+            m &= ~(3 << (2 * n))               # IDLE underneath the replay override
+            rpl |= 1 << n
+        else:
+            if args.mode == "fwd" and (rpl >> partner) & 1 and partner not in ports:
+                raise SystemExit(f"pktrec-phy: P{partner} is in replay: replay and TAP "
+                                 "forwarding on the same pair are mutually exclusive")
+            m = (m & ~(3 << (2 * n))) | (MODES[args.mode] << (2 * n))
+            rpl &= ~(1 << n)
     b.write_path(m)
+    if b.has_replay():
+        b.m0.wr(M0_PATH_RPL, rpl)
     print("PATH_CTRL = 0x%02x (%s)" % (m, ", ".join(
-        f"P{n}={MODE_NAMES[(m >> (2 * n)) & 3]}" for n in range(4))))
+        f"P{n}={'replay' if (rpl >> n) & 1 else MODE_NAMES[(m >> (2 * n)) & 3]}"
+        for n in range(4))))
 
 
 def cmd_counters(b, args):
@@ -703,6 +735,13 @@ def cmd_mode(b, args):
                          "and counted in FLUSH)")
     if run is None:
         print("note: capture state unknown (capture block not mapped)")
+    rpl = b.replay_ports() & (3 << (2 * pair))
+    if rpl and args.mode == "tap":
+        if not args.force:
+            raise SystemExit(f"pktrec-phy: a port of pair {pair} is in replay (PATH_RPL 0x{rpl:x}; "
+                             "pktrec-replay running?): replay and TAP forwarding on the same pair "
+                             "are mutually exclusive; --force takes the port out of replay")
+        b.m0.wr(M0_PATH_RPL, b.replay_ports() & ~rpl)
     if not b.has_tap():
         print("note: no PAIR_MODE register in this bitstream (m0 map < 1.2): only PATH_CTRL is set")
     path = MODES["fwd" if args.mode == "tap" else "idle"]
@@ -1125,7 +1164,7 @@ def main():
     p.add_argument("--json", action="store_true", help="one JSON document (stable keys)")
     p = sub.add_parser("path", help="select the TX source of a port")
     p.add_argument("port", help="0..3 or all")
-    p.add_argument("mode", choices=sorted(MODES))
+    p.add_argument("mode", choices=sorted(MODES) + ["replay"])
     p = sub.add_parser("counters", help="M0 frame counters")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--json", action="store_true")
