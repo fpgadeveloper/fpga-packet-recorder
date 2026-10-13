@@ -55,6 +55,19 @@ the port's frame FIFO.
 
 You can't change the mode while a capture is running.
 
+**Timebase.** The line under the pairs shows the state of the timebase discipline
+(`pktrec-tb`, see the Software page):
+
+* **locked to system time (NTP)**: the hardware timestamps follow the board's clock,
+  within the offset shown (normally a few µs);
+* **tracking, not locked yet**: for about a minute after boot, or after the system clock
+  jumped;
+* **not disciplined**: `pktrec-tb.service` is not running, so the timestamps drift from
+  wall-clock time (about 10 ppm).
+
+It also shows the current offset to the system clock, the frequency trim in ppm, and
+whether the calibration file (`/etc/pktrec/calibration.conf`) was applied at boot.
+
 **Capture.** To start a capture:
 
 1. Tick the ports to capture.
@@ -94,7 +107,7 @@ code:
 
 | Method and path | Body | Returns |
 |-----------------|------|---------|
-| `GET /api/status` | - | `ports[]` (link, speed, duplex, SGMII sync, path, counters), `pairs[]` (mode `tap`, `monitor` or `other`), `capture`, `disk`, `time` (system time, timebase), `version`, `errors` |
+| `GET /api/status` | - | `ports[]` (link, speed, duplex, SGMII sync, path, counters), `pairs[]` (mode `tap`, `monitor` or `other`), `capture`, `disk`, `time` (system time, timebase, `tb_inc_ns`, `tb_freq_ppb`, and `discipline`: see below), `calibration` (`file`, `present`, `mtime`, `applied`: time, ok, errors), `version`, `errors`, `sources` (`json` or `text`: how each tool's output was read) |
 | `GET /api/stats` | - | `capture` (state, name, elapsed, file size, live: write MB/s, ring buffers used/total, back-pressure, per-port rates and drops; `last` = result of the previous capture), `counters` (per port: frames, bytes, drops, bad, truncated, FIFO high-water, frames/s, bits/s), `disk`. Poll it once a second. |
 | `POST /api/mode` | `{"pair": 0 or 1, "mode": "tap" or "monitor"}` | the new `pairs[]` |
 | `POST /api/capture/start` | `{"ports": [0,1,2,3], "snaplen": 0, "duration_s": 60, "size_bytes": 1000000000, "name": "test1"}`; everything optional | 202 and the capture state |
@@ -106,6 +119,22 @@ code:
 | `DELETE /api/captures/<name>` | - | `{"deleted": "<name>"}` |
 
 Capture names may use letters, digits, `.`, `_` and `-` (up to 64 characters).
+
+`time.discipline` in `/api/status` is the `pktrec-tb` daemon state (`/run/pktrec/tb.json`):
+
+| Field | Meaning |
+|-------|---------|
+| `daemon`, `fresh` | a state file exists / it was updated in the last few seconds by a running daemon |
+| `locked` | the timebase has been within the lock threshold (10 µs) of `CLOCK_REALTIME` for 30 s |
+| `state` | `startup`, `waiting` (a capture ran at start-up), `estimating`, `tracking`, `stopped` |
+| `offset_ns`, `offset_rms_ns`, `offset_max_ns` | timebase - `CLOCK_REALTIME`: last, rms and max over 30 s |
+| `ppm`, `freq_est_ppm` | frequency trim applied now / the controller's frequency estimate |
+| `ntp_synced` | the system clock is NTP-synchronised (adjtimex) |
+| `locked_since`, `last_set`, `last_set_reason`, `sets`, `message` | history |
+
+`GET /api/captures/<name>/info` also returns `tb_discipline` from the file header: the
+state when that capture started (`daemon`, `locked`, `ntp_synced`, `set_at_start`,
+`offset_ns`, `ppm`, `locked_s`), or `null` for files written before this was recorded.
 
 Example:
 
@@ -126,10 +155,11 @@ It runs a threaded HTTP server and drives the command-line tools as subprocesses
 
 | Function | Tool |
 |----------|------|
-| Link state and datapath per port | `pktrec-phy status`. The text output is parsed. |
+| Link state and datapath per port | `pktrec-phy status --json` (the text output is parsed as a fallback) |
 | TAP / monitor | `pktrec-phy path <port> fwd` for both ports of the pair (TAP), or `idle` (monitor) |
-| Counters, timebase, capture block version | `pktrec-cap stats`, at most once every 0.8 s, shared by all clients; the rates come from the difference between two readings |
-| Capture | `pktrec-cap record --ports … --snaplen … [--duration …] [--size …] <file>`. Its live statistics on stderr feed `/api/stats`. **Stop** sends it `SIGTERM`, and it then ends the capture cleanly. |
+| Counters, timebase, capture block version | `pktrec-cap stats --json` (text fallback), at most once every 0.8 s, shared by all clients; the rates come from the difference between two readings |
+| Capture | `pktrec-cap record --ports … --snaplen … --stats-json [--duration …] [--size …] <file>`. Its JSON statistics lines on stdout feed `/api/stats`; the result comes from its final JSON line. **Stop** sends it `SIGTERM`, and it then ends the capture cleanly. |
+| Timebase discipline, calibration | `/run/pktrec/tb.json` (`pktrec-tb.service`), `/etc/pktrec/calibration.conf` and `/run/pktrec/calibration.json` (`pktrec-calibration.service`), read directly |
 | Capture list | The 4 KB file headers, read directly (format in `include/pktrec_format.h`) |
 | Capture info | `pktrec-cap info <file>` |
 | pcapng download | `pktrec-export <file> -o -`, piped to the browser in 256 KB chunks |
