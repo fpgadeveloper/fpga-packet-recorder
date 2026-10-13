@@ -419,7 +419,7 @@ static int write_shb(struct exp *e)
 static int write_idb(struct exp *e, unsigned port)
 {
 	const struct pktrec_file_port *hp = &e->h.port[port];
-	char name[20], desc[200];
+	char name[20], desc[200], mode[64];
 	uint8_t tsresol = 9, fcslen = 0;
 	uint32_t snap = e->h.snaplen ? e->h.snaplen : 65535;
 	uint64_t speed = (uint64_t)hp->speed_mbps * 1000000ull;
@@ -429,9 +429,15 @@ static int write_idb(struct exp *e, unsigned port)
 		snprintf(name, sizeof(name), "%.16s", hp->if_name);
 	else
 		snprintf(name, sizeof(name), "P%u", port);
+	/* TAP pair: frames received on P<n> are the ones forwarded out of its partner */
+	if ((e->h.pair_mode >> (port / 2)) & PKTREC_PAIR_MODE_TAP)
+		snprintf(mode, sizeof(mode), "TAP pair %u (P%u<->P%u), forwarded to P%u", port / 2,
+			 port & ~1u, port | 1u, port ^ 1u);
+	else
+		snprintf(mode, sizeof(mode), "monitor mode");
 	snprintf(desc, sizeof(desc),
-		 "Ethernet FMC Max port P%u, %s mode, inbound: frames received on P%u%s%s",
-		 port, pktrec_port_mode(&e->h, port), port,
+		 "Ethernet FMC Max port P%u, %s, inbound: frames received on P%u%s%s",
+		 port, mode, port,
 		 e->h.snaplen ? ", truncated to snaplen" : "",
 		 (e->h.flags & PKTREC_FILE_FLAG_COMPLETE) && !(hp->flags & PKTREC_FPORT_LINK_UP) ?
 		 ", link down at start" : "");

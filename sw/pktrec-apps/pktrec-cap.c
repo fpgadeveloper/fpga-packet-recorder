@@ -196,6 +196,7 @@ static inline uint64_t rd64(const struct regs *r, uint32_t off_lo)
 struct hw {
 	struct regs cap;
 	struct regs eth;        /* optional: link state for the header */
+	struct regs m0;         /* optional: TAP/monitor pair mode for the header (M3) */
 };
 
 static int hw_open(struct hw *hw, bool devmem, bool need_eth)
@@ -214,6 +215,8 @@ static int hw_open(struct hw *hw, bool devmem, bool need_eth)
 	}
 	if (need_eth && regs_map(&hw->eth, PKTREC_ETH_BASE, 0x1000, devmem, "eth_ports"))
 		fprintf(stderr, "%s: note: link state not recorded\n", prog_name);
+	if (need_eth && regs_map(&hw->m0, PKTREC_M0_BASE, PKTREC_M0_SIZE, devmem, "port datapath"))
+		fprintf(stderr, "%s: note: pair mode not recorded (monitor assumed)\n", prog_name);
 	return 0;
 }
 
@@ -221,6 +224,34 @@ static void hw_close(struct hw *hw)
 {
 	regs_unmap(&hw->cap);
 	regs_unmap(&hw->eth);
+	regs_unmap(&hw->m0);
+}
+
+/* File-header pair_mode (bit p = pair p in TAP mode) from the datapath's
+ * PAIR_MODE register (map 1.2, set by pktrec-phy mode); older bitstreams:
+ * a pair whose two ports both forward (PATH_CTRL = FWD) counts as TAP. */
+static uint32_t pair_mode(const struct hw *hw)
+{
+	uint32_t pm = 0, v, path;
+	unsigned p;
+
+	if (!hw->m0.p || rd(&hw->m0, PKTREC_M0_ID) != PKTREC_M0_ID_VALUE)
+		return PKTREC_PAIR_MODE_MONITOR;
+	v = rd(&hw->m0, PKTREC_M0_VERSION);
+	path = rd(&hw->m0, PKTREC_M0_PATH_CTRL);
+	for (p = 0; p < PKTREC_NUM_PORTS / 2; p++) {
+		bool tap;
+
+		if (v >= PKTREC_M0_VERSION_1_2)
+			tap = ((rd(&hw->m0, PKTREC_M0_PAIR_MODE) >> PKTREC_M0_PAIR_SHIFT(p)) & 3u) ==
+			      PKTREC_M0_PAIR_TAP;
+		else
+			tap = ((path >> PKTREC_M0_PATH_SHIFT(2 * p)) & 3u) == PKTREC_M0_PATH_FWD &&
+			      ((path >> PKTREC_M0_PATH_SHIFT(2 * p + 1)) & 3u) == PKTREC_M0_PATH_FWD;
+		if (tap)
+			pm |= PKTREC_PAIR_MODE_TAP << p;
+	}
+	return pm;
 }
 
 /* Link state of port n from the port shell: speed in Mb/s, 0 = down */
@@ -897,7 +928,7 @@ static int cmd_record(int argc, char **argv)
 	r->hdr->fdrec_version = r->info.hw_version;
 	r->hdr->num_ports = PKTREC_NUM_PORTS;
 	r->hdr->port_mask = r->o.ports;
-	r->hdr->pair_mode = PKTREC_PAIR_MODE_MONITOR;   /* M1: monitor mode only */
+	r->hdr->pair_mode = pair_mode(&r->hw);   /* M3: from PAIR_MODE (pktrec-phy mode) */
 	r->hdr->snaplen = r->o.snaplen;
 	strncpy(r->hdr->target, r->o.target, sizeof(r->hdr->target) - 1);
 	gethostname(r->hdr->hostname, sizeof(r->hdr->hostname) - 1);
