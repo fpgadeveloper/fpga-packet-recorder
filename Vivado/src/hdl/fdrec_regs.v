@@ -42,7 +42,7 @@ module fdrec_regs #(
   parameter integer CNT_W      = 13,
   parameter integer EGR_FIFO_DEPTH = 4096,
   parameter integer EGR_CNT_W  = 13,
-  parameter [31:0]  VERSION    = 32'h0001_0001
+  parameter [31:0]  VERSION    = 32'h0001_0002
 ) (
   input  wire          clk,
   input  wire          resetn,
@@ -78,6 +78,7 @@ module fdrec_regs #(
   input  wire [CNT_W-1:0] fifo_count,
   input  wire          fifo_rst_busy,
   input  wire [63:0]   beats_out,
+  input  wire          pkt_src,         // 1 = packetizer fed by s_axis_cap (capture records)
 
   // Controls
   output reg           tpg_enable,
@@ -127,6 +128,7 @@ module fdrec_regs #(
   localparam [11:0] R_PKT_LEN         = 12'h044;
   localparam [11:0] R_PKT_OUT_LO      = 12'h048;
   localparam [11:0] R_PKT_OUT_HI      = 12'h04C;
+  localparam [11:0] R_PKT_SRC         = 12'h050;
   // Playback (1.1)
   localparam [11:0] R_CHK_CTRL        = 12'h060;
   localparam [11:0] R_CHK_RATE_INC    = 12'h064;
@@ -390,6 +392,7 @@ module fdrec_regs #(
           R_PKT_LEN:         s_axi_rdata <= pkt_len;
           R_PKT_OUT_LO:      begin s_axi_rdata <= beats_out[31:0]; out_hi_l  <= beats_out[63:32]; end
           R_PKT_OUT_HI:      s_axi_rdata <= out_hi_l;
+          R_PKT_SRC:         s_axi_rdata <= {31'd0, pkt_src};
           R_CHK_CTRL:        s_axi_rdata <= {30'd0, chk_rst_busy, chk_enable};
           R_CHK_RATE_INC:    s_axi_rdata <= chk_rate_inc;
           R_CHK_BEATS_LO:    begin s_axi_rdata <= chk_beats_q[31:0]; cb_hi_l  <= chk_beats_q[63:32]; end

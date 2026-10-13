@@ -94,6 +94,12 @@ module tb_fdrec_core;
     .s_axis_tdata  (src_tdata),
     .s_axis_tvalid (src_tvalid),
     .s_axis_tready (src_tready),
+    // capture source unused here (covered by tb_pktrec_capture): TPG path
+    .s_axis_cap_tdata  (128'd0),
+    .s_axis_cap_tvalid (1'b0),
+    .s_axis_cap_tready (),
+    .cap_sel           (1'b0),
+    .rec_srst          (),
     .m_axis_tdata  (m_tdata),
     .m_axis_tkeep  (m_tkeep),
     .m_axis_tlast  (m_tlast),
@@ -340,7 +346,7 @@ module tb_fdrec_core;
 
     // ---------------- 1. Register block ----------------
     $display("--- 1. register block");
-    axi_read(VERSION, v);        check("VERSION", v, 32'h0001_0001);
+    axi_read(VERSION, v);        check("VERSION", v, 32'h0001_0002);
     axi_read(SRC_CLK_HZ, v);     check("SRC_CLK_HZ", v, SRC_HZ);
     axi_read(DP_CLK_HZ, v);      check("DP_CLK_HZ", v, DP_HZ);
     axi_read(ING_FIFO_DEPTH, v); check("ING_FIFO_DEPTH", v, DEPTH);
@@ -349,7 +355,7 @@ module tb_fdrec_core;
     axi_read(12'h03C, v);        check("unmapped 0x03C", v, 0);
     axi_read(12'hFFC, v);        check("unmapped 0xFFC", v, 0);
     axi_write(VERSION, 32'hDEAD_BEEF);
-    axi_read(VERSION, v);        check("VERSION is RO", v, 32'h0001_0001);
+    axi_read(VERSION, v);        check("VERSION is RO", v, 32'h0001_0002);
     axi_write(TPG_RATE_INC, 32'h1234_5678);
     axi_read(TPG_RATE_INC, v);   check("TPG_RATE_INC rw", v, 32'h1234_5678);
     axi_write(TPG_RATE_INC, 32'hAB00_0000, 4'b1000);

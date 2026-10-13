@@ -18,9 +18,12 @@
 // The MAC strips the FCS on RX and the TX MAC regenerates it; the MAC's own TX
 // padding must be off (pktrec_eth_ports DEFAULT_TX_PAD_EN = 0) for faithful runts.
 //
-// Timestamps: tx_ptp_ts_n / rx_ptp_ts_n are per-domain free-running placeholder
-// counters (48.16 ns, +16 ns per 62.5 MHz cycle, each in its own clock). They are
-// NOT a common timebase; M2 replaces them with a PHC and the PHY SFD inputs.
+// Capture tap (M1): m_axis_mon_n is a plain copy (wires) of RX stream n for the
+// capture path (pktrec_capture); the RX stream has no back-pressure, so the
+// fan-out costs nothing and the forward path is unaffected.
+//
+// Timestamps: the MAC's tx_ptp_ts_n / rx_ptp_ts_n come from the shared timebase
+// in pktrec_capture (M1); the M0 placeholder counters are gone.
 //
 // Counters and PHY GPIO / power-good levels: see pktrec_m0_regs.v and
 // include/pktrec_regs.h.
@@ -44,7 +47,7 @@ module pktrec_m0_path #(
     input  wire                ctrl_aresetn,
     // ---- port 0: RX stream from the MAC (rx_clk_0, no tready) ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 rx_clk_0 CLK" *)
-    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_0, ASSOCIATED_RESET rx_aresetn_0" *)
+    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_0:m_axis_mon_0, ASSOCIATED_RESET rx_aresetn_0" *)
     input  wire                rx_clk_0,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rx_aresetn_0 RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -80,12 +83,20 @@ module pktrec_m0_path #(
     output wire [0:0]          m_axis_tx_0_tuser,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_tx_0 TID" *)
     output wire [TX_TAG_W-1:0] m_axis_tx_0_tid,
-    // ---- port 0: timestamp counters to the MAC (tx_clk_0 / rx_clk_0) ----
-    output wire [PTP_TS_W-1:0] tx_ptp_ts_0,
-    output wire [PTP_TS_W-1:0] rx_ptp_ts_0,
+    // ---- port 0: copy of the RX stream for the capture path (rx_clk_0, no tready) ----
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_0 TDATA" *)
+    output wire [15:0]         m_axis_mon_0_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_0 TKEEP" *)
+    output wire [1:0]          m_axis_mon_0_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_0 TVALID" *)
+    output wire                m_axis_mon_0_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_0 TLAST" *)
+    output wire                m_axis_mon_0_tlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_0 TUSER" *)
+    output wire [PTP_TS_W:0]   m_axis_mon_0_tuser,
     // ---- port 1: RX stream from the MAC (rx_clk_1, no tready) ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 rx_clk_1 CLK" *)
-    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_1, ASSOCIATED_RESET rx_aresetn_1" *)
+    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_1:m_axis_mon_1, ASSOCIATED_RESET rx_aresetn_1" *)
     input  wire                rx_clk_1,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rx_aresetn_1 RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -121,12 +132,20 @@ module pktrec_m0_path #(
     output wire [0:0]          m_axis_tx_1_tuser,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_tx_1 TID" *)
     output wire [TX_TAG_W-1:0] m_axis_tx_1_tid,
-    // ---- port 1: timestamp counters to the MAC (tx_clk_1 / rx_clk_1) ----
-    output wire [PTP_TS_W-1:0] tx_ptp_ts_1,
-    output wire [PTP_TS_W-1:0] rx_ptp_ts_1,
+    // ---- port 1: copy of the RX stream for the capture path (rx_clk_1, no tready) ----
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_1 TDATA" *)
+    output wire [15:0]         m_axis_mon_1_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_1 TKEEP" *)
+    output wire [1:0]          m_axis_mon_1_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_1 TVALID" *)
+    output wire                m_axis_mon_1_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_1 TLAST" *)
+    output wire                m_axis_mon_1_tlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_1 TUSER" *)
+    output wire [PTP_TS_W:0]   m_axis_mon_1_tuser,
     // ---- port 2: RX stream from the MAC (rx_clk_2, no tready) ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 rx_clk_2 CLK" *)
-    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_2, ASSOCIATED_RESET rx_aresetn_2" *)
+    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_2:m_axis_mon_2, ASSOCIATED_RESET rx_aresetn_2" *)
     input  wire                rx_clk_2,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rx_aresetn_2 RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -162,12 +181,20 @@ module pktrec_m0_path #(
     output wire [0:0]          m_axis_tx_2_tuser,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_tx_2 TID" *)
     output wire [TX_TAG_W-1:0] m_axis_tx_2_tid,
-    // ---- port 2: timestamp counters to the MAC (tx_clk_2 / rx_clk_2) ----
-    output wire [PTP_TS_W-1:0] tx_ptp_ts_2,
-    output wire [PTP_TS_W-1:0] rx_ptp_ts_2,
+    // ---- port 2: copy of the RX stream for the capture path (rx_clk_2, no tready) ----
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_2 TDATA" *)
+    output wire [15:0]         m_axis_mon_2_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_2 TKEEP" *)
+    output wire [1:0]          m_axis_mon_2_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_2 TVALID" *)
+    output wire                m_axis_mon_2_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_2 TLAST" *)
+    output wire                m_axis_mon_2_tlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_2 TUSER" *)
+    output wire [PTP_TS_W:0]   m_axis_mon_2_tuser,
     // ---- port 3: RX stream from the MAC (rx_clk_3, no tready) ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 rx_clk_3 CLK" *)
-    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_3, ASSOCIATED_RESET rx_aresetn_3" *)
+    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_3:m_axis_mon_3, ASSOCIATED_RESET rx_aresetn_3" *)
     input  wire                rx_clk_3,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 rx_aresetn_3 RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -203,9 +230,17 @@ module pktrec_m0_path #(
     output wire [0:0]          m_axis_tx_3_tuser,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_tx_3 TID" *)
     output wire [TX_TAG_W-1:0] m_axis_tx_3_tid,
-    // ---- port 3: timestamp counters to the MAC (tx_clk_3 / rx_clk_3) ----
-    output wire [PTP_TS_W-1:0] tx_ptp_ts_3,
-    output wire [PTP_TS_W-1:0] rx_ptp_ts_3,
+    // ---- port 3: copy of the RX stream for the capture path (rx_clk_3, no tready) ----
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_3 TDATA" *)
+    output wire [15:0]         m_axis_mon_3_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_3 TKEEP" *)
+    output wire [1:0]          m_axis_mon_3_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_3 TVALID" *)
+    output wire                m_axis_mon_3_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_3 TLAST" *)
+    output wire                m_axis_mon_3_tlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_mon_3 TUSER" *)
+    output wire [PTP_TS_W:0]   m_axis_mon_3_tuser,
     // ---- MAC status strobes (bit n = port n; rx_* in rx_clk_n, tx_* in tx_clk_n) ----
     input  wire [3:0]          rx_stat_pkt_good,
     input  wire [3:0]          rx_stat_pkt_bad,
@@ -259,8 +294,6 @@ module pktrec_m0_path #(
     input  wire                s_axi_rready
 );
 
-localparam [PTP_TS_W-1:0] TS_INC = 64'h0000_0000_0010_0000;   // 16 ns in 48.16 ns
-
 // ---------------------------------------------------------------------------
 // Flatten the per-port ports (index n = port n)
 // ---------------------------------------------------------------------------
@@ -289,9 +322,17 @@ assign m_axis_tx_1_tid = {TX_TAG_W{1'b0}};
 assign m_axis_tx_2_tid = {TX_TAG_W{1'b0}};
 assign m_axis_tx_3_tid = {TX_TAG_W{1'b0}};
 
-wire [4*PTP_TS_W-1:0] tx_ts_all, rx_ts_all;
-assign {tx_ptp_ts_3, tx_ptp_ts_2, tx_ptp_ts_1, tx_ptp_ts_0} = tx_ts_all;
-assign {rx_ptp_ts_3, rx_ptp_ts_2, rx_ptp_ts_1, rx_ptp_ts_0} = rx_ts_all;
+// capture tap: plain copies of the RX streams
+assign {m_axis_mon_3_tdata, m_axis_mon_2_tdata, m_axis_mon_1_tdata, m_axis_mon_0_tdata} =
+       {s_axis_rx_3_tdata, s_axis_rx_2_tdata, s_axis_rx_1_tdata, s_axis_rx_0_tdata};
+assign {m_axis_mon_3_tkeep, m_axis_mon_2_tkeep, m_axis_mon_1_tkeep, m_axis_mon_0_tkeep} =
+       {s_axis_rx_3_tkeep, s_axis_rx_2_tkeep, s_axis_rx_1_tkeep, s_axis_rx_0_tkeep};
+assign {m_axis_mon_3_tvalid, m_axis_mon_2_tvalid, m_axis_mon_1_tvalid, m_axis_mon_0_tvalid} =
+       {s_axis_rx_3_tvalid, s_axis_rx_2_tvalid, s_axis_rx_1_tvalid, s_axis_rx_0_tvalid};
+assign {m_axis_mon_3_tlast, m_axis_mon_2_tlast, m_axis_mon_1_tlast, m_axis_mon_0_tlast} =
+       {s_axis_rx_3_tlast, s_axis_rx_2_tlast, s_axis_rx_1_tlast, s_axis_rx_0_tlast};
+assign {m_axis_mon_3_tuser, m_axis_mon_2_tuser, m_axis_mon_1_tuser, m_axis_mon_0_tuser} =
+       {s_axis_rx_3_tuser, s_axis_rx_2_tuser, s_axis_rx_1_tuser, s_axis_rx_0_tuser};
 
 // ---------------------------------------------------------------------------
 // Control / status
@@ -410,13 +451,6 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
     assign evt_tgl[6*n + 2] = tx_good_tgl;
     assign evt_tgl[6*n + 3] = tx_unf_tgl;
 
-    // ---- placeholder timestamp counters ----
-    reg [PTP_TS_W-1:0] tx_ts = {PTP_TS_W{1'b0}};
-    reg [PTP_TS_W-1:0] rx_ts = {PTP_TS_W{1'b0}};
-    always @(posedge tx_clk[n]) tx_ts <= tx_ts + TS_INC;
-    always @(posedge rx_clk[n]) rx_ts <= rx_ts + TS_INC;
-    assign tx_ts_all[PTP_TS_W*n +: PTP_TS_W] = tx_ts;
-    assign rx_ts_all[PTP_TS_W*n +: PTP_TS_W] = rx_ts;
 end
 endgenerate
 

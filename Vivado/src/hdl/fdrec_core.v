@@ -26,6 +26,20 @@
 //                 counters into one coherent snapshot (xpm_cdc_handshake,
 //                 continuously refreshed, at most a few hundred ns old)
 //
+// Capture source (register map 1.2, FPGA Packet Recorder): s_axis_cap (dp_clk,
+// 128-bit, WITH back-pressure) is the merged capture record stream
+// (pktrec_capture). While cap_sel = 1 it feeds the packetizer directly instead
+// of the ingest FIFO, so no beat is ever dropped inside the recorder: when the
+// DMA/SSD side stalls, s_axis_cap_tready goes low and the capture path drops
+// WHOLE frames upstream (counted per port). The ingest FIFO is then not read
+// (a running TPG would just fill it and count drops). cap_sel = 0 is the
+// original TPG/ingest path (fdrec --rate). Change cap_sel only while the
+// recorder is stopped. PKT_SRC (0x050, RO) reads cap_sel back. rec_srst
+// (dp_clk level) = soft reset in progress (or dp reset): the packetizer empties
+// its register slice meanwhile; the capture merge uses it to restart the stream
+// on a record boundary. The DMA contract is unchanged in both modes: TLAST every
+// PKT_LEN beats, TKEEP all ones.
+//
 // Clock-domain crossings use XPM CDC macros only, which carry their own timing
 // constraints (no XDC needed).
 //
@@ -65,7 +79,7 @@ module fdrec_core #(
 
   // Datapath / register clock domain
   (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 dp_clk CLK" *)
-  (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF m_axis:s_axi:s_axis_mm2s, ASSOCIATED_RESET dp_resetn" *)
+  (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF m_axis:s_axi:s_axis_mm2s:s_axis_cap, ASSOCIATED_RESET dp_resetn" *)
   input  wire          dp_clk,
   (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 dp_resetn RST" *)
   (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -75,6 +89,13 @@ module fdrec_core #(
   input  wire [127:0]  s_axis_tdata,
   input  wire          s_axis_tvalid,
   output wire          s_axis_tready,
+
+  // Capture record stream (dp_clk), with back-pressure; used while cap_sel = 1
+  input  wire [127:0]  s_axis_cap_tdata,
+  input  wire          s_axis_cap_tvalid,
+  output wire          s_axis_cap_tready,
+  input  wire          cap_sel,         // dp_clk level: 1 = packetizer source is s_axis_cap
+  output wire          rec_srst,        // dp_clk level: soft reset in progress / dp reset
 
   // Stream to the AXI DMA S2MM (dp_clk)
   output wire [127:0]  m_axis_tdata,
@@ -197,6 +218,7 @@ module fdrec_core #(
     .fifo_count      (fifo_count),
     .fifo_rst_busy   (fifo_rst_busy | egr_wr_rst_busy),
     .beats_out       (beats_out),
+    .pkt_src         (cap_sel),
     .tpg_enable      (dp_tpg_enable),
     .tpg_seq_rst     (dp_tpg_seq_rst),
     .tpg_rate_inc    (dp_tpg_rate_inc),
@@ -562,15 +584,23 @@ module fdrec_core #(
   // ===========================================================================
   // dp_clk domain: packetizer
   // ===========================================================================
+  // Packetizer source: ingest FIFO (TPG path) or the capture record stream
+  wire [127:0] pk_tdata  = cap_sel ? s_axis_cap_tdata  : fifo_tdata;
+  wire         pk_tvalid = cap_sel ? s_axis_cap_tvalid : fifo_tvalid;
+  wire         pk_tready;
+  assign fifo_tready       = pk_tready & ~cap_sel;
+  assign s_axis_cap_tready = pk_tready &  cap_sel;
+  assign rec_srst          = ~dp_resetn | dp_srst;
+
   fdrec_packetizer u_pkt (
     .clk           (dp_clk),
     .srst          (~dp_resetn | dp_srst),
     .enable        (pkt_enable),
     .pkt_len       (pkt_len),
     .beats_out     (beats_out),
-    .s_tdata       (fifo_tdata),
-    .s_tvalid      (fifo_tvalid),
-    .s_tready      (fifo_tready),
+    .s_tdata       (pk_tdata),
+    .s_tvalid      (pk_tvalid),
+    .s_tready      (pk_tready),
     .m_axis_tdata  (m_axis_tdata),
     .m_axis_tkeep  (m_axis_tkeep),
     .m_axis_tlast  (m_axis_tlast),

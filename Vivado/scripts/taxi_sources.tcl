@@ -11,7 +11,9 @@
 #     CFG_LOW_LATENCY is removed again (saves two OOC IP runs)
 #   * Taxi's implementation-only CDC constraint scripts (PROCESSING_ORDER LATE):
 #     taxi_sync_reset / taxi_sync_signal (MAC, M0 path) and taxi_axis_async_fifo
-#     (the M0 path's frame FIFOs)
+#     (the M0 path's and the capture ports' frame FIFOs)
+#   * for the capture path (pktrec_capture): taxi_axis_adapter /
+#     taxi_axis_async_fifo_adapter
 #
 # Inputs (set before sourcing):
 #   taxi_dir       absolute path of the Taxi checkout (repo: submodules/taxi)
@@ -81,6 +83,8 @@ foreach rel {
     src/sync/rtl/taxi_sync_signal.sv
     src/sync/rtl/taxi_sync_reset.sv
     src/axis/rtl/taxi_axis_async_fifo.sv
+    src/axis/rtl/taxi_axis_adapter.sv
+    src/axis/rtl/taxi_axis_async_fifo_adapter.sv
 } {
     set p [file normalize "$taxi_dir/$rel"]
     if {[lsearch -exact $pktrec_taxi_rtl $p] < 0} { lappend pktrec_taxi_rtl $p }

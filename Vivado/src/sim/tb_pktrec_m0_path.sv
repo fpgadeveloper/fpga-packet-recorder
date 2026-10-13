@@ -78,8 +78,8 @@ module tb_pktrec_m0_path;
   wire [0:0]  tx_tuser [0:3];
   wire [7:0]  tx_tid [0:3];
   reg  [3:0]  tx_tready = 4'b0;
-  wire [63:0] tx_ts [0:3];
-  wire [63:0] rx_ts [0:3];
+  wire [15:0] mon_tdata [0:3];
+  wire [3:0]  mon_tvalid;
 
   reg  [3:0]  rx_stat_good = 4'b0, rx_stat_bad = 4'b0, tx_stat_good = 4'b0;
   reg  [3:0]  phy_gpio0 = 4'b0, phy_gpio1 = 4'b0;
@@ -105,28 +105,32 @@ module tb_pktrec_m0_path;
     .tx_clk_0(tx_clk[0]), .tx_aresetn_0(tx_aresetn[0]),
     .m_axis_tx_0_tdata(tx_tdata[0]), .m_axis_tx_0_tkeep(tx_tkeep[0]), .m_axis_tx_0_tvalid(tx_tvalid[0]),
     .m_axis_tx_0_tready(tx_tready[0]), .m_axis_tx_0_tlast(tx_tlast[0]), .m_axis_tx_0_tuser(tx_tuser[0]),
-    .m_axis_tx_0_tid(tx_tid[0]), .tx_ptp_ts_0(tx_ts[0]), .rx_ptp_ts_0(rx_ts[0]),
+    .m_axis_tx_0_tid(tx_tid[0]), .m_axis_mon_0_tdata(mon_tdata[0]), .m_axis_mon_0_tkeep(), .m_axis_mon_0_tvalid(mon_tvalid[0]),
+    .m_axis_mon_0_tlast(), .m_axis_mon_0_tuser(),
     .rx_clk_1(rx_clk[1]), .rx_aresetn_1(rx_aresetn[1]),
     .s_axis_rx_1_tdata(rx_tdata[1]), .s_axis_rx_1_tkeep(rx_tkeep[1]), .s_axis_rx_1_tvalid(rx_tvalid[1]),
     .s_axis_rx_1_tlast(rx_tlast[1]), .s_axis_rx_1_tuser({64'd0, rx_tbad[1]}),
     .tx_clk_1(tx_clk[1]), .tx_aresetn_1(tx_aresetn[1]),
     .m_axis_tx_1_tdata(tx_tdata[1]), .m_axis_tx_1_tkeep(tx_tkeep[1]), .m_axis_tx_1_tvalid(tx_tvalid[1]),
     .m_axis_tx_1_tready(tx_tready[1]), .m_axis_tx_1_tlast(tx_tlast[1]), .m_axis_tx_1_tuser(tx_tuser[1]),
-    .m_axis_tx_1_tid(tx_tid[1]), .tx_ptp_ts_1(tx_ts[1]), .rx_ptp_ts_1(rx_ts[1]),
+    .m_axis_tx_1_tid(tx_tid[1]), .m_axis_mon_1_tdata(mon_tdata[1]), .m_axis_mon_1_tkeep(), .m_axis_mon_1_tvalid(mon_tvalid[1]),
+    .m_axis_mon_1_tlast(), .m_axis_mon_1_tuser(),
     .rx_clk_2(rx_clk[2]), .rx_aresetn_2(rx_aresetn[2]),
     .s_axis_rx_2_tdata(rx_tdata[2]), .s_axis_rx_2_tkeep(rx_tkeep[2]), .s_axis_rx_2_tvalid(rx_tvalid[2]),
     .s_axis_rx_2_tlast(rx_tlast[2]), .s_axis_rx_2_tuser({64'd0, rx_tbad[2]}),
     .tx_clk_2(tx_clk[2]), .tx_aresetn_2(tx_aresetn[2]),
     .m_axis_tx_2_tdata(tx_tdata[2]), .m_axis_tx_2_tkeep(tx_tkeep[2]), .m_axis_tx_2_tvalid(tx_tvalid[2]),
     .m_axis_tx_2_tready(tx_tready[2]), .m_axis_tx_2_tlast(tx_tlast[2]), .m_axis_tx_2_tuser(tx_tuser[2]),
-    .m_axis_tx_2_tid(tx_tid[2]), .tx_ptp_ts_2(tx_ts[2]), .rx_ptp_ts_2(rx_ts[2]),
+    .m_axis_tx_2_tid(tx_tid[2]), .m_axis_mon_2_tdata(mon_tdata[2]), .m_axis_mon_2_tkeep(), .m_axis_mon_2_tvalid(mon_tvalid[2]),
+    .m_axis_mon_2_tlast(), .m_axis_mon_2_tuser(),
     .rx_clk_3(rx_clk[3]), .rx_aresetn_3(rx_aresetn[3]),
     .s_axis_rx_3_tdata(rx_tdata[3]), .s_axis_rx_3_tkeep(rx_tkeep[3]), .s_axis_rx_3_tvalid(rx_tvalid[3]),
     .s_axis_rx_3_tlast(rx_tlast[3]), .s_axis_rx_3_tuser({64'd0, rx_tbad[3]}),
     .tx_clk_3(tx_clk[3]), .tx_aresetn_3(tx_aresetn[3]),
     .m_axis_tx_3_tdata(tx_tdata[3]), .m_axis_tx_3_tkeep(tx_tkeep[3]), .m_axis_tx_3_tvalid(tx_tvalid[3]),
     .m_axis_tx_3_tready(tx_tready[3]), .m_axis_tx_3_tlast(tx_tlast[3]), .m_axis_tx_3_tuser(tx_tuser[3]),
-    .m_axis_tx_3_tid(tx_tid[3]), .tx_ptp_ts_3(tx_ts[3]), .rx_ptp_ts_3(rx_ts[3]),
+    .m_axis_tx_3_tid(tx_tid[3]), .m_axis_mon_3_tdata(mon_tdata[3]), .m_axis_mon_3_tkeep(), .m_axis_mon_3_tvalid(mon_tvalid[3]),
+    .m_axis_mon_3_tlast(), .m_axis_mon_3_tuser(),
     .rx_stat_pkt_good(rx_stat_good), .rx_stat_pkt_bad(rx_stat_bad),
     .tx_stat_pkt_good(tx_stat_good), .tx_stat_err_underflow(4'b0000),
     .link_up(link_up),

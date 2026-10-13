@@ -57,7 +57,8 @@
 #define FDREC_VERSION_MINOR_MASK        0x0000FFFFu
 #define FDREC_VERSION_1_0               0x00010000u   /* version 1.0 */
 #define FDREC_VERSION_1_1               0x00010001u   /* 1.1: + playback (CHK_, EGR_) */
-#define FDREC_VERSION_EXPECTED          FDREC_VERSION_1_1
+#define FDREC_VERSION_1_2               0x00010002u   /* 1.2: + capture source (PKT_SRC) */
+#define FDREC_VERSION_EXPECTED          FDREC_VERSION_1_2
 
 /* ---------------------------------------------------------------------------
  * Global
@@ -149,6 +150,17 @@
 /* 0x048/0x04C PKT_BEATS_OUT (RO, 64-bit): beats delivered to the DMA */
 #define FDREC_PKT_BEATS_OUT_LO          0x048       /* read first: latches HI */
 #define FDREC_PKT_BEATS_OUT_HI          0x04C
+
+/*
+ * 0x050 PKT_SRC (RO, version 1.2, FPGA Packet Recorder): [0] = 1 while the
+ * packetizer is fed by the capture record stream (s_axis_cap, lossless with
+ * back-pressure; selected by PKTREC_CAP_CTRL.SRC_SEL in pktrec_regs.h), 0 while
+ * it is fed by the ingest FIFO (TPG / user source, drop-when-full). In capture
+ * mode the ING_* counters do not describe the recorded data (the ingest FIFO is
+ * bypassed); use the PKTREC_CAP_* counters.
+ */
+#define FDREC_PKT_SRC                   0x050
+#define FDREC_PKT_SRC_CAPTURE           (1u << 0)
 
 /* ---------------------------------------------------------------------------
  * Playback checker (fdrec_check, user_data_sink hierarchy) -- version 1.1

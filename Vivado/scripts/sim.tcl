@@ -48,11 +48,13 @@ set work_root  [file join $vivado_dir sim]
 set taxi_dir   [file normalize [file join $vivado_dir .. submodules taxi]]
 
 # Taxi library sources needed by the simulated RTL (pktrec_axis_async_fifo,
-# pktrec_m0_path)
+# pktrec_m0_path, pktrec_cap_port)
 set taxi_sim_srcs {}
 foreach rel {
   src/axis/rtl/taxi_axis_if.sv
   src/axis/rtl/taxi_axis_async_fifo.sv
+  src/axis/rtl/taxi_axis_adapter.sv
+  src/axis/rtl/taxi_axis_async_fifo_adapter.sv
   src/sync/rtl/taxi_sync_reset.sv
   src/sync/rtl/taxi_sync_signal.sv
 } {

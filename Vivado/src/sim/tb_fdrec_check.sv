@@ -92,6 +92,8 @@ module tb_fdrec_check;
     .s_axis_tdata  (128'd0),
     .s_axis_tvalid (1'b0),
     .s_axis_tready (),
+    .s_axis_cap_tdata (128'd0), .s_axis_cap_tvalid (1'b0), .s_axis_cap_tready (),
+    .cap_sel (1'b0), .rec_srst (),
     .m_axis_tdata  (),
     .m_axis_tkeep  (),
     .m_axis_tlast  (),
@@ -409,7 +411,7 @@ module tb_fdrec_check;
 
     // ---------------- 1. Register block ----------------
     $display("--- 1. register block 1.1");
-    axi_read(VERSION, v);         check("VERSION", v, 32'h0001_0001);
+    axi_read(VERSION, v);         check("VERSION", v, 32'h0001_0002);
     axi_read(CHK_RATE_INC, v);    check("CHK_RATE_INC reset value", v, 32'h8000_0000);
     axi_read(CHK_CTRL, v);        check("CHK_CTRL reset value", v, 0);
     axi_read(EGR_CTRL, v);        check("EGR_CTRL reset value", v, 0);
