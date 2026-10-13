@@ -58,7 +58,8 @@ and `pktrec_eth_ports_core.sv`), built on the open-source Taxi library
   0x01, 0x03, 0x0C and 0x0F.
 * Software controls the four PHY reset pins.
 * TX padding is off, so frames are forwarded as they were received.
-* The 64-bit MAC timestamp inputs are fed from placeholder counters for now.
+* The 64-bit MAC timestamp inputs are fed by the capture block's timebase (see
+  [Capture path](#capture-path-m1)).
 
 **`pktrec_m0_path`** is the bring-up datapath (`Vivado/src/hdl/pktrec_m0_path.v`).
 
@@ -77,6 +78,8 @@ and `pktrec_eth_ports_core.sv`), built on the open-source Taxi library
 * Forwarding is store-and-forward, so latency grows with frame size.
 * The PHY GPIO_0/GPIO_1 inputs (RX/TX start-of-frame-delimiter pulses once configured) and
   the card's power-good signals can be read back. Their rising edges are counted.
+* It also passes a plain copy of every RX stream (`m_axis_mon_n`) to the capture path.
+  The RX streams have no back-pressure, so this fan-out does not affect forwarding.
 
 `ctrl_clk` is the PS `pl_clk0` (100 MHz). It clocks both register blocks, the MDIO master
 and Taxi's transceiver reset/DRP logic. The GT wizard IP declares 62.5 MHz for this clock.
@@ -145,3 +148,161 @@ service (`systemctl stop pktrec-phy-watch`) and run `pktrec-phy init` by hand.
 
 The OP080 has no bypass relays. If the board is unpowered or reconfiguring, every port
 link is broken, including a TAP pair.
+
+## Capture path (M1)
+
+The block-design hierarchy `capture` holds one module reference, **`pktrec_capture`**
+(`Vivado/src/hdl/pktrec_capture.v`, implementation in `pktrec_capture_core.sv` and the
+`pktrec_cap_*.sv` / `pktrec_timebase.sv` modules). It records what every port receives, in
+monitor mode, and hands the records to the recorder datapath (`fdrec_core`), which writes
+them to the SSD exactly like the recorder's test data.
+
+```
+eth_ports RX n (rx_clk_n, 16 bit) ──> pktrec_cap_port n ─┐
+   x4                                  frame FIFO 16 KB   ├─> pktrec_cap_merge ─> fdrec_core
+                                       + record header    ┘   (round robin,       S_AXIS_CAP
+pktrec_timebase (dp_clk) ─ cycle count ─> MAC timestamp inputs   whole records)   -> packetizer
+                         ─ ns, cycles ──> record headers                          -> AXI DMA
+```
+
+### Per port (`pktrec_cap_port`)
+
+* A frame is captured if capture is enabled (`CTRL.ENABLE` and `PORT_EN[n]`) when its
+  first byte arrives. A frame already in progress when the enable changes is taken or
+  ignored whole.
+* Every frame that starts while the port is enabled gets the port's next 16-bit sequence
+  number, including frames that are then dropped. A gap in a port's sequence numbers in
+  a capture file is therefore exactly the number of frames the hardware dropped there.
+* `SNAPLEN` (0 = off) limits the bytes stored per frame. Truncated records carry the
+  TRUNC flag and the original length.
+* The frame is stored whole in a 16 KB per-port frame FIFO (Taxi
+  `taxi_axis_async_fifo_adapter`: 16-to-128-bit conversion and the clock crossing into
+  `dp_clk`). When a frame does not fit, the FIFO drops it **whole**, and the port counts
+  it in `FRAMES_DROP` / `BYTES_DROP`. A frame larger than the FIFO is dropped the same
+  way. Nothing is ever dropped in the middle of a frame or a record.
+* The frame's metadata waits until the FIFO has committed the frame, then goes into a
+  small metadata FIFO. The record reader in `dp_clk` builds the 16-byte header, then
+  copies the frame's data beats, zeroing the unused bytes of the last one.
+* Counters (frames received, bad, dropped, truncated, bytes received and dropped) are
+  kept in the port's receive clock and copied to `dp_clk` as one coherent snapshot.
+
+### Merge and recorder
+
+* `pktrec_cap_merge` grants the four ports round robin, one **whole record** at a time,
+  and produces one 128-bit stream at up to 4 GB/s, well above the 500 MB/s of four ports
+  at line rate.
+* The stream goes straight into the `fdrec_core` packetizer, with back-pressure, while
+  `CTRL.SRC_SEL` = 1. The recorder's ingest FIFO, which drops 16-byte beats when it is
+  full, is bypassed. When the SSD or the DMA stalls, the back-pressure reaches the
+  per-port frame FIFOs, and drops happen there as whole, counted frames.
+* The DMA contract is unchanged: `TLAST` every `PKT_LEN` beats, `TKEEP` all ones. Record
+  boundaries and DMA buffer boundaries are unrelated: records span buffers.
+* `fdrec_core` register map 1.2 adds `PKT_SRC` (0x050), which reads the source back.
+  With `SRC_SEL` = 0 (the reset value) the test pattern generator path works as before,
+  so `fdrec --rate` benchmarks still run on this design.
+* **Fill:** with `CTRL.FILL` set, the merge sends all-zero 16-byte fill units whenever it
+  has no record. At the end of a capture, fill pushes the last records through the DMA
+  (whose buffers only complete when full), so the fdrec driver's STOP drain completes at
+  once.
+* A recorder soft reset (every `FDREC_IOC_START`) while a record is in progress cuts that
+  record (`SRST_ABORTS`); the merge then discards its remainder, so a recording always
+  starts on a record boundary.
+
+### Record format v1
+
+Defined in `include/pktrec_format.h`. Each record is a 16-byte header, the frame bytes
+(FCS excluded; the MAC strips it), and zero padding to a multiple of 16 bytes.
+
+| Bytes | Field | Description |
+|-------|-------|-------------|
+| 0-7 | `ts_ns` | timebase value at the start of frame, ns |
+| 8-9 | `cap_len` | bytes stored (FCS excluded, at most `SNAPLEN` and 16384) |
+| 10-11 | `orig_len` | length on the wire including the FCS |
+| 12 | `port` | 0..3 (OP080 P0..P3) |
+| 13 | `flags` | [0] bad frame (FCS/framing error or too long), [1] truncated, [2] timestamp from the MAC (always 1 in M1), [3] SFD mismatch (M2), [7:4] marker `0xA` |
+| 14-15 | `seq` | per-port frame sequence number |
+
+All fields are little-endian. A capture file is a 4 KB header (`struct
+pktrec_file_header`) followed by the record stream.
+
+### Timebase
+
+`pktrec_timebase` is a PHC-style clock in `dp_clk` (249.975 MHz): a 64-bit nanosecond
+counter plus a 32-bit fraction, advanced every cycle by a 32.32 increment (`INC`,
+reset 1e9 / `DP_CLK_HZ` = 4.0004 ns). Software can set it (`TB_SET`), step it by a
+signed offset (`TB_ADJ`) and trim its rate (`TB_INC_*`), so it can be slaved to system
+time. `pktrec-cap` sets it from `CLOCK_REALTIME` before every capture.
+
+The four MAC receive clocks are recovered from the network and are not related to
+`dp_clk`. Instead of copying the time into each of them, the timebase counts `dp_clk`
+cycles and carries that count, Gray-coded (`xpm_cdc_gray`), into every MAC clock
+domain. The MAC latches the count at the start of frame. When the header is built, in
+`dp_clk`, the count is turned back into time:
+
+    ts_ns = TB_NOW - (cycles now - cycles at SFD) * INC + MAC_OFFSET
+
+`MAC_OFFSET` (reset 52 ns) removes the constant synchronisation delay of the copy.
+
+| Contribution | Size |
+|--------------|------|
+| timebase resolution | 4 ns (one `dp_clk` cycle) |
+| MAC timestamp quantisation | 16 ns (one 62.5 MHz MAC clock) |
+| sampling jitter of the cycle-count copy | at most 8 ns (simulation: 12..14 cycles of delay) |
+| PHY, PCS and transceiver latency | constant, not calibrated in M1 |
+
+M2 replaces the MAC timestamps with the PHYs' SFD pulses, sampled in `dp_clk`.
+
+Taxi's PTP clock-domain-crossing module (`taxi_ptp_clock_cdc`, a digital PLL per clock
+domain) was tried first. In simulation, with the 125..250 ppm frequency offsets expected
+between a recovered clock and `dp_clk`, its output wandered up to ±30 ns (rms about 9 ns)
+around the master. The cycle-count scheme has no lock time and only a constant offset.
+
+### Capture register map
+
+`pktrec_capture` (`0x04_2003_0000`, 4 KB, `generic-uio`), register map 1.1. The full
+definitions, including the start and stop protocol with the fdrec driver, are in
+`include/pktrec_regs.h`. 64-bit counters are `_LO`/`_HI` pairs: reading `_LO` latches
+the matching `_HI`.
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `0x000` | ID | `0x504B4350` |
+| `0x004` | VERSION | `0x00010001` |
+| `0x008` | CTRL | [0] ENABLE, [1] FILL, [2] SRC_SEL (recorder source: 1 = capture), [8] CLEAR (self-clearing) |
+| `0x00C` | STATUS | [0] IDLE, [1] merge busy, [11:8] port idle, [15:12] port receiving a captured frame, [23:16] MAC clock domains out of reset |
+| `0x010` | PORT_EN | [3:0] per-port enable (reset `0xF`) |
+| `0x014` | SNAPLEN | [15:0] bytes stored per frame, 0 = whole frames |
+| `0x018` | DP_CLK_HZ | timebase clock frequency |
+| `0x01C` | PORT_FIFO_BYTES | 16384 |
+| `0x020` | BYTES_OUT (64) | record bytes handed to the recorder |
+| `0x028` | RECORDS_OUT (64) | records handed to the recorder |
+| `0x030` | FILL_BEATS (64) | fill units sent |
+| `0x038` | BP_CYCLES (64) | `dp_clk` cycles a beat waited for the recorder |
+| `0x040` | SRST_ABORTS | records cut by a recorder soft reset |
+| `0x044` | LEN_FIXUPS | records whose data did not match their header length (expect 0) |
+| `0x080` | TB_CTRL | [0] SET, [1] ADJ |
+| `0x084` / `0x088` | TB_INC_FRAC / TB_INC_NS | increment per cycle; writing `INC_NS` applies both |
+| `0x08C` | TB_STATUS | [3:0] RX, [7:4] TX MAC clock domains out of reset |
+| `0x090` | TB_NOW (64) | current time, ns |
+| `0x098` | TB_SET (64) | value loaded by SET |
+| `0x0A0` | TB_ADJ (64) | signed offset added by ADJ |
+| `0x0A8` | MAC_OFFSET | signed ns added to MAC timestamps (reset 52) |
+| `0x100 + n*0x40` | port n | FRAMES_RX, FRAMES_BAD, FRAMES_DROP, BYTES_RX, BYTES_DROP, FRAMES_TRUNC, RECORDS (64 bit each), FIFO_HWM (0x38, bytes, write clears), SEQ_NEXT (0x3C) |
+
+Once `STATUS.IDLE` = 1, `FRAMES_RX` = `RECORDS` + `FRAMES_DROP` on every port.
+
+### Verification
+
+Self-checking testbenches (`Vivado/scripts/sim.tcl`):
+
+* `tb_pktrec_cap_port`: headers, data and padding of every record, snaplen, whole-frame
+  drops under back-pressure with exact counters and sequence gaps, the port enable,
+  minimum-size frames at line rate with no drops, the timestamp conversion across the
+  32-bit wrap of the cycle counter.
+* `tb_pktrec_cap_merge`: whole records only, per-port order, round-robin fairness, fill,
+  soft-reset cut.
+* `tb_pktrec_timebase`: increment, set, adjust, rate change, and the delay window of the
+  cycle-count copies at +125 / -250 ppm.
+* `tb_pktrec_capture`: the four ports, the merge, the registers and `fdrec_core` in
+  capture mode with a DMA model. It follows the start and stop protocol and checks the
+  recorded stream frame by frame, then cuts records in flight with a recorder soft reset.
