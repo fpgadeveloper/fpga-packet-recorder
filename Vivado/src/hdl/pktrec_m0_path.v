@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 //
-// pktrec_m0_path - M0 bring-up datapath for the 4-port Ethernet subsystem
-// (block-design module reference, next to pktrec_eth_ports in hierarchy eth_ports).
+// pktrec_m0_path - datapath of the 4-port Ethernet subsystem: TAP forwarding,
+// loopback, traffic generator (block-design module reference, next to
+// pktrec_eth_ports in hierarchy eth_ports). The "m0" in the name is historical
+// (it started as the M0 bring-up path); it carries the M3 TAP mode as well.
 //
 // Per port n the TX MAC input is selected by PATH_CTRL (pktrec_m0_regs):
 //   0 IDLE  nothing is sent
@@ -11,12 +13,26 @@
 //           numbered test frames, register-controlled (GEN_* registers); each
 //           port also has a receive checker (pktrec_gen_chk, CHK_*) on its RX
 // Each (TX port, source) pair has its own store-and-forward async frame FIFO
-// (pktrec_axis_async_fifo, rx_clk[src] -> tx_clk[n], 4 KB): 8 FIFOs in total. A FIFO
+// (pktrec_axis_async_fifo, rx_clk[src] -> tx_clk[n]; LOOP FIFO_DEPTH = 4 KB, FWD
+// FWD_FIFO_DEPTH = 16 KB since M3): 8 FIFOs in total. A FIFO
 // is written only while its source is selected (decided at the first beat of every
 // frame, so frames are never cut); frames that do not fit are dropped whole and
 // counted. Frames marked bad by the RX MAC (tuser[0] at tlast) are forwarded with
 // tuser set, so the TX MAC sends them with an error (TAP fidelity). The TX side
-// switches source only between frames; a FIFO that is not selected is drained.
+// switches source only between frames; a FIFO that is not selected is drained
+// (frames discarded that way are counted in FLUSH, M3).
+//
+// TAP mode (M3): a pair in TAP mode has both ports on FWD. The partner's RX clock
+// (recovered, +-100 ppm of the far device) and our TX clock (local QPLL) differ, so a
+// partner that sends at 100 % utilisation slightly faster than we can send would
+// overflow any FIFO. Dynamic inter-frame gap: per TX port, while the FWD FIFO fill
+// exceeds IFG_HI (bytes) the MAC's TX inter-frame gap (tx_ifg[8n+7:8n] ->
+// pktrec_eth_ports EXT_TX_IFG) drops from IFG_NOM (12) to IFG_MIN (8) until the fill
+// falls below IFG_LO (hysteresis). 4 bytes per frame of catch-up = 2600 ppm at
+// 1518-byte frames, 5 % at 64-byte frames, far more than the +-200 ppm worst case.
+// Cycles spent in reduced mode and the number of entries are counted. PAIR_MODE
+// (pktrec_m0_regs) records tap/monitor per pair for software; EFF_PATH reads back
+// the TX source each port actually uses.
 // The MAC strips the FCS on RX and the TX MAC regenerates it; the MAC's own TX
 // padding must be off (pktrec_eth_ports DEFAULT_TX_PAD_EN = 0) for faithful runts.
 //
@@ -37,7 +53,8 @@
 module pktrec_m0_path #(
     parameter PTP_TS_W   = 64,
     parameter TX_TAG_W   = 8,
-    parameter FIFO_DEPTH = 4096,     // bytes per FIFO
+    parameter FIFO_DEPTH = 4096,     // bytes per LOOP FIFO
+    parameter FWD_FIFO_DEPTH = 16384, // bytes per FWD (TAP) FIFO
     parameter C_S_AXI_ADDR_WIDTH = 12
 )(
     // ---- control clock / reset (s_axi, counters) ----
@@ -249,6 +266,8 @@ module pktrec_m0_path #(
     input  wire [3:0]          tx_stat_pkt_good,
     input  wire [3:0]          tx_stat_err_underflow,
     input  wire [3:0]          link_up,               // ctrl_clk
+    // ---- MAC TX inter-frame gap per port (dynamic IFG, M3): [8n+7:8n] in tx_clk_n ----
+    output wire [31:0]         tx_ifg,
     // ---- OP080 pins (asynchronous inputs): PHY GPIO_0 / GPIO_1 per port, power good ----
     input  wire [3:0]          phy_gpio0,
     input  wire [3:0]          phy_gpio1,
@@ -344,6 +363,17 @@ wire [31:0] mode_rx_all;        // path_mode synchronised into rx_clk[n]: [8n+7:
 wire [31:0] mode_tx_all;        // path_mode synchronised into tx_clk[n]: [8n+7:8n]
 wire [23:0] evt_tgl;            // event toggles, [6n+i] (i: see pktrec_m0_regs)
 wire [7:0]  fifo_drop;          // FIFO f drop strobe (rx_clk of its source)
+wire [8*16-1:0] f_depth;        // FIFO f fill in bytes (tx_clk of its TX port)
+// dynamic IFG configuration (ctrl_clk) and status (into ctrl_clk), per port
+//   cfg {gen_bad, lo[15:0], hi[15:0], min[7:0], nom[7:0], en}  (gen_bad = GEN_CTRL[3])
+//   st  {red_cyc[47:0], entries[31:0], fill_max[15:0], fill_cur[15:0], ifg[7:0], reduced}
+localparam ICFG_W = 1 + 8 + 8 + 16 + 16 + 1;
+localparam IST_W  = 1 + 8 + 16 + 16 + 32 + 48;
+wire [4*ICFG_W-1:0] ifg_cfg;
+wire [4*IST_W-1:0]  ifg_st;
+wire                ifg_clr_tgl;    // ctrl_clk toggle: clear max fill / counters
+wire [7:0]          eff_path;       // TX source in use per port (synchronised to ctrl_clk)
+wire [7:0]          flush_tgl;      // [2n+k] frame flushed from FIFO 2n+k (tx_clk[n])
 // generator / checker configuration (ctrl_clk) and status (into ctrl_clk)
 localparam GCFG_W = 3 + 14 + 14 + 16 + 32 + 48 + 48 + 16 + 32 + 32;   // 255
 localparam CCFG_W = 2 + 16;
@@ -386,8 +416,12 @@ for (f = 0; f < 8; f = f + 1) begin : g_fifo
         end
     end
 
+    localparam integer DEPTH = KIND ? FWD_FIFO_DEPTH : FIFO_DEPTH;
+    wire [$clog2(DEPTH):0] depth;
+    assign f_depth[16*f +: 16] = depth;
+
     pktrec_axis_async_fifo #(
-        .DEPTH(FIFO_DEPTH),
+        .DEPTH(DEPTH),
         .RAM_PIPELINE(2)
     ) fifo_inst (
         .s_clk(rx_clk[SRC]),
@@ -407,7 +441,8 @@ for (f = 0; f < 8; f = f + 1) begin : g_fifo
         .m_tlast(f_tlast[f]),
         .m_tuser(f_tuser[f]),
         .s_drop(fifo_drop[f]),
-        .s_good()
+        .s_good(),
+        .m_depth(depth)
     );
 
     // drop events: DROP_LOOP of port DST (k = 0) / DROP_FWD of port DST (k = 1)
@@ -426,6 +461,17 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
     wire [1:0] target = tmode;
     reg  [1:0] sel = 2'd0;          // 0 none, 1 LOOP FIFO (2n), 2 FWD FIFO (2n+1), 3 GEN
     reg  [2:0] fin = 3'b000;        // FIFO / generator output is inside a frame
+
+    // ---- dynamic IFG / generator-bad configuration (tx_clk[n]) ----
+    wire [ICFG_W-1:0] icfg;
+    taxi_sync_signal #(.WIDTH(ICFG_W), .N(2)) icfg_sync_inst (
+        .clk(tx_clk[n]), .in(ifg_cfg[ICFG_W*n +: ICFG_W]), .out(icfg));
+    wire        i_en  = icfg[0];
+    wire [7:0]  i_nom = icfg[1 +: 8];
+    wire [7:0]  i_min = icfg[9 +: 8];
+    wire [15:0] i_hi  = icfg[17 +: 16];
+    wire [15:0] i_lo  = icfg[33 +: 16];
+    wire        i_gen_bad = icfg[49];
 
     // ---- traffic generator (tx_clk[n]) ----
     wire [GCFG_W-1:0] gcfg;
@@ -512,7 +558,7 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
                                   (sel == 2'd2) ? f_tkeep[2*(2*n+1) +: 2]  : f_tkeep[2*(2*n) +: 2];
     assign tx_tlast[n]          = (sel == 2'd3) ? g_tlast :
                                   (sel == 2'd2) ? f_tlast[2*n+1] : f_tlast[2*n];
-    assign tx_tuser[n]          = (sel == 2'd3) ? 1'b0 :
+    assign tx_tuser[n]          = (sel == 2'd3) ? i_gen_bad :
                                   (sel == 2'd2) ? f_tuser[2*n+1] : f_tuser[2*n];
 
     always @(posedge tx_clk[n]) begin
@@ -526,6 +572,77 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
             fin <= 3'b000;
         end
     end
+
+    // ---- frames discarded from an unselected FIFO (mode switch) -> FLUSH ----
+    reg [1:0] fl_tgl = 2'b00;
+    always @(posedge tx_clk[n]) begin
+        if (sel != 2'd1 && f_tvalid[2*n]   && f_tlast[2*n])   fl_tgl[0] <= !fl_tgl[0];
+        if (sel != 2'd2 && f_tvalid[2*n+1] && f_tlast[2*n+1]) fl_tgl[1] <= !fl_tgl[1];
+    end
+    assign flush_tgl[2*n +: 2] = fl_tgl;
+
+    // ---- dynamic inter-frame gap (tx_clk[n]) ----
+    wire        clr_s;
+    taxi_sync_signal #(.WIDTH(1), .N(2)) iclr_sync_inst (
+        .clk(tx_clk[n]), .in(ifg_clr_tgl), .out(clr_s));
+    reg         clr_d = 1'b0;
+    reg  [15:0] fill = 16'd0, fill_max = 16'd0;
+    reg         reduced = 1'b0;
+    reg  [7:0]  ifg_q = 8'd12;
+    reg  [47:0] red_cyc = 48'd0;
+    reg  [31:0] red_ent = 32'd0;
+    always @(posedge tx_clk[n]) begin
+        clr_d <= clr_s;
+        fill  <= f_depth[16*(2*n+1) +: 16];       // FWD FIFO of this TX port
+        if (fill > fill_max) fill_max <= fill;
+        if (!i_en) begin
+            reduced <= 1'b0;
+        end else if (!reduced) begin
+            if (fill > i_hi) begin
+                reduced <= 1'b1;
+                red_ent <= red_ent + 32'd1;
+            end
+        end else if (fill < i_lo) begin
+            reduced <= 1'b0;
+        end
+        if (reduced) red_cyc <= red_cyc + 48'd1;
+        ifg_q <= reduced ? i_min : i_nom;
+        if (clr_s != clr_d) begin
+            fill_max <= 16'd0;
+            red_cyc  <= 48'd0;
+            red_ent  <= 32'd0;
+        end
+        if (tx_rst[n]) begin
+            reduced <= 1'b0;
+            ifg_q   <= 8'd12;
+        end
+    end
+    assign tx_ifg[8*n +: 8] = ifg_q;
+
+    // status snapshot tx_clk[n] -> ctrl_clk
+    reg  [IST_W-1:0] ist_hold = {IST_W{1'b0}};
+    reg              ist_send = 1'b0;
+    wire             ist_rcv, ist_req;
+    wire [IST_W-1:0] ist_out;
+    reg  [IST_W-1:0] ist_q = {IST_W{1'b0}};
+    always @(posedge tx_clk[n]) begin
+        if (!ist_send && !ist_rcv) begin
+            ist_hold <= {red_cyc, red_ent, fill_max, fill, ifg_q, reduced};
+            ist_send <= 1'b1;
+        end else if (ist_send && ist_rcv) begin
+            ist_send <= 1'b0;
+        end
+    end
+    xpm_cdc_handshake #(.DEST_EXT_HSK(0), .DEST_SYNC_FF(3), .INIT_SYNC_FF(1), .SIM_ASSERT_CHK(0),
+                        .SRC_SYNC_FF(3), .WIDTH(IST_W))
+    ist_cdc (.src_clk(tx_clk[n]), .src_in(ist_hold), .src_send(ist_send), .src_rcv(ist_rcv),
+             .dest_clk(ctrl_clk), .dest_req(ist_req), .dest_ack(1'b0), .dest_out(ist_out));
+    always @(posedge ctrl_clk) if (ist_req) ist_q <= ist_out;
+    assign ifg_st[IST_W*n +: IST_W] = ist_q;
+
+    // effective TX source back into ctrl_clk (EFF_PATH)
+    taxi_sync_signal #(.WIDTH(2), .N(3)) eff_sync_inst (
+        .clk(ctrl_clk), .in(sel), .out(eff_path[2*n +: 2]));
 
     // ---- event toggles (source domains) ----
     reg rx_good_tgl = 1'b0, rx_bad_tgl = 1'b0, tx_good_tgl = 1'b0, tx_unf_tgl = 1'b0;
@@ -555,6 +672,13 @@ taxi_sync_signal #(.WIDTH(24), .N(3)) evt_sync_inst (
 always @(posedge ctrl_clk) evt_tgl_d <= evt_tgl_s;
 wire [23:0] evt = evt_tgl_s ^ evt_tgl_d;
 
+wire [7:0] flush_s;
+reg  [7:0] flush_d = 8'd0;
+taxi_sync_signal #(.WIDTH(8), .N(3)) flush_sync_inst (
+    .clk(ctrl_clk), .in(flush_tgl), .out(flush_s));
+always @(posedge ctrl_clk) flush_d <= flush_s;
+wire [7:0] flush_evt = flush_s ^ flush_d;
+
 wire [9:0] io_s;
 taxi_sync_signal #(.WIDTH(10), .N(3)) io_sync_inst (
     .clk(ctrl_clk), .in({pg_2v5, pg_1v0, phy_gpio1, phy_gpio0}), .out(io_s));
@@ -572,6 +696,11 @@ pktrec_m0_regs #(
     .chk_cfg(chk_cfg),
     .gen_st(gen_st),
     .chk_st(chk_st),
+    .flush_evt(flush_evt),
+    .eff_path(eff_path),
+    .ifg_cfg(ifg_cfg),
+    .ifg_st(ifg_st),
+    .ifg_clr_tgl(ifg_clr_tgl),
     .s_axi_awaddr(s_axi_awaddr),
     .s_axi_awvalid(s_axi_awvalid),
     .s_axi_awready(s_axi_awready),

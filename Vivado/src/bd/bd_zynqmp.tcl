@@ -532,7 +532,8 @@ add_irq axi_dma_0/mm2s_introut 7
 #                        | m_axis_rx_n (rx_clk_n)      ^ s_axis_tx_n (tx_clk_n)
 #                        v                             |
 #                      pktrec_m0_path_0 (8 async frame FIFOs: per TX port n a LOOP
-#                      FIFO from RX n and a FWD FIFO from RX n^1; PATH_CTRL selects;
+#                      FIFO from RX n (4 KB) and a FWD FIFO from RX n^1 (16 KB, TAP);
+#                      PATH_CTRL selects; dynamic IFG -> tx_ifg (M3); pair mode;
 #                      counters; PHY GPIO_0/1 + PG levels and edge counters;
 #                      copies of the RX streams for the capture path; the MAC
 #                      timestamp inputs come from capture/pktrec_timebase)
@@ -545,7 +546,9 @@ add_irq axi_dma_0/mm2s_introut 7
 #
 # pktrec_eth_ports parameters: low-latency (buffer-bypass) GT variant, 64-bit MAC
 # timestamps (48.16 ns), TX padding OFF (frames are forwarded unmodified, runts
-# included), GTs run from reset (GCTRL.xcvr_rst = 0).
+# included), GTs run from reset (GCTRL.xcvr_rst = 0), TX inter-frame gap per port
+# from pktrec_m0_path's dynamic IFG (EXT_TX_IFG = 1, M3 TAP mode: 12 bytes, 8 while
+# the FWD FIFO fills up because the far device's clock is faster than ours).
 #
 # The module-reference RX streams have no TREADY: pktrec_m0_path always accepts
 # (its frame FIFOs drop whole frames when full).
@@ -557,10 +560,11 @@ set_property -dict [list CONFIG.CFG_LOW_LATENCY {1} \
   CONFIG.PTP_TS_W {64} \
   CONFIG.PTP_TS_FMT_TOD {0} \
   CONFIG.DEFAULT_TX_PAD_EN {0} \
+  CONFIG.EXT_TX_IFG {1} \
   CONFIG.XCVR_RST_DEFAULT {0}] [get_bd_cells eth_ports/pktrec_eth_ports_0]
 create_bd_cell -type module -reference pktrec_m0_path eth_ports/pktrec_m0_path_0
-set_property -dict [list CONFIG.PTP_TS_W {64} CONFIG.FIFO_DEPTH {4096}] \
-  [get_bd_cells eth_ports/pktrec_m0_path_0]
+set_property -dict [list CONFIG.PTP_TS_W {64} CONFIG.FIFO_DEPTH {4096} \
+  CONFIG.FWD_FIFO_DEPTH {16384}] [get_bd_cells eth_ports/pktrec_m0_path_0]
 
 set ep eth_ports/pktrec_eth_ports_0
 set mp eth_ports/pktrec_m0_path_0
@@ -622,6 +626,8 @@ for {set n 0} {$n < 4} {incr n} {
 foreach p {rx_stat_pkt_good rx_stat_pkt_bad tx_stat_pkt_good tx_stat_err_underflow link_up} {
   connect_bd_net [get_bd_pins $ep/$p] [get_bd_pins $mp/$p]
 }
+# dynamic inter-frame gap (M3): [8n+7:8n] in tx_clk_n
+connect_bd_net [get_bd_pins $mp/tx_ifg] [get_bd_pins $ep/tx_ifg]
 
 # External ports (names match src/constraints/zcu106.xdc)
 create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 gt_ref_clk

@@ -15,7 +15,9 @@
 // DEPTH is in bytes (Taxi counts tkeep units); 4096 = 2048 x 16-bit beats.
 //
 // Status strobes (one s_clk cycle per frame): s_drop (frame dropped: FIFO full or
-// oversize), s_good (frame committed).
+// oversize), s_good (frame committed). m_depth (m_clk): current fill in bytes as seen
+// by the read side (Taxi m_status_depth: everything written and not yet read,
+// including the frame still being received), used by the M3 dynamic inter-frame gap.
 //
 // Copyright (c) 2026 Opsero Electronic Design Inc.
 
@@ -46,7 +48,8 @@ module pktrec_axis_async_fifo #(
     output wire logic        m_tuser,
 
     output wire logic        s_drop,
-    output wire logic        s_good
+    output wire logic        s_good,
+    output wire logic [$clog2(DEPTH):0] m_depth
 );
 
 taxi_axis_if #(.DATA_W(16), .KEEP_W(2), .USER_EN(1), .USER_W(1)) s_axis(), m_axis();
@@ -93,7 +96,7 @@ taxi_axis_async_fifo #(
     .s_status_overflow(s_drop),
     .s_status_bad_frame(),
     .s_status_good_frame(s_good),
-    .m_status_depth(),
+    .m_status_depth(m_depth),
     .m_status_depth_commit(),
     .m_status_overflow(),
     .m_status_bad_frame(),

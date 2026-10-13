@@ -11,6 +11,8 @@
 // Per port n (0..3): s_axis_tx_n / m_axis_tx_cpl_n / tx_ptp_ts_n on tx_clk_n,
 // m_axis_rx_n / rx_ptp_ts_n on rx_clk_n (recovered clock). All MAC clocks 62.5 MHz,
 // 16-bit data. RX has no tready (no back-pressure); TX underrun aborts the frame.
+// EXT_TX_IFG = 1 (M3): the MAC TX inter-frame gap of port n comes from tx_ifg[8n+7:8n]
+// (tx_clk_n; driven by pktrec_m0_path's dynamic IFG) instead of the TX_IFG register.
 //
 // Copyright (c) 2026 Opsero Electronic Design Inc.
 
@@ -27,6 +29,7 @@ module pktrec_eth_ports #(
     parameter TX_TAG_W           = 8,
     parameter XCVR_RST_DEFAULT   = 0,
     parameter DEFAULT_TX_PAD_EN  = 1,
+    parameter EXT_TX_IFG         = 0,       // 1: MAC TX IFG from tx_ifg (M3 dynamic IFG), 0: TX_IFG register
     parameter C_S_AXI_ADDR_WIDTH = 19,
     parameter SIM                = 0
 )(
@@ -101,6 +104,8 @@ module pktrec_eth_ports #(
     // ---- port 0 timestamp inputs (PTP_TS_EN; already in tx_clk_0 / rx_clk_0) ----
     input  wire [PTP_TS_W-1:0] tx_ptp_ts_0,
     input  wire [PTP_TS_W-1:0] rx_ptp_ts_0,
+    // ---- TX inter-frame gap per port (EXT_TX_IFG = 1): [8n+7:8n] in tx_clk_n, bytes ----
+    input  wire [31:0]  tx_ifg,
     // ---- port 1 clocks / resets ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 tx_clk_1 CLK" *)
     (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_tx_1:m_axis_tx_cpl_1, ASSOCIATED_RESET tx_aresetn_1" *)
@@ -332,6 +337,7 @@ pktrec_eth_ports_core #(
     .TX_TAG_W(TX_TAG_W),
     .XCVR_RST_DEFAULT(XCVR_RST_DEFAULT),
     .DEFAULT_TX_PAD_EN(DEFAULT_TX_PAD_EN),
+    .EXT_TX_IFG(EXT_TX_IFG),
     .AXIL_ADDR_W(C_S_AXI_ADDR_WIDTH)
 ) core_inst (
     .gt_ref_clk_p(gt_ref_clk_clk_p),
@@ -382,6 +388,7 @@ pktrec_eth_ports_core #(
     .m_axis_tx_cpl_tvalid({m_axis_tx_cpl_3_tvalid, m_axis_tx_cpl_2_tvalid, m_axis_tx_cpl_1_tvalid, m_axis_tx_cpl_0_tvalid}),
     .tx_ptp_ts({tx_ptp_ts_3, tx_ptp_ts_2, tx_ptp_ts_1, tx_ptp_ts_0}),
     .rx_ptp_ts({rx_ptp_ts_3, rx_ptp_ts_2, rx_ptp_ts_1, rx_ptp_ts_0}),
+    .tx_ifg_ext(tx_ifg),
     .rx_status(rx_status),
     .an_complete(an_complete),
     .sgmii_link(sgmii_link),

@@ -38,7 +38,8 @@
 //   +0x08 LP_ADV       RO  [15:0] an_lp_adv_ability (SGMII config word from the PHY)
 //   +0x0C STICKY       W1C [0] link went down [1] rx bad FCS [2] rx bad frame
 //                          [3] tx underflow [4] an interrupt
-//   +0x10 TX_IFG       RW  [7:0] (12)
+//   +0x10 TX_IFG       RW  [7:0] (12); not used when EXT_TX_IFG = 1 (the MAC then takes
+//                          tx_ifg_ext, the dynamic IFG of pktrec_m0_path, M3)
 //   +0x14 TX_MAX_LEN   RW  [15:0] max frame length incl. FCS, minus 1 (1517)
 //   +0x18 RX_MAX_LEN   RW  [15:0] max frame length incl. FCS, minus 1 (1517)
 //   +0x1C TX_MIN_LEN   RW  [7:0] min frame length excl. FCS, minus 1 (59; used when tx_pad_en)
@@ -66,6 +67,7 @@ module pktrec_eth_ports_core #(
     parameter int          TX_TAG_W          = 8,
     parameter logic        XCVR_RST_DEFAULT  = 1'b0,
     parameter logic        DEFAULT_TX_PAD_EN = 1'b1,
+    parameter logic        EXT_TX_IFG        = 1'b0,
     parameter int          AXIL_ADDR_W       = 19
 )(
     // GT reference clock (125 MHz) and serial lanes
@@ -132,6 +134,9 @@ module pktrec_eth_ports_core #(
     // timestamp inputs (already in tx_clk[n] / rx_clk[n])
     input  wire logic [4*PTP_TS_W-1:0]    tx_ptp_ts,
     input  wire logic [4*PTP_TS_W-1:0]    rx_ptp_ts,
+
+    // TX inter-frame gap per port (EXT_TX_IFG = 1; tx_clk[n], [8n+7:8n] bytes)
+    input  wire logic [4*8-1:0]           tx_ifg_ext,
 
     // status (native domains: rx_status rx_clk[n]; an_* / sgmii_* tx_clk[n]; link_up ctrl_clk)
     output wire logic [3:0]               rx_status,
@@ -545,7 +550,7 @@ for (genvar n = 0; n < CNT; n = n + 1) begin : port
     );
     assign cfg_tx_min_s[n]    = tx_cfg_s[7:0];
     assign cfg_tx_max_s[n]    = tx_cfg_s[23:8];
-    assign cfg_tx_ifg_s[n]    = tx_cfg_s[31:24];
+    assign cfg_tx_ifg_s[n]    = EXT_TX_IFG ? tx_ifg_ext[8*n +: 8] : tx_cfg_s[31:24];
     assign cfg_tx_en_s[n]     = tx_cfg_s[32];
     assign cfg_tx_pad_en_s[n] = tx_cfg_s[34];
     assign an_en_s[n]         = tx_cfg_s[35];
