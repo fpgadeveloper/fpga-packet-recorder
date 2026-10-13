@@ -6,6 +6,7 @@
 !/bsp/
 !/scripts/
 !/meta-fdrec/
+!/meta-pktrec/
 
 # Local environment overrides and generated state.
 /offline.txt

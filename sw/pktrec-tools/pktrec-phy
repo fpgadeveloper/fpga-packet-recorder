@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Opsero Electronic Design Inc.
+"""pktrec-phy - bring-up tool for the Ethernet FMC Max (OP080) port subsystem of the
+FPGA Packet Recorder (M0): DP83867 PHY configuration over the fabric MDIO master,
+link status, M0 path selection and counters.
+
+Hardware (include/pktrec_regs.h):
+  eth_ports/pktrec_eth_ports_0  0x4_2008_0000 (512 KB)  MAC/PCS regs, MDIO master, GT APB
+  eth_ports/pktrec_m0_path_0    0x4_2002_0000 (4 KB)    PATH_CTRL, counters, PHY GPIO/PG
+Both are bound to generic-uio in the device tree; the tool finds them by their
+physical address in /sys/class/uio/uio*/maps/map0/addr (or uses /dev/mem with
+--devmem). Dependency-free: mmap + memoryview (aligned 32-bit accesses) only.
+
+Commands:
+  init [--1000-only] [--reset] [--no-sfd] [--wait S]
+                         configure all four PHYs (see init_phy) and re-trigger the
+                         SGMII status word on every copper link that comes up
+  status                 per port: PHY link/speed/duplex, SGMII/PCS state, GPIO levels
+  path <port|all> idle|loop|fwd   select the M0 TX source of a port
+  counters [--clear]     M0 frame counters
+  watch [--interval S]   re-trigger the SGMII status word (CFG2[7] 0->1) whenever a
+                         PHY's copper link changes (DP83867 sends it only once)
+  mdio <phy> <reg> [val] raw PHY register access (phy: p0..p3 or MDIO address;
+                         reg > 0x1f uses the extended REGCR/ADDAR indirection)
+"""
+
+import argparse
+import mmap
+import os
+import sys
+import time
+
+ETH_BASE, ETH_SIZE = 0x4_2008_0000, 0x80000
+M0_BASE, M0_SIZE = 0x4_2002_0000, 0x1000
+
+# pktrec_eth_ports (shell) registers
+ETH_ID, ETH_VERSION, ETH_GCTRL, ETH_GSTATUS = 0x000, 0x004, 0x008, 0x00C
+ETH_MDIO_CMD, ETH_MDIO_RDATA, ETH_MDIO_STATUS, ETH_MDIO_DIV = 0x010, 0x014, 0x018, 0x01C
+ETH_PORT_BASE, ETH_PORT_STRIDE = 0x100, 0x40
+P_CTRL, P_STATUS, P_LP_ADV, P_STICKY = 0x00, 0x04, 0x08, 0x0C
+ETH_ID_VALUE = 0x504B5245
+
+# pktrec_m0_path registers
+M0_ID, M0_VERSION, M0_PATH_CTRL, M0_CNT_CTRL, M0_IO_STATUS, M0_IO_STICKY = (
+    0x000, 0x004, 0x008, 0x00C, 0x010, 0x014)
+M0_PORT_BASE, M0_PORT_STRIDE = 0x100, 0x40
+M0_COUNTERS = ["RX_GOOD", "RX_BAD", "TX_GOOD", "TX_UNDERFLOW", "DROP_LOOP", "DROP_FWD",
+               "GPIO0_EDGES", "GPIO1_EDGES"]
+M0_ID_VALUE = 0x504B4D30
+MODES = {"idle": 0, "loop": 1, "fwd": 2}
+MODE_NAMES = {0: "idle", 1: "loop", 2: "fwd", 3: "idle(3)"}
+
+# DP83867 on the OP080: MDIO address of port n
+PHY_ADDR = [0x01, 0x03, 0x0C, 0x0F]
+BMCR, BMSR, PHYIDR1, PHYIDR2, ANAR, ANLPAR, CFG1, PHYCR, PHYSTS, CFG2, REGCR, ADDAR, CTRL = (
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x09, 0x10, 0x11, 0x14, 0x0D, 0x0E, 0x1F)
+CFG4, SGMIICTL1, SYNC_FIFO_CTRL, RXFCFG, GPIO_MUX_CTRL = 0x0031, 0x00D3, 0x00E9, 0x0134, 0x0172
+
+
+class Regs:
+    """32-bit register window (UIO map or /dev/mem)."""
+
+    def __init__(self, base, size, devmem=False):
+        self.base = base
+        if devmem:
+            fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+            self.mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE,
+                                offset=base)
+            self.src = "/dev/mem"
+        else:
+            dev = find_uio(base)
+            if dev is None:
+                raise SystemExit(f"pktrec-phy: no UIO device maps 0x{base:x} "
+                                 "(generic-uio binding missing? try --devmem)")
+            fd = os.open(dev, os.O_RDWR | os.O_SYNC)
+            self.mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE,
+                                offset=0)
+            self.src = dev
+        os.close(fd)
+        # typed view: every access is a single aligned 32-bit load/store
+        self.words = memoryview(self.mm).cast("I")
+
+    def rd(self, off):
+        return self.words[off >> 2]
+
+    def wr(self, off, val):
+        self.words[off >> 2] = val & 0xFFFFFFFF
+
+
+def find_uio(base):
+    root = "/sys/class/uio"
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for n in names:
+        try:
+            with open(f"{root}/{n}/maps/map0/addr") as f:
+                if int(f.read().strip(), 16) == base:
+                    return f"/dev/{n}"
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+class Board:
+    def __init__(self, devmem=False):
+        self.eth = Regs(ETH_BASE, ETH_SIZE, devmem)
+        self.m0 = Regs(M0_BASE, M0_SIZE, devmem)
+        if self.eth.rd(ETH_ID) != ETH_ID_VALUE:
+            raise SystemExit(f"pktrec-phy: eth_ports ID 0x{self.eth.rd(ETH_ID):08x}, "
+                             f"expected 0x{ETH_ID_VALUE:08x} (wrong bitstream?)")
+        if self.m0.rd(M0_ID) != M0_ID_VALUE:
+            raise SystemExit(f"pktrec-phy: m0_path ID 0x{self.m0.rd(M0_ID):08x}, "
+                             f"expected 0x{M0_ID_VALUE:08x}")
+
+    # ---- MDIO (Taxi taxi_mdio_master behind the shell's MDIO_CMD/STATUS/RDATA) ----
+    def _mdio_wait(self, want_rd, timeout=0.05):
+        t0 = time.monotonic()
+        while True:
+            st = self.eth.rd(ETH_MDIO_STATUS)
+            if st & 0x4:
+                raise RuntimeError("MDIO command dropped (master busy)")
+            if not (st & 0x1) and (not want_rd or (st & 0x2)):
+                return
+            if time.monotonic() - t0 > timeout:
+                raise RuntimeError(f"MDIO timeout (status 0x{st:x})")
+
+    def _mdio(self, op, phy, reg, data=0):
+        # [31:30]=01 start, [29:28] op (01 write, 10 read), [27:23] phy, [22:18] reg, [15:0] data
+        self._mdio_wait(False)
+        self.eth.wr(ETH_MDIO_CMD, (1 << 30) | (op << 28) | ((phy & 0x1F) << 23) |
+                    ((reg & 0x1F) << 18) | (data & 0xFFFF))
+        self._mdio_wait(op == 2)
+        return self.eth.rd(ETH_MDIO_RDATA) & 0xFFFF if op == 2 else None
+
+    def mdio_rd(self, phy, reg):
+        if reg <= 0x1F:
+            return self._mdio(2, phy, reg)
+        self._mdio(1, phy, REGCR, 0x001F)
+        self._mdio(1, phy, ADDAR, reg)
+        self._mdio(1, phy, REGCR, 0x401F)
+        return self._mdio(2, phy, ADDAR)
+
+    def mdio_wr(self, phy, reg, val):
+        if reg <= 0x1F:
+            self._mdio(1, phy, reg, val)
+            return
+        self._mdio(1, phy, REGCR, 0x001F)
+        self._mdio(1, phy, ADDAR, reg)
+        self._mdio(1, phy, REGCR, 0x401F)
+        self._mdio(1, phy, ADDAR, val)
+
+    def mdio_rmw(self, phy, reg, clr, setb):
+        v = self.mdio_rd(phy, reg)
+        n = (v & ~clr) | setb
+        if n != v:
+            self.mdio_wr(phy, reg, n)
+        return v
+
+    # ---- helpers ----
+    def eth_port(self, n, off):
+        return self.eth.rd(ETH_PORT_BASE + n * ETH_PORT_STRIDE + off)
+
+    def copper_link(self, n):
+        return bool(self.mdio_rd(PHY_ADDR[n], PHYSTS) & 0x0400)
+
+    def sgmii_retrigger(self, n):
+        """Make the DP83867 send a fresh SGMII config word (CFG2[7] 0 -> 1)."""
+        a = PHY_ADDR[n]
+        v = self.mdio_rd(a, CFG2)
+        self.mdio_wr(a, CFG2, v & ~0x0080)
+        self.mdio_wr(a, CFG2, v | 0x0080)
+
+
+def init_phy(b, n, only1000, sfd):
+    a = PHY_ADDR[n]
+    id1, id2 = b.mdio_rd(a, PHYIDR1), b.mdio_rd(a, PHYIDR2)
+    if id1 != 0x2000 or (id2 & 0xFFF0) != 0xA230:
+        print(f"P{n}: PHY @0x{a:02x} ID {id1:04x}:{id2:04x} is not a DP83867 - skipped")
+        return False
+    cfg4 = b.mdio_rd(a, CFG4)
+    # mirror mode (OP080 layout; Rev-A boards are not strapped for it) and SGMII AN
+    # timer 16 ms (CFG4[6:5] = 00, as the Linux dp83867 driver sets)
+    b.mdio_wr(a, CFG4, (cfg4 & ~0x0060) | 0x0001)
+    b.mdio_rmw(a, PHYCR, 0, 0x0800)            # SGMII_EN
+    b.mdio_rmw(a, SGMIICTL1, 0x4000, 0)        # 4-wire SGMII (no 625 MHz clock)
+    b.mdio_rmw(a, CFG2, 0, 0x0080)             # SGMII auto-negotiation enable
+    if only1000:
+        b.mdio_rmw(a, ANAR, 0x01E0, 0)         # no 10/100
+        b.mdio_rmw(a, CFG1, 0x0100, 0x0200)    # 1000FD only
+    else:
+        b.mdio_rmw(a, ANAR, 0, 0x01E0)         # strap default: 10/100/1000 HD+FD
+        b.mdio_rmw(a, CFG1, 0, 0x0300)
+    if sfd:
+        # TI SNLA242: TX SFD on GPIO_1, RX SFD on GPIO_0 (RGZ package)
+        b.mdio_wr(a, RXFCFG, 0x1080)
+        b.mdio_wr(a, GPIO_MUX_CTRL, 0x0120)
+        b.mdio_wr(a, SYNC_FIFO_CTRL, 0xDF22)
+    b.mdio_rmw(a, BMCR, 0x0C00, 0x1000)        # AN on, not powered down / isolated
+    b.mdio_wr(a, CTRL, 0x4000)                 # SW_RESTART (registers kept)
+    time.sleep(0.01)
+    print(f"P{n}: PHY @0x{a:02x} configured (strap mirror={'on' if cfg4 & 1 else 'OFF (Rev-A)'}, "
+          f"{'1000FD only' if only1000 else '10/100/1000'}, SFD {'on' if sfd else 'off'})")
+    return True
+
+
+def cmd_init(b, args):
+    g = b.eth.rd(ETH_GCTRL)
+    if args.reset:
+        b.eth.wr(ETH_GCTRL, g & ~0x0F00)        # assert all PHY resets
+        time.sleep(0.01)
+    if args.reset or (g & 0x0F00) != 0x0F00:
+        b.eth.wr(ETH_GCTRL, (g & ~0x0F00 & ~0x1) | 0x0F00)
+        time.sleep(0.05)                       # >= 1 ms after reset release
+    elif g & 1:
+        b.eth.wr(ETH_GCTRL, g & ~0x1)          # release the transceivers
+    ok = [init_phy(b, n, args.only1000, not args.no_sfd) for n in range(4)]
+    if args.wait > 0:
+        print(f"waiting up to {args.wait:.0f} s for copper links "
+              "(re-triggering SGMII on each link-up)...")
+        watch_loop(b, args.wait, 0.2, [n for n in range(4) if ok[n]], quiet=False)
+    cmd_status(b, args)
+
+
+def speed_str(code):
+    return {0: "10M", 1: "100M", 2: "1G"}.get(code, "?")
+
+
+def cmd_status(b, args):
+    gs = b.eth.rd(ETH_GSTATUS)
+    io = b.m0.rd(M0_IO_STATUS)
+    mode = b.m0.rd(M0_PATH_CTRL)
+    print(f"eth_ports: gtpowergood={gs & 1} qpll0_lock={(gs >> 1) & 1} "
+          f"phy_reset_n=0x{(b.eth.rd(ETH_GCTRL) >> 8) & 0xF:x} "
+          f"PG_1V0={(io >> 8) & 1} PG_2V5={(io >> 9) & 1}")
+    print("port phy  copper            sgmii/pcs                         lp_adv  link_up "
+          "gpio0 gpio1 path")
+    for n in range(4):
+        a = PHY_ADDR[n]
+        try:
+            bmsr = b.mdio_rd(a, BMSR)
+            bmsr = b.mdio_rd(a, BMSR)          # link bit latches low: read twice
+            st = b.mdio_rd(a, PHYSTS)
+            if bmsr & 0x4:
+                copper = f"up {speed_str((st >> 14) & 3):>4} {'FD' if st & 0x2000 else 'HD'}"
+            else:
+                copper = "down"
+        except RuntimeError as e:
+            copper = f"MDIO error: {e}"
+        s = b.eth_port(n, P_STATUS)
+        pcs = (f"sync={s & 1} an={'done' if s & 2 else ('run' if s & 4 else 'idle')}"
+               f"{' TIMEOUT' if s & 8 else ''} lp_link={(s >> 5) & 1} "
+               f"{speed_str((s >> 6) & 3)} {'FD' if s & 0x100 else 'HD'}")
+        print(f"P{n}   0x{a:02x} {copper:<17} {pcs:<33} 0x{b.eth_port(n, P_LP_ADV):04x}  "
+              f"{(s >> 11) & 1}       {(io >> n) & 1}     {(io >> (4 + n)) & 1}     "
+              f"{MODE_NAMES[(mode >> (2 * n)) & 3]}")
+
+
+def cmd_path(b, args):
+    ports = range(4) if args.port == "all" else [int(args.port.lstrip("pP"))]
+    m = b.m0.rd(M0_PATH_CTRL) & 0xFF
+    for n in ports:
+        if not 0 <= n <= 3:
+            raise SystemExit("port must be 0..3 or all")
+        m = (m & ~(3 << (2 * n))) | (MODES[args.mode] << (2 * n))
+    b.m0.wr(M0_PATH_CTRL, m)
+    print("PATH_CTRL = 0x%02x (%s)" % (m, ", ".join(
+        f"P{n}={MODE_NAMES[(m >> (2 * n)) & 3]}" for n in range(4))))
+
+
+def cmd_counters(b, args):
+    print(f"{'':14}" + "".join(f"{'P%d' % n:>12}" for n in range(4)))
+    for i, name in enumerate(M0_COUNTERS):
+        vals = [b.m0.rd(M0_PORT_BASE + n * M0_PORT_STRIDE + 4 * i) for n in range(4)]
+        print(f"{name:14}" + "".join(f"{v:>12}" for v in vals))
+    sticky = [b.eth_port(n, P_STICKY) for n in range(4)]
+    print(f"{'MAC_STICKY':14}" + "".join(f"{'0x%02x' % v:>12}" for v in sticky))
+    if args.clear:
+        b.m0.wr(M0_CNT_CTRL, 1)
+        for n in range(4):
+            b.eth.wr(ETH_PORT_BASE + n * ETH_PORT_STRIDE + P_STICKY, 0x1F)
+        print("counters cleared")
+
+
+def watch_loop(b, duration, interval, ports, quiet):
+    """Poll the copper link of each PHY; on every change re-trigger the SGMII config
+    word. Also re-trigger when copper is up but the PCS has no SGMII link (missed
+    word), at most once per second per port."""
+    last = {n: None for n in ports}
+    last_fix = {n: 0.0 for n in ports}
+    t_end = None if duration is None else time.monotonic() + duration
+    while t_end is None or time.monotonic() < t_end:
+        now = time.monotonic()
+        for n in ports:
+            try:
+                up = b.copper_link(n)
+            except RuntimeError as e:
+                print(f"P{n}: {e}", flush=True)
+                continue
+            s = b.eth_port(n, P_STATUS)
+            stale = up and not (s & 0x20) and now - last_fix[n] > 1.0
+            if up != last[n] or stale:
+                b.sgmii_retrigger(n)
+                last_fix[n] = now
+                if last[n] is not None or up or not quiet:
+                    why = "stale SGMII status" if (up == last[n]) else f"copper link {'up' if up else 'down'}"
+                    print(f"{time.strftime('%H:%M:%S')} P{n}: {why} -> SGMII re-triggered", flush=True)
+                last[n] = up
+        if t_end is not None and all(last[n] for n in ports) and \
+                all(b.eth_port(n, P_STATUS) & 0x800 for n in ports):
+            return
+        time.sleep(interval)
+
+
+def cmd_watch(b, args):
+    watch_loop(b, None, args.interval, list(range(4)), quiet=True)
+
+
+def parse_int(s):
+    return int(s, 0)
+
+
+def cmd_mdio(b, args):
+    p = args.phy.lower()
+    phy = PHY_ADDR[int(p[1:])] if p.startswith("p") else parse_int(p)
+    reg = parse_int(args.reg)
+    if args.val is None:
+        print(f"0x{b.mdio_rd(phy, reg):04x}")
+    else:
+        b.mdio_wr(phy, reg, parse_int(args.val))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="pktrec-phy", description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("Commands:", 1)[1])
+    ap.add_argument("--devmem", action="store_true", help="use /dev/mem instead of UIO")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("init", help="configure the four DP83867s")
+    p.add_argument("--1000-only", dest="only1000", action="store_true",
+                   help="advertise 1000BASE-T full duplex only (TAP)")
+    p.add_argument("--reset", action="store_true", help="pulse the PHY reset pins first")
+    p.add_argument("--no-sfd", action="store_true", help="leave GPIO_0/1 at their defaults")
+    p.add_argument("--wait", type=float, default=6.0,
+                   help="seconds to watch for link-up after init (default 6, 0 = none)")
+    sub.add_parser("status", help="link status of all ports")
+    p = sub.add_parser("path", help="select the M0 TX source of a port")
+    p.add_argument("port", help="0..3 or all")
+    p.add_argument("mode", choices=sorted(MODES))
+    p = sub.add_parser("counters", help="M0 frame counters")
+    p.add_argument("--clear", action="store_true")
+    p = sub.add_parser("watch", help="re-trigger SGMII on every copper link change")
+    p.add_argument("--interval", type=float, default=0.25)
+    p = sub.add_parser("mdio", help="raw PHY register access")
+    p.add_argument("phy", help="p0..p3 or an MDIO address")
+    p.add_argument("reg")
+    p.add_argument("val", nargs="?")
+    args = ap.parse_args()
+
+    b = Board(args.devmem)
+    try:
+        {"init": cmd_init, "status": cmd_status, "path": cmd_path, "counters": cmd_counters,
+         "watch": cmd_watch, "mdio": cmd_mdio}[args.cmd](b, args)
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError as e:
+        raise SystemExit(f"pktrec-phy: {e}")
+
+
+if __name__ == "__main__":
+    main()

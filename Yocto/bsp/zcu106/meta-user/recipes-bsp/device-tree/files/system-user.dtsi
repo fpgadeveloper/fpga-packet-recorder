@@ -83,3 +83,20 @@
    dmas = <&axi_dma_0 1>, <&axi_dma_0 0>;
    dma-names = "rx", "tx";
 };
+
+/*
+ * Ethernet FMC Max (OP080) port subsystem (block-design hierarchy eth_ports):
+ * expose both register blocks to user space through generic-uio for pktrec-phy
+ * (sw/pktrec-tools, Yocto/meta-pktrec). boot.scr already passes
+ * uio_pdrv_genirq.of_id=generic-uio; meta-pktrec builds the driver in.
+ *   eth_ports_pktrec_eth_ports_0  0x4_2008_0000 512K  MAC/PCS regs, MDIO, GT APB
+ *   eth_ports_pktrec_m0_path_0    0x4_2002_0000   4K  M0 path regs
+ * No interrupts. The labels follow the block-design cell paths.
+ */
+&eth_ports_pktrec_eth_ports_0 {
+   compatible = "generic-uio";
+};
+
+&eth_ports_pktrec_m0_path_0 {
+   compatible = "generic-uio";
+};
