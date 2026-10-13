@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
 #
 # FPGA Packet Recorder apps: pktrec-cap (capture control + recording),
-# pktrec-export (capture file -> pcapng).
+# pktrec-export (capture file -> pcapng), pktrec-replay (capture -> port, M6).
 #
 #   make                         build with the system compiler (+ liburing)
 #   make pktrec-export           only the exporter (no liburing needed: it
@@ -28,7 +28,7 @@ PKTREC_CFLAGS = -Wall -Wextra -std=gnu11 -I. -I$(PKTREC_INCLUDE) -I$(FDREC_APPS)
 LIBURING_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags liburing 2>/dev/null)
 LIBURING_LIBS ?= $(shell $(PKG_CONFIG) --libs liburing 2>/dev/null || echo -luring)
 
-PROGS = pktrec-cap pktrec-export
+PROGS = pktrec-cap pktrec-export pktrec-replay
 HEADERS = pktrec_common.h $(FDREC_APPS)/fdrec_common.h \
 	  $(PKTREC_INCLUDE)/fdrec_uapi.h $(PKTREC_INCLUDE)/pktrec_regs.h $(PKTREC_INCLUDE)/pktrec_format.h
 
@@ -36,6 +36,9 @@ all: $(PROGS)
 
 pktrec-cap: pktrec-cap.c $(HEADERS)
 	$(CC) $(CPPFLAGS) $(PKTREC_CFLAGS) $(CFLAGS) $(LIBURING_CFLAGS) -o $@ $< $(LDFLAGS) $(LIBURING_LIBS)
+
+pktrec-replay: pktrec-replay.c $(HEADERS)
+	$(CC) $(CPPFLAGS) $(PKTREC_CFLAGS) $(CFLAGS) $(LIBURING_CFLAGS) -o $@ $< $(LDFLAGS) $(LIBURING_LIBS) -lm
 
 pktrec-export: pktrec-export.c $(HEADERS)
 	$(CC) $(CPPFLAGS) $(PKTREC_CFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS)
