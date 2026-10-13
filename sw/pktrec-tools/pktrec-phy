@@ -4,7 +4,8 @@
 """pktrec-phy - bring-up tool for the Ethernet FMC Max (OP080) port subsystem of the
 FPGA Packet Recorder: DP83867 PHY configuration over the fabric MDIO master, link
 status, path selection and counters (M0), PHY SFD timestamping and the per-port
-hardware traffic generator / checker (M2).
+hardware traffic generator / checker (M2), TAP mode: per-pair mode, dynamic
+inter-frame gap, link-state propagation and forwarding latency (M3).
 
 Hardware (include/pktrec_regs.h):
   eth_ports/pktrec_eth_ports_0  0x4_2008_0000 (512 KB)  MAC/PCS regs, MDIO master, GT APB
@@ -20,7 +21,19 @@ Commands:
                          configure all four PHYs (see init_phy) and re-trigger the
                          SGMII status word on every copper link that comes up
   status [--json]        per port: PHY link/speed/duplex, SGMII/PCS state, GPIO levels
-  path <port|all> idle|loop|fwd|gen   select the TX source of a port
+  path <port|all> idle|loop|fwd|gen   select the TX source of a port (also keeps
+                         PAIR_MODE consistent: a pair is "tap" when both ports are fwd)
+  mode <pair 0|1> tap|monitor [--force]   per-pair mode: tap = both ports forward to
+                         each other (inline TAP), monitor = both ports receive only.
+                         Refused while a capture runs (capture CTRL.ENABLE) unless --force
+  mode status [--json]   PAIR_MODE, PATH_CTRL and the effective path per pair
+  ifg <port|all> [--enable on|off] [--nom B] [--min B] [--hi B] [--lo B] [--json]
+                         dynamic inter-frame gap of the TAP forward path: settings,
+                         FWD FIFO fill (now / max), reduced-gap time and entries, FLUSH
+  latency (--pair P | --in A --out B) [--count N] [--timeout S] [--window NS] [--json]
+                         TAP forwarding latency per frame, TX SFD(out) - RX SFD(in), from
+                         the SFD log FIFOs while paced traffic flows (one frame in flight,
+                         e.g. ping -s <size> -i 0.01 through the TAP): min/median/max
   counters [--clear] [--json]   M0 frame counters
   sfd status [--json] [--clear]   SFD timestamping: edges, matches, stale, mismatches,
                          MAC->SFD deltas, TX latency, latest timestamps per port
@@ -33,8 +46,18 @@ Commands:
   gen <port> stop | status [--json]
   chk <port> start [--raw] [--etype E] | stop | status [--json]   receive checker
   (--size is the wire size INCLUDING the FCS, like test/gen_seq.py: 64..16387)
-  watch [--interval S]   re-trigger the SGMII status word (CFG2[7] 0->1) whenever a
-                         PHY's copper link changes (DP83867 sends it only once)
+  watch [--interval S] [--no-propagate] [--debounce S] [--grace S] [--json]
+                         re-trigger the SGMII status word (CFG2[7] 0->1) whenever a
+                         PHY's copper link changes (DP83867 sends it only once), and
+                         for pairs in TAP mode propagate link state: when a port's
+                         copper link stays down for --debounce s, power down its
+                         partner PHY (BMCR[11]) so the device on the other side sees
+                         link down too; power it up again (and re-trigger SGMII) when
+                         the port comes back. Ports we powered down never propagate,
+                         and a port just powered up gets --grace s to negotiate before
+                         its link-down counts (no ping-pong). Every action is logged
+                         (--json: one JSON object per line). On exit, or when the
+                         pair leaves TAP mode, every PHY it powered down is powered up.
   mdio <phy> <reg> [val] raw PHY register access (phy: p0..p3 or MDIO address;
                          reg > 0x1f uses the extended REGCR/ADDAR indirection)
 
@@ -70,6 +93,13 @@ M0_ID, M0_VERSION, M0_PATH_CTRL, M0_CNT_CTRL, M0_IO_STATUS, M0_IO_STICKY = (
 M0_PORT_BASE, M0_PORT_STRIDE = 0x100, 0x40
 M0_COUNTERS = ["RX_GOOD", "RX_BAD", "TX_GOOD", "TX_UNDERFLOW", "DROP_LOOP", "DROP_FWD",
                "GPIO0_EDGES", "GPIO1_EDGES"]
+# m0 map 1.2 (M3): pair mode, effective path, dynamic IFG, FWD FIFO fill, FLUSH
+M0_PAIR_MODE, M0_EFF_PATH = 0x018, 0x01C
+(P_IFG_CTRL, P_IFG_THRESH, P_FWD_FILL, P_IFG_STATUS, P_IFG_RED_CYC, P_IFG_RED_ENT,
+ P_FLUSH) = (0x20, 0x24, 0x28, 0x2C, 0x30, 0x38, 0x3C)
+PAIR_MODES = {"monitor": 0, "tap": 1}
+PAIR_MODE_NAMES = {0: "monitor", 1: "tap", 2: "reserved", 3: "reserved"}
+CAP_CTRL, CAP_CTRL_ENABLE = 0x008, 0x1
 M0_ID_VALUE = 0x504B4D30
 MODES = {"idle": 0, "loop": 1, "fwd": 2, "gen": 3}
 MODE_NAMES = {0: "idle", 1: "loop", 2: "fwd", 3: "gen"}
@@ -185,6 +215,44 @@ class Board:
         if self.m0.rd(M0_VERSION) < 0x00010001:
             raise SystemExit("pktrec-phy: this bitstream has no traffic generator (m0 map 1.0)")
 
+    def has_tap(self):
+        """m0 map 1.2 (M3): PAIR_MODE, EFF_PATH, dynamic IFG."""
+        return self.m0.rd(M0_VERSION) >= 0x00010002
+
+    def need_tap(self):
+        if not self.has_tap():
+            raise SystemExit("pktrec-phy: this bitstream has no TAP-mode registers "
+                             f"(m0 map 0x{self.m0.rd(M0_VERSION):08x}, needs 1.2)")
+
+    def capture_running(self):
+        """True while the capture block records (CTRL.ENABLE); None if unknown."""
+        try:
+            c = self._cap if self._cap is not None else Regs(CAP_BASE, CAP_SIZE, self.devmem)
+        except (SystemExit, OSError):
+            return None
+        if c.rd(0) != CAP_ID_VALUE:
+            return None
+        return bool(c.rd(CAP_CTRL) & CAP_CTRL_ENABLE)
+
+    def write_path(self, m):
+        """PATH_CTRL = m, and PAIR_MODE derived from it (pair = tap iff both ports fwd)."""
+        self.m0.wr(M0_PATH_CTRL, m & 0xFF)
+        if self.has_tap():
+            pm = 0
+            for p in range(2):
+                if all(((m >> (2 * n)) & 3) == MODES["fwd"] for n in (2 * p, 2 * p + 1)):
+                    pm |= PAIR_MODES["tap"] << (2 * p)
+            self.m0.wr(M0_PAIR_MODE, pm)
+
+    def pair_modes(self):
+        """Mode name of pair 0 and 1 (PAIR_MODE on 1.2, else derived from PATH_CTRL)."""
+        if self.has_tap():
+            pm = self.m0.rd(M0_PAIR_MODE)
+            return [PAIR_MODE_NAMES[(pm >> (2 * p)) & 3] for p in range(2)]
+        m = self.m0.rd(M0_PATH_CTRL)
+        return ["tap" if all(((m >> (2 * n)) & 3) == MODES["fwd"] for n in (2 * p, 2 * p + 1))
+                else "monitor" for p in range(2)]
+
     @staticmethod
     def rd64(regs, off):
         lo = regs.rd(off)                     # the LO read latches HI
@@ -267,6 +335,13 @@ class Board:
 
     def copper_link(self, n):
         return bool(self.mdio_rd(PHY_ADDR[n], PHYSTS) & 0x0400)
+
+    def phy_power(self, n, up):
+        """BMCR[11] power-down off (up=True) / on. Registers are kept."""
+        self.mdio_rmw(PHY_ADDR[n], BMCR, 0x0800 if up else 0, 0 if up else 0x0800)
+
+    def phy_powered_down(self, n):
+        return bool(self.mdio_rd(PHY_ADDR[n], BMCR) & 0x0800)
 
     def sgmii_retrigger(self, n):
         """Make the DP83867 send a fresh SGMII config word (CFG2[7] 0 -> 1)."""
@@ -363,6 +438,8 @@ def status_doc(b):
             "lp_adv": b.eth_port(n, P_LP_ADV), "link_up": (s >> 11) & 1,
             "gpio0": (io >> n) & 1, "gpio1": (io >> (4 + n)) & 1,
             "path": MODE_NAMES[(mode >> (2 * n)) & 3]})
+    doc["pairs"] = [{"pair": p, "ports": [2 * p, 2 * p + 1], "mode": m}
+                    for p, m in enumerate(b.pair_modes())]
     return doc
 
 
@@ -389,6 +466,8 @@ def cmd_status(b, args):
                f"lp_link={c['lp_link']} {c['speed']} {'FD' if c['full_duplex'] else 'HD'}")
         print(f"P{p['port']}   0x{p['phy_addr']:02x} {copper:<17} {pcs:<33} 0x{p['lp_adv']:04x}  "
               f"{p['link_up']}       {p['gpio0']}     {p['gpio1']}     {p['path']}")
+    print("pair modes: " + ", ".join(f"pair {q['pair']} (P{q['ports'][0]}/P{q['ports'][1]}) {q['mode']}"
+                                     for q in doc["pairs"]))
 
 
 def cmd_path(b, args):
@@ -398,7 +477,7 @@ def cmd_path(b, args):
         if not 0 <= n <= 3:
             raise SystemExit("port must be 0..3 or all")
         m = (m & ~(3 << (2 * n))) | (MODES[args.mode] << (2 * n))
-    b.m0.wr(M0_PATH_CTRL, m)
+    b.write_path(m)
     print("PATH_CTRL = 0x%02x (%s)" % (m, ", ".join(
         f"P{n}={MODE_NAMES[(m >> (2 * n)) & 3]}" for n in range(4))))
 
@@ -423,21 +502,117 @@ def cmd_counters(b, args):
             print("counters cleared")
 
 
-def watch_loop(b, duration, interval, ports, quiet):
+class EventLog:
+    """Timestamped action log for 'watch' (text, or one JSON object per line)."""
+
+    def __init__(self, as_json=False):
+        self.as_json = as_json
+
+    def __call__(self, port, event, msg, **kw):
+        if self.as_json:
+            print(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "port": port,
+                              "event": event, "msg": msg} | kw), flush=True)
+        else:
+            print(f"{time.strftime('%H:%M:%S')} " + (f"P{port}: " if port is not None else "")
+                  + msg, flush=True)
+
+
+class Propagator:
+    """Link-state propagation for pairs in TAP mode (watch).
+
+    A port whose copper link has been down for `debounce` s makes us power down its
+    partner PHY (BMCR[11]) so the device on the partner's side sees link down, as on
+    a direct cable; when the port's link has been up again for `debounce` s, the
+    partner is powered up (and SGMII re-triggered). Guards against ping-pong:
+      - a port WE powered down never propagates (its link-down is our doing);
+      - a port we just powered up gets `grace` s (copper auto-negotiation takes
+        ~3 s) before its own link-down counts;
+      - at start every port gets `grace` s too.
+    If someone else powers a PHY back up (pktrec-phy init, mdio), we notice and
+    forget it. When a pair leaves TAP mode, or watch exits, every PHY powered down
+    here is powered up again."""
+
+    def __init__(self, b, log, debounce=0.5, grace=6.0):
+        self.b, self.log, self.debounce, self.grace = b, log, debounce, grace
+        now = time.monotonic()
+        self.pd = [False] * 4               # powered down by us
+        self.state = [None] * 4             # last copper link state
+        self.t_change = [now] * 4
+        self.grace_until = [now + grace] * 4
+        # a PHY left powered down by a previous watch (crash/restart) in a TAP pair
+        tap = self.b.pair_modes()
+        for n in range(4):
+            if tap[n // 2] == "tap" and self.b.phy_powered_down(n):
+                self.b.phy_power(n, True)
+                self.log(n, "power_up", "PHY was powered down at start (previous watch?) "
+                         "-> powered up", reason="startup")
+
+    def power(self, n, up, now, reason):
+        self.b.phy_power(n, up)
+        self.pd[n] = not up
+        if up:
+            self.grace_until[n] = now + self.grace
+            self.b.sgmii_retrigger(n)
+        self.log(n, "power_up" if up else "power_down",
+                 f"PHY powered {'UP (+SGMII re-trigger)' if up else 'DOWN'} ({reason})",
+                 reason=reason)
+
+    def release_all(self, reason):
+        now = time.monotonic()
+        for n in range(4):
+            if self.pd[n]:
+                self.power(n, True, now, reason)
+
+    def step(self, now, links):
+        for n in range(4):
+            if links.get(n) is None:
+                continue
+            if links[n] != self.state[n]:
+                self.state[n] = links[n]
+                self.t_change[n] = now
+        tap = self.b.pair_modes()
+        for pair in range(2):
+            a, c = 2 * pair, 2 * pair + 1
+            if tap[pair] != "tap":
+                for x in (a, c):
+                    if self.pd[x]:
+                        self.power(x, True, now, f"pair {pair} left TAP mode")
+                continue
+            for x in (a, c):                    # externally powered up again?
+                if self.pd[x] and not self.b.phy_powered_down(x):
+                    self.pd[x] = False
+                    self.grace_until[x] = now + self.grace
+                    self.log(x, "external_power_up", "PHY was powered up by someone else; "
+                             "no longer held down")
+            for x, y in ((a, c), (c, a)):
+                if self.state[x] is None or now - self.t_change[x] < self.debounce:
+                    continue
+                if self.state[x] is False and not self.pd[x] and not self.pd[y] \
+                        and now >= self.grace_until[x]:
+                    self.power(y, False, now, f"P{x} link down")
+                elif self.state[x] is True and self.pd[y]:
+                    self.power(y, True, now, f"P{x} link up")
+
+
+def watch_loop(b, duration, interval, ports, quiet, prop=None, log=None):
     """Poll the copper link of each PHY; on every change re-trigger the SGMII config
     word. Also re-trigger when copper is up but the PCS has no SGMII link (missed
-    word), at most once per second per port."""
+    word), at most once per second per port. With a Propagator, propagate link
+    state across TAP pairs (see Propagator)."""
+    log = log or EventLog()
     last = {n: None for n in ports}
     last_fix = {n: 0.0 for n in ports}
     t_end = None if duration is None else time.monotonic() + duration
     while t_end is None or time.monotonic() < t_end:
         now = time.monotonic()
+        links = {}
         for n in ports:
             try:
                 up = b.copper_link(n)
             except RuntimeError as e:
-                print(f"P{n}: {e}", flush=True)
+                log(n, "mdio_error", str(e))
                 continue
+            links[n] = up
             s = b.eth_port(n, P_STATUS)
             stale = up and not (s & 0x20) and now - last_fix[n] > 1.0
             if up != last[n] or stale:
@@ -445,8 +620,14 @@ def watch_loop(b, duration, interval, ports, quiet):
                 last_fix[n] = now
                 if last[n] is not None or up or not quiet:
                     why = "stale SGMII status" if (up == last[n]) else f"copper link {'up' if up else 'down'}"
-                    print(f"{time.strftime('%H:%M:%S')} P{n}: {why} -> SGMII re-triggered", flush=True)
+                    log(n, "sgmii_retrigger", f"{why} -> SGMII re-triggered",
+                        link=up, stale=bool(stale and up == last[n]))
                 last[n] = up
+        if prop is not None:
+            try:
+                prop.step(now, links)
+            except RuntimeError as e:
+                log(None, "mdio_error", f"propagation: {e}")
         if t_end is not None and all(last[n] for n in ports) and \
                 all(b.eth_port(n, P_STATUS) & 0x800 for n in ports):
             return
@@ -454,7 +635,230 @@ def watch_loop(b, duration, interval, ports, quiet):
 
 
 def cmd_watch(b, args):
-    watch_loop(b, None, args.interval, list(range(4)), quiet=True)
+    import signal
+    log = EventLog(args.json)
+    prop = None
+    if not args.no_propagate:
+        prop = Propagator(b, log, args.debounce, args.grace)
+    log(None, "start", f"watch: SGMII re-trigger on link changes, link-state propagation "
+        f"{'OFF' if prop is None else f'ON (debounce {args.debounce} s, grace {args.grace} s)'}"
+        f"; pair modes {', '.join(b.pair_modes())}")
+    # systemd stops the service with SIGTERM: leave no PHY powered down
+    signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        watch_loop(b, None, args.interval, list(range(4)), quiet=True, prop=prop, log=log)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if prop is not None:
+            prop.release_all("watch exiting")
+        log(None, "stop", "watch stopped")
+
+
+# ---------------------------------------------------------------------------
+# TAP mode (m0 map 1.2): per-pair mode, dynamic IFG
+# ---------------------------------------------------------------------------
+def mode_doc(b):
+    m = b.m0.rd(M0_PATH_CTRL)
+    eff = b.m0.rd(M0_EFF_PATH) if b.has_tap() else None
+    pairs = []
+    for p, mode in enumerate(b.pair_modes()):
+        ports = [2 * p, 2 * p + 1]
+        path = [MODE_NAMES[(m >> (2 * n)) & 3] for n in ports]
+        want = {"tap": "fwd", "monitor": "idle"}.get(mode)
+        pairs.append({"pair": p, "ports": ports, "mode": mode, "path": path,
+                      "eff_path": None if eff is None else [MODE_NAMES[(eff >> (2 * n)) & 3]
+                                                           for n in ports],
+                      "consistent": all(x == want for x in path)})
+    return {"pair_mode_reg": b.m0.rd(M0_PAIR_MODE) if b.has_tap() else None,
+            "path_ctrl": m, "capture_running": b.capture_running(), "pairs": pairs}
+
+
+def print_mode(doc):
+    for q in doc["pairs"]:
+        note = "" if q["consistent"] else "  (ports not both " + \
+            ("fwd" if q["mode"] == "tap" else "idle") + ": loop/gen/mixed)"
+        eff = "" if q["eff_path"] is None or q["eff_path"] == q["path"] else \
+            f"  effective now {'/'.join(q['eff_path'])}"
+        print(f"pair {q['pair']} (P{q['ports'][0]}/P{q['ports'][1]}): {q['mode']:<8} "
+              f"path {'/'.join(q['path'])}{eff}{note}")
+
+
+def cmd_mode(b, args):
+    if args.what == "status":
+        doc = mode_doc(b)
+        print(json.dumps(doc, indent=1)) if args.json else print_mode(doc)
+        return
+    try:
+        pair = int(args.what)
+        assert pair in (0, 1)
+    except (ValueError, AssertionError):
+        raise SystemExit("pktrec-phy: mode <pair 0|1> tap|monitor  or  mode status")
+    if args.mode not in PAIR_MODES:
+        raise SystemExit("pktrec-phy: mode <pair 0|1> tap|monitor")
+    run = b.capture_running()
+    if run and not args.force:
+        raise SystemExit("pktrec-phy: a capture is running (capture CTRL.ENABLE = 1); stop it "
+                         "first or use --force (frames in flight at the switch are flushed "
+                         "and counted in FLUSH)")
+    if run is None:
+        print("note: capture state unknown (capture block not mapped)")
+    if not b.has_tap():
+        print("note: no PAIR_MODE register in this bitstream (m0 map < 1.2): only PATH_CTRL is set")
+    path = MODES["fwd" if args.mode == "tap" else "idle"]
+    m = b.m0.rd(M0_PATH_CTRL) & 0xFF
+    for n in (2 * pair, 2 * pair + 1):
+        m = (m & ~(3 << (2 * n))) | (path << (2 * n))
+    b.write_path(m)
+    if b.has_tap():                            # TX side switches at the next frame boundary
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 0.2 and \
+                (b.m0.rd(M0_EFF_PATH) >> (4 * pair)) & 0xF != (m >> (4 * pair)) & 0xF:
+            time.sleep(0.005)
+    if args.mode == "tap":
+        # both sides must negotiate the same speed: the FIFO cannot bridge 1G <-> 100M
+        sp = []
+        for n in (2 * pair, 2 * pair + 1):
+            s = b.eth_port(n, P_STATUS)
+            sp.append(speed_str((s >> 6) & 3) if s & 0x800 else None)
+        if sp[0] and sp[1] and sp[0] != sp[1]:
+            print(f"WARNING: P{2 * pair} links at {sp[0]}, P{2 * pair + 1} at {sp[1]}: a TAP needs "
+                  "the same speed on both sides (pktrec-phy init --1000-only)")
+    print_mode(mode_doc(b))
+
+
+def ifg_doc(b, n):
+    m = b.m0
+    base = M0_PORT_BASE + n * M0_PORT_STRIDE
+    ctrl, thr, fill, st = (m.rd(base + P_IFG_CTRL), m.rd(base + P_IFG_THRESH),
+                           m.rd(base + P_FWD_FILL), m.rd(base + P_IFG_STATUS))
+    cyc = Board.rd64(m, base + P_IFG_RED_CYC)
+    return {"port": n, "dyn_en": ctrl & 1, "ifg_nom": (ctrl >> 8) & 0xFF,
+            "ifg_min": (ctrl >> 16) & 0xFF, "ifg_hi": thr & 0xFFFF, "ifg_lo": thr >> 16,
+            "fwd_fill": fill & 0xFFFF, "fwd_fill_max": fill >> 16,
+            "reduced": st & 1, "ifg_now": (st >> 8) & 0xFF,
+            "reduced_cycles": cyc, "reduced_s": cyc * 16e-9,
+            "reduced_entries": m.rd(base + P_IFG_RED_ENT), "flush": m.rd(base + P_FLUSH),
+            "drop_fwd": m.rd(base + 0x14)}
+
+
+def cmd_ifg(b, args):
+    b.need_tap()
+    ports = range(4) if args.port == "all" else [int(args.port.lstrip("pP"))]
+    for n in ports:
+        if not 0 <= n <= 3:
+            raise SystemExit("port must be 0..3 or all")
+        base = M0_PORT_BASE + n * M0_PORT_STRIDE
+        ctrl, thr = b.m0.rd(base + P_IFG_CTRL), b.m0.rd(base + P_IFG_THRESH)
+        if args.enable is not None:
+            ctrl = (ctrl & ~1) | (args.enable == "on")
+        for val, sh, what in ((args.nom, 8, "--nom"), (args.min, 16, "--min")):
+            if val is not None:
+                if not 2 <= val <= 255:
+                    raise SystemExit(f"pktrec-phy: {what} must be 2..255 bytes")
+                ctrl = (ctrl & ~(0xFF << sh)) | (val << sh)
+        if args.hi is not None:
+            thr = (thr & 0xFFFF0000) | (args.hi & 0xFFFF)
+        if args.lo is not None:
+            thr = (thr & 0xFFFF) | ((args.lo & 0xFFFF) << 16)
+        if (thr >> 16) >= (thr & 0xFFFF):
+            raise SystemExit("pktrec-phy: IFG_LO must be below IFG_HI")
+        b.m0.wr(base + P_IFG_CTRL, ctrl)
+        b.m0.wr(base + P_IFG_THRESH, thr)
+    docs = [ifg_doc(b, n) for n in ports]
+    if args.json:
+        print(json.dumps({"ports": docs}, indent=1))
+        return
+    for d in docs:
+        print(f"P{d['port']} TX: dynamic IFG {'on' if d['dyn_en'] else 'OFF'} "
+              f"({d['ifg_nom']} B -> {d['ifg_min']} B above {d['ifg_hi']} B until below "
+              f"{d['ifg_lo']} B FWD fill) | now {'REDUCED' if d['reduced'] else 'normal'} "
+              f"gap {d['ifg_now']} B, FWD fill {d['fwd_fill']} B (max {d['fwd_fill_max']} of "
+              f"16384) | reduced {d['reduced_s']:.6f} s in {d['reduced_entries']} episodes | "
+              f"DROP_FWD {d['drop_fwd']} FLUSH {d['flush']}")
+
+
+# ---------------------------------------------------------------------------
+# TAP forwarding latency (SFD log FIFOs of the capture block)
+# ---------------------------------------------------------------------------
+def cmd_latency(b, args):
+    c = b.cap
+    if args.pair is not None:
+        dirs = [(2 * args.pair + 1, 2 * args.pair), (2 * args.pair, 2 * args.pair + 1)]
+    elif args.inp is not None and args.out is not None:
+        dirs = [(args.inp, args.out)]
+    else:
+        raise SystemExit("pktrec-phy: latency needs --pair P or --in A --out B")
+    ctrl0 = c.rd(SFD_CTRL) & 0x3
+    c.wr(SFD_CTRL, ctrl0 | 0x2)                 # LOG_EN
+
+    def pop(port, d):
+        base = SFD_PORT_BASE + port * SFD_PORT_STRIDE
+        st, ts = (SFD_RX_LOG_STATUS, SFD_RX_LOG_TS) if d == "rx" else (SFD_TX_LOG_STATUS, SFD_TX_LOG_TS)
+        out = []
+        while c.rd(base + st) & 0x1F:
+            out.append(Board.rd64(c, base + ts))
+        return out
+
+    ins = sorted({i for i, _ in dirs})
+    outs = sorted({o for _, o in dirs})
+    for p in ins:
+        pop(p, "rx")
+    for p in outs:
+        pop(p, "tx")
+    ovf0 = {p: c.rd(SFD_PORT_BASE + p * SFD_PORT_STRIDE + SFD_RX_LOG_STATUS) >> 16 for p in ins}
+    pend = {d: [] for d in dirs}
+    lat = {d: [] for d in dirs}
+    unmatched = {d: 0 for d in dirs}
+    t_end = time.monotonic() + args.timeout
+    try:
+        while time.monotonic() < t_end and any(len(lat[d]) < args.count for d in dirs):
+            rx = {p: pop(p, "rx") for p in ins}
+            tx = {p: pop(p, "tx") for p in outs}
+            for d in dirs:
+                i, o = d
+                pend[d].extend(rx[i])
+                for t in tx[o]:
+                    # the earliest pending RX frame that left on `o` within the window
+                    while pend[d] and t - pend[d][0] > args.window:
+                        pend[d].pop(0)
+                        unmatched[d] += 1
+                    if pend[d] and 0 < t - pend[d][0] <= args.window:
+                        lat[d].append(t - pend[d].pop(0))
+            time.sleep(0.005)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        c.wr(SFD_CTRL, ctrl0)                   # LOG_EN back as it was
+    res = []
+    for (i, o) in dirs:
+        v = sorted(lat[(i, o)])
+        r = {"in": i, "out": o, "samples": len(v), "unmatched_rx": unmatched[(i, o)],
+             "rx_offset_ns": s32(c.rd(SFD_PORT_BASE + i * SFD_PORT_STRIDE + 0x38)),
+             "tx_offset_ns": s32(c.rd(SFD_PORT_BASE + o * SFD_PORT_STRIDE + 0xB8)),
+             "rx_log_overflows": (c.rd(SFD_PORT_BASE + i * SFD_PORT_STRIDE + SFD_RX_LOG_STATUS) >> 16)
+             - ovf0[i]}
+        if v:
+            med = v[len(v) // 2]
+            inl = [x for x in v if abs(x - med) <= args.cluster]
+            r.update(min_ns=v[0], median_ns=med, max_ns=v[-1], cluster_ns=args.cluster,
+                     cluster_samples=len(inl), cluster_min_ns=inl[0], cluster_max_ns=inl[-1])
+        res.append(r)
+    if args.json:
+        print(json.dumps({"label": args.label, "window_ns": args.window, "directions": res},
+                         indent=1))
+        return
+    for r in res:
+        if not r["samples"]:
+            print(f"P{r['in']} -> P{r['out']}: no samples (traffic? 'pktrec-phy mode' tap? "
+                  "SFD enabled by init?)")
+            continue
+        print(f"P{r['in']} -> P{r['out']}{' ' + args.label if args.label else ''}: "
+              f"{r['samples']} frames, latency min {r['min_ns']} / median {r['median_ns']} / "
+              f"max {r['max_ns']} ns; main cluster (median +-{r['cluster_ns']} ns): "
+              f"{r['cluster_samples']} frames {r['cluster_min_ns']}..{r['cluster_max_ns']} ns "
+              f"(TX SFD - RX SFD incl. RX_OFFSET {r['rx_offset_ns']} / TX_OFFSET "
+              f"{r['tx_offset_ns']} ns; {r['unmatched_rx']} RX without TX in the window)")
 
 
 def parse_int(s):
@@ -610,7 +1014,7 @@ def gen_doc(b, n):
     length = m.rd(g + G_LEN)
     return {"port": n, "path": MODE_NAMES[(m.rd(M0_PATH_CTRL) >> (2 * n)) & 3],
             "gen": {"enable": ctrl & 1, "format": "raw" if ctrl & 2 else "prsq",
-                    "rand_len": (ctrl >> 2) & 1, "running": st & 1, "done": (st >> 1) & 1,
+                    "rand_len": (ctrl >> 2) & 1, "bad": (ctrl >> 3) & 1, "running": st & 1, "done": (st >> 1) & 1,
                     "len": length, "size_with_fcs": length + 4,
                     "len_mask": m.rd(g + G_LEN_MASK), "ifg": m.rd(g + G_IFG),
                     "count": m.rd(g + G_COUNT),
@@ -630,7 +1034,8 @@ def print_gen(doc, what):
         gd = doc["gen"]
         print(f"P{doc['port']} gen: path={doc['path']} {'RUNNING' if gd['running'] else 'stopped'}"
               f"{' (done)' if gd['done'] else ''} format={gd['format']} size={gd['size_with_fcs']}"
-              f"{' +rand&0x%x' % gd['len_mask'] if gd['rand_len'] else ''} ifg={gd['ifg']} "
+              f"{' +rand&0x%x' % gd['len_mask'] if gd['rand_len'] else ''}"
+              f"{' BAD' if gd['bad'] else ''} ifg={gd['ifg']} "
               f"count={gd['count'] or 'endless'} dst={gd['dst']} src={gd['src']} "
               f"{'etype=0x%04x' % gd['etype'] if gd['format'] == 'raw' else 'stream=%d' % gd['stream']} "
               f"seq_first={gd['seq_first']} | sent {gd['frames']} frames {gd['bytes']} bytes")
@@ -667,9 +1072,12 @@ def cmd_gen(b, args):
         m.wr(g + G_SEQ_FIRST, args.seq_first)
         if not args.no_select:
             mode = m.rd(M0_PATH_CTRL) & 0xFF
-            m.wr(M0_PATH_CTRL, (mode & ~(3 << (2 * n))) | (3 << (2 * n)))
+            b.write_path((mode & ~(3 << (2 * n))) | (3 << (2 * n)))
         time.sleep(0.001)                      # config settles in tx_clk before ENABLE
-        m.wr(g + G_CTRL, 1 | (2 if args.raw else 0) | (4 if args.rand_mask else 0))
+        if args.bad:
+            b.need_tap()
+        m.wr(g + G_CTRL, 1 | (2 if args.raw else 0) | (4 if args.rand_mask else 0) |
+             (8 if args.bad else 0))
         print_gen(gen_doc(b, n), "gen")
     elif args.gen_cmd == "stop":
         m.wr(g + G_CTRL, m.rd(g + G_CTRL) & ~1)
@@ -755,6 +1163,8 @@ def main():
     q.add_argument("--seq-first", type=parse_int, default=0)
     q.add_argument("--rand-mask", type=parse_int, help="random extra length: size + (LFSR & mask)")
     q.add_argument("--no-select", action="store_true", help="do not set PATH_CTRL to gen")
+    q.add_argument("--bad", action="store_true",
+                   help="send every frame error-terminated (bad-frame forwarding test, m0 map 1.2)")
     gs.add_parser("stop")
     q = gs.add_parser("status")
     q.add_argument("--json", action="store_true")
@@ -767,8 +1177,41 @@ def main():
     cs.add_parser("stop")
     q = cs.add_parser("status")
     q.add_argument("--json", action="store_true")
-    p = sub.add_parser("watch", help="re-trigger SGMII on every copper link change")
+    p = sub.add_parser("watch", help="re-trigger SGMII on link changes; TAP link propagation")
     p.add_argument("--interval", type=float, default=0.25)
+    p.add_argument("--no-propagate", action="store_true",
+                   help="do not propagate link state across TAP pairs")
+    p.add_argument("--debounce", type=float, default=0.5,
+                   help="s a link change must persist before it is propagated (0.5)")
+    p.add_argument("--grace", type=float, default=6.0,
+                   help="s a freshly powered-up PHY gets to negotiate before its link-down "
+                        "counts (6)")
+    p.add_argument("--json", action="store_true", help="log one JSON object per line")
+    p = sub.add_parser("mode", help="per-pair TAP / monitor mode (M3)")
+    p.add_argument("what", help="pair 0|1, or status")
+    p.add_argument("mode", nargs="?", choices=sorted(PAIR_MODES))
+    p.add_argument("--force", action="store_true", help="switch even while a capture runs")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("ifg", help="dynamic inter-frame gap of the TAP forward path (M3)")
+    p.add_argument("port", help="0..3 or all")
+    p.add_argument("--enable", choices=["on", "off"])
+    p.add_argument("--nom", type=int, help="normal gap, bytes (12)")
+    p.add_argument("--min", type=int, help="reduced gap, bytes (8)")
+    p.add_argument("--hi", type=int, help="FWD fill (bytes) that starts the reduced gap (3072)")
+    p.add_argument("--lo", type=int, help="FWD fill (bytes) that ends it (2048; > largest frame)")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("latency", help="TAP forwarding latency from the SFD logs (M3)")
+    p.add_argument("--pair", type=int, choices=[0, 1], help="both directions of a pair")
+    p.add_argument("--in", dest="inp", type=port_t, help="receiving port")
+    p.add_argument("--out", type=port_t, help="forwarding port")
+    p.add_argument("--count", type=int, default=200, help="samples per direction (200)")
+    p.add_argument("--timeout", type=float, default=30.0, help="s (30)")
+    p.add_argument("--window", type=int, default=30000,
+                   help="max TX-RX ns for a match (30000; keep frames >= 2x apart)")
+    p.add_argument("--cluster", type=int, default=500,
+                   help="ns around the median that count as the main cluster (500)")
+    p.add_argument("--label", default="", help="free text in the output (e.g. the frame size)")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("mdio", help="raw PHY register access")
     p.add_argument("phy", help="p0..p3 or an MDIO address")
     p.add_argument("reg")
@@ -779,7 +1222,8 @@ def main():
     try:
         {"init": cmd_init, "status": cmd_status, "path": cmd_path, "counters": cmd_counters,
          "watch": cmd_watch, "mdio": cmd_mdio, "sfd": cmd_sfd, "gen": cmd_gen,
-         "chk": cmd_chk}[args.cmd](b, args)
+         "chk": cmd_chk, "mode": cmd_mode, "ifg": cmd_ifg,
+         "latency": cmd_latency}[args.cmd](b, args)
     except KeyboardInterrupt:
         pass
     except RuntimeError as e:
