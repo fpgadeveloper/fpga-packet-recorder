@@ -33,6 +33,11 @@
 # XPM macros (eg. xpm_fifo_async) used by the RTL are taken from the
 # precompiled "xpm" library that ships with Vivado (-L xpm).
 #
+# Taxi (submodules/taxi): the library modules the simulated RTL instantiates
+# (taxi_sim_srcs below) are compiled too. The 4-port MAC/PCS/GT shell
+# (pktrec_eth_ports*.v/.sv) is skipped: it needs the GT wizard IP and the full
+# Taxi MAC, and is verified by implementation and on hardware instead.
+#
 #*****************************************************************************************
 
 set script_dir [file dirname [file normalize [info script]]]
@@ -40,6 +45,21 @@ set vivado_dir [file dirname $script_dir]
 set hdl_dir    [file join $vivado_dir src hdl]
 set sim_dir    [file join $vivado_dir src sim]
 set work_root  [file join $vivado_dir sim]
+set taxi_dir   [file normalize [file join $vivado_dir .. submodules taxi]]
+
+# Taxi library sources needed by the simulated RTL (pktrec_axis_async_fifo,
+# pktrec_m0_path)
+set taxi_sim_srcs {}
+foreach rel {
+  src/axis/rtl/taxi_axis_if.sv
+  src/axis/rtl/taxi_axis_async_fifo.sv
+  src/sync/rtl/taxi_sync_reset.sv
+  src/sync/rtl/taxi_sync_signal.sv
+} {
+  lappend taxi_sim_srcs [file join $taxi_dir $rel]
+}
+# RTL files not simulated here (see above)
+set sim_exclude {pktrec_eth_ports.v pktrec_eth_ports_core.sv}
 
 # Locate a Vivado simulator tool: prefer $XILINX_VIVADO/bin, else the PATH
 proc find_tool {name} {
@@ -79,7 +99,7 @@ proc run_step {dir log args} {
 }
 
 proc run_tb {tb_file} {
-  global hdl_dir work_root
+  global hdl_dir work_root taxi_dir taxi_sim_srcs sim_exclude
   set tb [file rootname [file tail $tb_file]]
   set work [file join $work_root $tb]
   file delete -force $work
@@ -91,7 +111,17 @@ proc run_tb {tb_file} {
 
   set rtl [lsort [concat [glob -nocomplain -directory $hdl_dir *.v] \
                          [glob -nocomplain -directory $hdl_dir *.sv]]]
-  set srcs [concat $rtl [list $tb_file]]
+  set rtl_sim {}
+  foreach f $rtl {
+    if {[lsearch -exact $sim_exclude [file tail $f]] < 0} { lappend rtl_sim $f }
+  }
+  foreach f $taxi_sim_srcs {
+    if {![file exists $f]} {
+      puts "ERROR: $f not found (git submodule update --init submodules/taxi)"
+      return 0
+    }
+  }
+  set srcs [concat $taxi_sim_srcs $rtl_sim [list $tb_file]]
   set glbl [file join [file dirname [file dirname $xvlog]] data verilog src glbl.v]
   if {[file exists $glbl]} { lappend srcs $glbl }
 
