@@ -8,9 +8,11 @@
  *   PKTREC_ETH_*  pktrec_eth_ports (Vivado/src/hdl/pktrec_eth_ports_core.sv):
  *                 4-port 1G SGMII MAC/PCS (Taxi), MDIO master, PHY resets, GT APB
  *                 PS address 0x4_2008_0000, 512 KB
- *   PKTREC_M0_*   pktrec_m0_path (Vivado/src/hdl/pktrec_m0_regs.v): M0 bring-up
- *                 datapath (per-port idle / loopback / forward), frame counters,
- *                 PHY GPIO_0/1 and power-good inputs
+ *   PKTREC_M0_*   pktrec_m0_path (Vivado/src/hdl/pktrec_m0_regs.v): port datapath
+ *                 (per-port idle / loopback / forward = TAP / generator), frame
+ *                 counters, TAP pair mode and dynamic IFG (map 1.2, M3), PHY
+ *                 GPIO_0/1 and power-good inputs. ("m0" is historical: the block
+ *                 started as the M0 bring-up path.)
  *                 PS address 0x4_2002_0000, 4 KB
  *   PKTREC_CAP_*  pktrec_capture (Vivado/src/hdl/pktrec_cap_regs.sv; hierarchy
  *                 capture): capture control, per-port capture counters, record
@@ -122,8 +124,11 @@
 /* ------------------------------------------------------------------------- */
 #define PKTREC_M0_ID               0x000   /* RO 0x504B4D30 "PKM0" */
 #define PKTREC_M0_ID_VALUE         0x504B4D30
-#define PKTREC_M0_VERSION          0x004   /* RO 0x00010001 (1.1: traffic generator + checker) */
+#define PKTREC_M0_VERSION          0x004   /* RO 0x00010002 (1.1: traffic generator + checker;
+                                              1.2: TAP mode - PAIR_MODE, EFF_PATH, dynamic
+                                              IFG, FWD FIFO 16 KB + fill, FLUSH, GEN BAD) */
 #define PKTREC_M0_VERSION_1_1      0x00010001
+#define PKTREC_M0_VERSION_1_2      0x00010002
 #define PKTREC_M0_PATH_CTRL        0x008   /* RW [2n+1:2n] TX source of port n (reset 0) */
 #define   PKTREC_M0_PATH_IDLE            0u          /* nothing is sent */
 #define   PKTREC_M0_PATH_LOOP            1u          /* own RX (RX n -> TX n) */
@@ -134,6 +139,16 @@
 #define PKTREC_M0_IO_STATUS        0x010   /* RO [3:0] GPIO_0 P0..P3, [7:4] GPIO_1 P0..P3,
                                               [8] PG_1V0, [9] PG_2V5, [19:16] link_up */
 #define PKTREC_M0_IO_STICKY        0x014   /* W1C [3:0] GPIO_0 rose, [7:4] GPIO_1 rose */
+#define PKTREC_M0_PAIR_MODE        0x018   /* RW (1.2) [2p+1:2p] mode of pair p (P0/P1 = 0,
+                                              P2/P3 = 1). Informational: written by
+                                              pktrec-phy together with PATH_CTRL, read
+                                              by pktrec-cap into the file header. Reset 0 */
+#define   PKTREC_M0_PAIR_MONITOR         0u          /* both ports IDLE (receive only) */
+#define   PKTREC_M0_PAIR_TAP             1u          /* both ports FWD (inline TAP) */
+#define   PKTREC_M0_PAIR_SHIFT(p)        (2 * (p))
+#define PKTREC_M0_EFF_PATH         0x01C   /* RO (1.2) [2n+1:2n] TX source port n uses now
+                                              (PATH_CTRL coding; follows PATH_CTRL at the
+                                              next frame boundary) */
 
 /* pktrec_m0_path: per-port 32-bit counters (wrap) at PKTREC_M0_PORT(n) + offset */
 #define PKTREC_M0_PORT(n)          (0x100 + (n) * 0x40)
@@ -145,6 +160,26 @@
 #define PKTREC_M0_P_DROP_FWD       0x14    /* frames for TX n dropped by the FWD FIFO */
 #define PKTREC_M0_P_GPIO0_EDGES    0x18    /* rising edges of GPIO_0 (RX SFD) */
 #define PKTREC_M0_P_GPIO1_EDGES    0x1C    /* rising edges of GPIO_1 (TX SFD) */
+/* TAP forwarding / dynamic inter-frame gap of TX port n (map 1.2, M3). The TX
+ * MAC's inter-frame gap is IFG_NOM, or IFG_MIN while the reduced gap is active:
+ * it starts when the FWD FIFO fill (bytes, counting the frame being received)
+ * exceeds IFG_HI and ends when it falls below IFG_LO. Keep IFG_LO above the
+ * largest frame. The shell's TX_IFG register is not used (EXT_TX_IFG = 1). */
+#define PKTREC_M0_P_IFG_CTRL       0x20    /* RW [0] DYN_EN (1), [15:8] IFG_NOM (12),
+                                              [23:16] IFG_MIN (8), bytes */
+#define   PKTREC_M0_IFG_DYN_EN           (1u << 0)
+#define   PKTREC_M0_IFG_NOM_SHIFT        8
+#define   PKTREC_M0_IFG_MIN_SHIFT        16
+#define PKTREC_M0_P_IFG_THRESH     0x24    /* RW [15:0] IFG_HI (3072), [31:16] IFG_LO (2048) */
+#define PKTREC_M0_P_FWD_FILL       0x28    /* RO [15:0] FWD FIFO fill now, [31:16] max since
+                                              CNT_CTRL clear (bytes; FIFO = 16384) */
+#define PKTREC_M0_P_IFG_STATUS     0x2C    /* RO [0] reduced gap active, [15:8] gap in use */
+#define PKTREC_M0_P_IFG_RED_CYC_LO 0x30    /* RO 48-bit: tx_clk cycles (16 ns) with the */
+#define PKTREC_M0_P_IFG_RED_CYC_HI 0x34    /*    reduced gap (LO read latches HI) */
+#define PKTREC_M0_P_IFG_RED_ENTRIES 0x38   /* RO times the reduced gap started */
+#define PKTREC_M0_P_FLUSH          0x3C    /* RO frames discarded from a FIFO the port no
+                                              longer selects (PATH_CTRL change) */
+#define PKTREC_M0_FWD_FIFO_BYTES   16384   /* FWD FIFO per TX port (LOOP: 4096) */
 /* (since M2 the GPIO levels and edges come from the SFD sampler in the capture
  * block -- pktrec_sfd_io, sampled at ~1 ns -- re-synchronised into ctrl_clk;
  * IO_STATUS / IO_STICKY / GPIOn_EDGES behave as before) */
@@ -175,6 +210,8 @@
 #define   PKTREC_M0_GEN_CTRL_ENABLE      (1u << 0)
 #define   PKTREC_M0_GEN_CTRL_RAW         (1u << 1)   /* FORMAT 1 */
 #define   PKTREC_M0_GEN_CTRL_RAND_LEN    (1u << 2)   /* LEN + (LFSR & LEN_MASK) per frame */
+#define   PKTREC_M0_GEN_CTRL_BAD         (1u << 3)   /* (1.2) send every frame error-
+                                                        terminated (TX tuser; /V/ over FCS) */
 #define PKTREC_M0_GEN_STATUS       0x04    /* RO [0] running, [1] done (COUNT reached) */
 #define PKTREC_M0_GEN_LEN          0x08    /* RW [13:0] bytes without FCS (reset 60) */
 #define PKTREC_M0_GEN_LEN_MASK     0x0C    /* RW [13:0] random length mask (reset 0) */
@@ -204,8 +241,8 @@
 /* ------------------------------------------------------------------------- */
 /*
  * There is no port-mode register in the capture block: monitor/TAP forwarding
- * is PKTREC_M0_PATH_CTRL (pktrec_m0_path) in M1; capture always records what
- * each port RECEIVES.
+ * is PKTREC_M0_PATH_CTRL + PKTREC_M0_PAIR_MODE (pktrec_m0_path); capture always
+ * records what each port RECEIVES.
  *
  * Datapath (see docs/source/design.md "Capture path"): per port n the MAC RX
  * stream is tapped (in parallel with the TAP forward path), each frame is
