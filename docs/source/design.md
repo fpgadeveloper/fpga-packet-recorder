@@ -69,8 +69,10 @@ and `pktrec_eth_ports_core.sv`), built on the open-source Taxi library
   * or the received frames of its pair partner (FWD), where P0 pairs with P1 and P2 with
     P3. Setting FWD on both ports of a pair makes a two-port TAP.
 * Every TX port and source pair has its own store-and-forward asynchronous frame FIFO
-  (4 KB, Taxi `taxi_axis_async_fifo`). Frames are switched only between frames, so they
-  are never cut.
+  (Taxi `taxi_axis_async_fifo`; 4 KB for LOOP, 16 KB for FWD since M3). Frames are
+  switched only between frames, so they are never cut. TAP mode, the dynamic
+  inter-frame gap and the map 1.2 registers are described in
+  [TAP mode (M3)](#tap-mode-m3).
 * A frame that does not fit in its FIFO is dropped whole and counted.
 * Frames that arrive with an error (bad FCS, framing error) are forwarded with the error
   flag set. The TX MAC then ends them with an error code, so the far end still sees a bad
@@ -109,7 +111,7 @@ The full definitions are in `include/pktrec_regs.h`.
 | Offset | Name | Description |
 |--------|------|-------------|
 | `0x000` | ID | `0x504B4D30` |
-| `0x008` | PATH_CTRL | [2n+1:2n] TX source of port n: 0 IDLE, 1 LOOP, 2 FWD |
+| `0x008` | PATH_CTRL | [2n+1:2n] TX source of port n: 0 IDLE, 1 LOOP, 2 FWD, 3 GEN (M2) |
 | `0x00C` | CNT_CTRL | write 1 to clear all counters |
 | `0x010` | IO_STATUS | [3:0] GPIO_0, [7:4] GPIO_1, [8] PG_1V0, [9] PG_2V5, [19:16] link up |
 | `0x014` | IO_STICKY | rising edge seen on GPIO_0 [3:0] / GPIO_1 [7:4] (write 1 to clear) |
@@ -147,7 +149,7 @@ interleave on the single MDIO master. To use other advertisement settings, stop 
 service (`systemctl stop pktrec-phy-watch`) and run `pktrec-phy init` by hand.
 
 The OP080 has no bypass relays. If the board is unpowered or reconfiguring, every port
-link is broken, including a TAP pair.
+link is broken, including a TAP pair (see [TAP mode (M3)](#tap-mode-m3)).
 
 ## Capture path (M1)
 
@@ -493,3 +495,212 @@ Registers: `pktrec_m0_path` (`0x04_2002_0000`, map 1.1) at `0x200 + n*0x80`
 * `tb_pktrec_gen`: frame content byte for byte against a `gen_seq.py` model, line-rate
   spacing, IFG spacing, random lengths, count, stop, and the checker (loss, duplicate,
   bad frames).
+
+## TAP mode (M3)
+
+```{warning}
+**The Ethernet FMC Max has no bypass relays.** The TAP forwards in the FPGA fabric, so the
+link between the two devices on a TAP pair is **broken whenever the board is unpowered,
+booting, or the FPGA is being reconfigured** (a new bitstream, a reboot, a crash of the
+PL). Insert the TAP only where a short outage at power-up is acceptable, and expect
+both devices to see a link-down event whenever the board restarts.
+```
+
+A pair (P0/P1 or P2/P3) is either in **TAP** mode, where each port forwards everything
+it receives out of its partner so the two devices on either side talk to each other
+through the board, or in **monitor** mode, where both ports only receive. Capture is
+the same in both modes: each port records what it *receives*, so in TAP mode the two
+directions of the link are the two ports' interfaces (`P0` = traffic from the device on
+P0 to the device on P1) and nothing is recorded twice.
+
+### Forwarding
+
+* **Store-and-forward.** Every TX port has a 16 KB forward FIFO (`FWD_FIFO_DEPTH`,
+  `pktrec_m0_path`) fed by its partner's RX MAC; a frame is sent once it has been
+  received completely. The latency therefore grows with the frame size (see
+  [Latency](#forwarding-latency)). Cut-through forwarding (start sending after the
+  header) is deferred: it would make the latency fixed but adds complexity (underrun
+  handling when the partner's clock is slower) without changing what the devices see.
+* **Frames are forwarded unmodified** except for the FCS, which the RX MAC checks and
+  strips and the TX MAC regenerates (a correct frame comes out bit-identical). TX
+  padding is off, so runts stay runts.
+* **Errored frames are forwarded as errored frames.** A frame that arrives with a bad
+  FCS or a receive error is forwarded with the MAC's bad-frame flag (Taxi TX
+  `tuser[0]`); the Taxi PCS then sends `/V/` (error propagation) code groups in place
+  of the FCS, the DP83867 turns them into a transmit error on the copper side, and the
+  device on the other side counts a receive error and drops the frame, as it would
+  with the original errored frame. The original wrong FCS value is not preserved, and
+  a receiver that meets `/V/` ends the frame a few bytes early (6 bytes for the Taxi
+  receiver in simulation) - so the far device sees *a* receive error, not the same
+  bytes. The capture records the frame as received, with the bad-frame flag.
+* **Frames never get cut.** The TX side changes source only between frames; frames that
+  do not fit are dropped whole and counted (`DROP_FWD`).
+
+### Clock mismatch and the dynamic inter-frame gap
+
+The two devices on a TAP pair each transmit with their own clock, up to +-100 ppm off
+nominal, while our TX MAC sends with the board's 125 MHz reference. If the device on P0
+sends at 100 % utilisation and its clock is faster than ours, frames arrive faster than
+P1 can send them, and any FIFO eventually overflows: at a +200 ppm worst case that is
+25 KB per second of traffic.
+
+The standard fix, applied here, is to shorten the inter-frame gap while the FIFO fills
+up. Per TX port, `pktrec_m0_path` drives the Taxi MAC's `cfg_tx_ifg`
+(`pktrec_eth_ports` parameter `EXT_TX_IFG` = 1):
+
+* normally `IFG_NOM` = 12 bytes (the IEEE 802.3 gap),
+* `IFG_MIN` = 8 bytes while the forward FIFO holds more than `IFG_HI` = 3072 bytes, until
+  it falls below `IFG_LO` = 2048 bytes (hysteresis; IEEE 802.3 receivers must accept
+  gaps down to 64 bit times, i.e. 8 bytes).
+
+Saving 4 bytes per frame catches up 4 / 1538 = 0.26 % (2600 ppm) with 1518-byte frames
+and 4.8 % with 64-byte frames, far more than the 200 ppm needed. The FIFO fill counts
+the frame that is being received, so while forwarding 1518-byte frames at 100 % it sits
+at about one frame (~1.5 KB) even with no backlog; `IFG_LO` must stay above the largest
+frame or the reduced gap only ends when the traffic pauses. Below 100 % utilisation the
+FIFO never fills and the gap stays at 12 bytes. The worst-case extra latency from the
+backlog is `IFG_HI` (3 KB, 25 us); the 13 KB above it absorb bursts.
+
+Counters per TX port (`pktrec-phy ifg`): FWD fill now and its maximum, time spent with
+the reduced gap (`IFG_RED_CYC`, 16 ns units) and the number of episodes.
+
+Speed: the forward FIFO cannot bridge two different link speeds. `pktrec-phy init
+--1000-only` (what `pktrec-phy-watch.service` runs at boot) advertises only 1000BASE-T
+full duplex on all four PHYs, so both devices link at 1 Gb/s or not at all, and `pktrec-phy
+mode <pair> tap` warns when the two ports of a pair report different speeds. Tapping a
+100 Mb/s link needs both PHYs of the pair restricted to 100 Mb/s instead (Should #10,
+not done yet).
+
+### Pair mode and switching
+
+`pktrec-phy mode <pair> tap|monitor` sets the two ports' `PATH_CTRL` fields (tap = FWD
+on both, monitor = IDLE on both) and the informational `PAIR_MODE` register, which
+`pktrec-cap` copies into the capture file header (`pair_mode`, bit p = pair p in TAP mode)
+and `pktrec-export` reports in each pcapng interface description ("TAP pair 0
+(P0<->P1), forwarded to P1" or "monitor mode"). `pktrec-phy path` and `gen` keep
+`PAIR_MODE` consistent (a pair is "tap" exactly when both its ports forward).
+`pktrec-phy mode` refuses to switch while a capture is running (capture `CTRL.ENABLE`),
+unless `--force` is given.
+
+Exact behaviour of a switch while traffic flows (verified in `tb_pktrec_tap`):
+
+* **RX side:** the new mode takes effect for frames whose first byte arrives after the
+  register write has crossed into the port's receive clock (a few cycles); a frame that
+  is being received keeps the decision taken at its first byte.
+* **TX side:** the port finishes the frame it is sending, then switches source.
+* **Frames already in a FIFO** that the port no longer selects (for example the forward
+  FIFO when going from TAP to monitor) are discarded and counted per port in `FLUSH`. At
+  most the FIFO contents are lost (in practice the one or two frames in flight); no
+  frame is ever truncated, corrupted, duplicated or reordered, and every frame that
+  entered a FIFO is either sent or counted in `FLUSH` or `DROP_*`.
+
+In **monitor mode** the PHYs still link up normally (with the advertisement from `pktrec-phy
+init`, 1000BASE-T full duplex only by default) so that the devices on each side keep
+their link; the ports send nothing but idles.
+
+### Link-state propagation
+
+On a direct cable, when one device's link goes down the other device sees it too. Through
+the TAP it would not: the PHY on the other port keeps its link to the other device. The
+link watcher (`pktrec-phy watch`, run by `pktrec-phy-watch.service`) therefore propagates
+the copper link state for pairs in TAP mode:
+
+* when a port's copper link has been down for 0.5 s (`--debounce`), its partner PHY is
+  powered down (DP83867 `BMCR[11]`), so the device on the partner's side sees link down;
+* when the port's link has been up again for 0.5 s, the partner PHY is powered up (its
+  registers are kept) and the SGMII status word re-triggered once its copper link
+  returns;
+* a port whose link is down *because we powered it down* never propagates (no
+  ping-pong), and a PHY that was just powered up gets 6 s (`--grace`) to auto-negotiate
+  before its own link-down counts. If its far device is really gone, the first port is
+  powered down after the grace time: the device on that side sees its link come up
+  for up to ~6 s, then go down again;
+* when the pair leaves TAP mode, when the watcher stops (SIGTERM), or when someone else
+  powers the PHY up (`pktrec-phy init`), the watcher releases every PHY it powered down.
+
+Every action is logged with a timestamp (`journalctl -u pktrec-phy-watch`; `--json` gives
+one JSON object per line); `--no-propagate` disables propagation.
+
+### Forwarding latency
+
+Simulated (`tb_pktrec_tap`, Taxi MAC/PCS models, no transceiver or PHY), from the
+start-of-frame on the incoming 1000BASE-X stream to the start-of-frame of the forwarded
+frame:
+
+| Frame (incl. FCS) | 64 B | 256 B | 512 B | 1024 B | 1518 B |
+|---|---|---|---|---|---|
+| Latency (simulation) | 735 ns | 2271 ns | 4319 ns | 8415 ns | 12367 ns |
+
+That is `8 ns x frame length + 223 ns`: the frame time plus a fixed MAC/FIFO/PCS
+pipeline. On the hardware the GTH transceivers and the two DP83867s (RX and TX) add their
+fixed latencies. **Hardware latency is measured with the SFD timestamps** (M2): for a
+frame received on port A and forwarded out of port B, latency = TX SFD(B) - RX SFD(A),
+i.e. from the start-of-frame delimiter on the incoming wire to the one on the outgoing
+wire (the PHYs' own SFD indications, 1 ns sampling; with `RX_OFFSET`/`TX_OFFSET`
+calibrated, wire to wire). `pktrec-phy latency` pairs the two ports' SFD log FIFOs
+(time window 30 us, so the traffic must be paced: at most one frame in flight per
+direction) and prints min / median / max per direction:
+
+    # on the board (pair 0 in TAP mode)
+    pktrec-phy latency --pair 0 --count 300 --label "64 B"
+    # meanwhile on the device behind P1: echo traffic of one size through the TAP
+    ping -I <if> -i 0.01 -c 400 -s 18 <host behind P0>     # 64-byte frames
+
+ICMP payload sizes for the standard frame sizes (Ethernet + IPv4 + ICMP = 42 bytes of
+headers, plus the 4-byte FCS): 64 B `-s 18`, 256 B `-s 210`, 512 B `-s 466`, 1024 B
+`-s 978`, 1518 B `-s 1472`. The echo request gives the P1 to P0 direction and the reply the
+P0 to P1 direction. Background frames of other sizes fall outside the "main cluster"
+(median +- 500 ns) that the tool also reports.
+
+### Registers (pktrec_m0_path map 1.2)
+
+New in map 1.2 (`VERSION` = `0x00010002`; full list in `include/pktrec_regs.h`):
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `0x018` | PAIR_MODE | [2p+1:2p] pair p: 0 monitor, 1 TAP (informational, see above) |
+| `0x01C` | EFF_PATH | [2n+1:2n] TX source port n is using now (PATH_CTRL coding) |
+| port + `0x20` | IFG_CTRL | [0] dynamic IFG enable (1), [15:8] IFG_NOM (12), [23:16] IFG_MIN (8) |
+| port + `0x24` | IFG_THRESH | [15:0] IFG_HI (3072), [31:16] IFG_LO (2048), bytes of FWD FIFO fill |
+| port + `0x28` | FWD_FILL | [15:0] FWD FIFO fill now, [31:16] maximum since `CNT_CTRL` clear |
+| port + `0x2C` | IFG_STATUS | [0] reduced gap active, [15:8] gap in use |
+| port + `0x30/0x34` | IFG_RED_CYC | 48-bit count of 16 ns cycles with the reduced gap (LO read latches HI) |
+| port + `0x38` | IFG_RED_ENTRIES | number of reduced-gap episodes |
+| port + `0x3C` | FLUSH | frames discarded from a FIFO the port no longer selects |
+| GEN + `0x00` | GEN_CTRL[3] | BAD: generator frames sent error-terminated (bad-frame forwarding test) |
+
+(port = `0x100 + n*0x40`, GEN = `0x200 + n*0x80`.) The shell's `TX_IFG` register is not
+used any more (`EXT_TX_IFG` = 1). The block keeps its historical name `pktrec_m0_path`.
+
+### Commands
+
+| Command | What it does |
+|---------|--------------|
+| `pktrec-phy mode <0\|1> tap\|monitor [--force]` | sets the pair's mode (PATH_CTRL + PAIR_MODE) |
+| `pktrec-phy mode status [--json]` | mode, path and effective path per pair |
+| `pktrec-phy ifg <port\|all> [--enable on\|off] [--nom B] [--min B] [--hi B] [--lo B] [--json]` | dynamic-IFG settings and counters, FWD fill, FLUSH |
+| `pktrec-phy latency --pair P \| --in A --out B [--count N] [--json]` | forwarding latency from the SFD logs |
+| `pktrec-phy watch [--no-propagate] [--debounce S] [--grace S] [--json]` | SGMII re-trigger and link-state propagation |
+| `pktrec-phy gen <port> start --bad ...` | generator frames sent as errored frames |
+
+### Verification (M3)
+
+`tb_pktrec_tap` puts real Taxi 1000BASE-X MAC/PCS cores (`taxi_axis_basex_tx_16` /
+`_rx_16`) on both sides of the P0/P1 pair, wired at the 8b/10b level, with sources at
+100 % utilisation and sequence-numbered frames checked at the far ends:
+
+* **Bad frames:** frames sent error-terminated and frames hit by a bit error on the line
+  leave the partner port error-terminated; the far receiver flags exactly those 130 of
+  400 frames bad, the others arrive intact; RX_BAD / TX_GOOD exact.
+* **Dynamic IFG:** 1514-byte frames from a source +2000 ppm fast: the reduced gap starts
+  only above `IFG_HI` and ends only below `IFG_LO` (4 episodes in 1200 frames), the wire
+  carries only 12- and 8-byte gaps, no frame lost.
+* **Clock mismatch:** 64-byte frames, source +4 % fast (a scaled stand-in for +200 ppm
+  over more than 1 s: 233 us of accumulated excess against 200 us): 9000 of 9000 frames
+  delivered with the dynamic IFG; without it the FIFO overflows and 75 frames are dropped
+  whole, `DROP_FWD` = 75 = the frames missing at the far end.
+* **Mode switching:** both directions at 100 %, PATH_CTRL toggled 12 times between TAP,
+  monitor and loopback mid-traffic: 1335 frames entered FIFOs, 1232 delivered + 103 in
+  `FLUSH`, none corrupted, truncated or reordered; lossless after the last switch.
+
+The other testbenches (`tb_pktrec_m0_path`, `tb_pktrec_gen`, ...) pass unchanged.
