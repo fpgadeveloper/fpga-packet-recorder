@@ -94,7 +94,12 @@ module tb_pktrec_cap_port;
     .st_frames_rx(st_frames_rx), .st_frames_bad(st_frames_bad), .st_frames_drop(st_frames_drop),
     .st_bytes_rx(st_bytes_rx), .st_bytes_drop(st_bytes_drop), .st_frames_trunc(st_frames_trunc),
     .st_seq_next(st_seq_next), .st_rx_active(st_rx_active), .st_records(st_records),
-    .st_fifo_hwm(st_fifo_hwm), .hwm_clr(hwm_clr), .idle(idle), .len_fixup(len_fixup)
+    .st_fifo_hwm(st_fifo_hwm), .hwm_clr(hwm_clr), .idle(idle), .len_fixup(len_fixup),
+    // no SFD entries: every frame falls back to its MAC timestamp (TS_MAC = 1)
+    .sfd_wr(1'b0), .sfd_din(34'd0), .sfd_full(), .sfd_match_en(1'b1), .sfd_win_min(32'd100),
+    .sfd_win_max(32'd700), .sfd_offset(32'd0), .sfd_clear(1'b0),
+    .st_sfd_matched(), .st_sfd_stale(), .st_sfd_mismatch(), .st_sfd_dlast(), .st_sfd_dmin(),
+    .st_sfd_dmax(), .st_sfd_dhead()
   );
 
   // ---------------------------------------------------------------------------

@@ -11,6 +11,11 @@
 //                          Gray-coded into the 4 RX and 4 TX MAC clocks
 //                          (rx/tx_ptp_ts_n = {32'b0, cycle count})
 //   pktrec_cap_regs        AXI-Lite registers (include/pktrec_regs.h PKTREC_CAP_*)
+//   pktrec_sfd_io/_sfd     (M2) PHY SFD pins (phy_gpio0 = RX SFD, phy_gpio1 = TX
+//                          SFD) oversampled by ISERDESE3 (~1 ns), timestamped,
+//                          matched to the frames (RX) and to the MAC TX
+//                          completions s_axis_tx_cpl_n (TX); the sampled levels
+//                          go back out (phy_gpio0/1_lvl) to pktrec_m0_path
 // Record format: include/pktrec_format.h.
 //
 // s_axis_rx_n: the MAC RX stream of port n (rx_clk_n, no tready) -- a parallel
@@ -25,7 +30,9 @@
 
 module pktrec_capture #(
     parameter DP_CLK_HZ  = 250000000,
-    parameter FIFO_BYTES = 16384
+    parameter FIFO_BYTES = 16384,
+    parameter SFD_SAMPLER = "ISERDES",
+    parameter SFD_PIPE_NS = 16
 )(
     // ---- datapath / register clock ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 dp_clk CLK" *)
@@ -54,12 +61,19 @@ module pktrec_capture #(
     // ---- port 0: timestamps to the MAC ({32'b0, timebase cycle count}, in rx_clk_0 / tx_clk_0) ----
     output wire [63:0]   rx_ptp_ts_0,
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 tx_clk_0 CLK" *)
-    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_RESET tx_aresetn_0" *)
+    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_tx_cpl_0, ASSOCIATED_RESET tx_aresetn_0" *)
     input  wire          tx_clk_0,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 tx_aresetn_0 RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
     input  wire          tx_aresetn_0,
     output wire [63:0]   tx_ptp_ts_0,
+    // ---- port 0: MAC TX completions (tx_clk_0, no tready) ----
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_0 TDATA" *)
+    input  wire [63:0]   s_axis_tx_cpl_0_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_0 TID" *)
+    input  wire [7:0]    s_axis_tx_cpl_0_tid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_0 TVALID" *)
+    input  wire          s_axis_tx_cpl_0_tvalid,
     // ---- port 1: MAC RX stream tap (rx_clk_1, no tready) ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 rx_clk_1 CLK" *)
     (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_1, ASSOCIATED_RESET rx_aresetn_1" *)
@@ -80,12 +94,19 @@ module pktrec_capture #(
     // ---- port 1: timestamps to the MAC ({32'b0, timebase cycle count}, in rx_clk_1 / tx_clk_1) ----
     output wire [63:0]   rx_ptp_ts_1,
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 tx_clk_1 CLK" *)
-    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_RESET tx_aresetn_1" *)
+    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_tx_cpl_1, ASSOCIATED_RESET tx_aresetn_1" *)
     input  wire          tx_clk_1,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 tx_aresetn_1 RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
     input  wire          tx_aresetn_1,
     output wire [63:0]   tx_ptp_ts_1,
+    // ---- port 1: MAC TX completions (tx_clk_1, no tready) ----
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_1 TDATA" *)
+    input  wire [63:0]   s_axis_tx_cpl_1_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_1 TID" *)
+    input  wire [7:0]    s_axis_tx_cpl_1_tid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_1 TVALID" *)
+    input  wire          s_axis_tx_cpl_1_tvalid,
     // ---- port 2: MAC RX stream tap (rx_clk_2, no tready) ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 rx_clk_2 CLK" *)
     (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_2, ASSOCIATED_RESET rx_aresetn_2" *)
@@ -106,12 +127,19 @@ module pktrec_capture #(
     // ---- port 2: timestamps to the MAC ({32'b0, timebase cycle count}, in rx_clk_2 / tx_clk_2) ----
     output wire [63:0]   rx_ptp_ts_2,
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 tx_clk_2 CLK" *)
-    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_RESET tx_aresetn_2" *)
+    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_tx_cpl_2, ASSOCIATED_RESET tx_aresetn_2" *)
     input  wire          tx_clk_2,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 tx_aresetn_2 RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
     input  wire          tx_aresetn_2,
     output wire [63:0]   tx_ptp_ts_2,
+    // ---- port 2: MAC TX completions (tx_clk_2, no tready) ----
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_2 TDATA" *)
+    input  wire [63:0]   s_axis_tx_cpl_2_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_2 TID" *)
+    input  wire [7:0]    s_axis_tx_cpl_2_tid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_2 TVALID" *)
+    input  wire          s_axis_tx_cpl_2_tvalid,
     // ---- port 3: MAC RX stream tap (rx_clk_3, no tready) ----
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 rx_clk_3 CLK" *)
     (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_rx_3, ASSOCIATED_RESET rx_aresetn_3" *)
@@ -132,12 +160,19 @@ module pktrec_capture #(
     // ---- port 3: timestamps to the MAC ({32'b0, timebase cycle count}, in rx_clk_3 / tx_clk_3) ----
     output wire [63:0]   rx_ptp_ts_3,
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 tx_clk_3 CLK" *)
-    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_RESET tx_aresetn_3" *)
+    (* X_INTERFACE_PARAMETER = "FREQ_HZ 62500000, ASSOCIATED_BUSIF s_axis_tx_cpl_3, ASSOCIATED_RESET tx_aresetn_3" *)
     input  wire          tx_clk_3,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 tx_aresetn_3 RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
     input  wire          tx_aresetn_3,
     output wire [63:0]   tx_ptp_ts_3,
+    // ---- port 3: MAC TX completions (tx_clk_3, no tready) ----
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_3 TDATA" *)
+    input  wire [63:0]   s_axis_tx_cpl_3_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_3 TID" *)
+    input  wire [7:0]    s_axis_tx_cpl_3_tid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 s_axis_tx_cpl_3 TVALID" *)
+    input  wire          s_axis_tx_cpl_3_tvalid,
     // ---- merged record stream to fdrec_core s_axis_cap (dp_clk) ----
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 m_axis_rec TDATA" *)
     output wire [127:0]  m_axis_rec_tdata,
@@ -147,6 +182,12 @@ module pktrec_capture #(
     input  wire          m_axis_rec_tready,
     output wire          cap_sel,
     input  wire          rec_srst,
+    // ---- PHY SFD pins (OP080 GPIO_0 = RX SFD, GPIO_1 = TX SFD; asynchronous) ----
+    input  wire [3:0]    phy_gpio0,
+    input  wire [3:0]    phy_gpio1,
+    // sampled levels (dp_clk) for pktrec_m0_path's IO_STATUS / edge counters
+    output wire [3:0]    phy_gpio0_lvl,
+    output wire [3:0]    phy_gpio1_lvl,
     // ---- s_axi (AXI4-Lite slave, dp_clk), include/pktrec_regs.h PKTREC_CAP_* ----
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 s_axi AWADDR" *)
     (* X_INTERFACE_PARAMETER = "PROTOCOL AXI4LITE, DATA_WIDTH 32, ADDR_WIDTH 12" *)
@@ -196,7 +237,9 @@ assign {tx_ptp_ts_3, tx_ptp_ts_2, tx_ptp_ts_1, tx_ptp_ts_0} = tx_ts_all;
 pktrec_capture_core #(
     .N(4),
     .DP_CLK_HZ(DP_CLK_HZ),
-    .FIFO_BYTES(FIFO_BYTES)
+    .FIFO_BYTES(FIFO_BYTES),
+    .SFD_SAMPLER(SFD_SAMPLER),
+    .SFD_PIPE_NS(SFD_PIPE_NS)
 ) core_inst (
     .dp_clk(dp_clk),
     .dp_rst(!dp_resetn),
@@ -212,6 +255,12 @@ pktrec_capture_core #(
     .tx_clk({tx_clk_3, tx_clk_2, tx_clk_1, tx_clk_0}),
     .tx_rst(~{tx_aresetn_3, tx_aresetn_2, tx_aresetn_1, tx_aresetn_0}),
     .tx_ptp_ts(tx_ts_all),
+    .tx_cpl_valid({s_axis_tx_cpl_3_tvalid, s_axis_tx_cpl_2_tvalid, s_axis_tx_cpl_1_tvalid, s_axis_tx_cpl_0_tvalid}),
+    .tx_cpl_ts({s_axis_tx_cpl_3_tdata, s_axis_tx_cpl_2_tdata, s_axis_tx_cpl_1_tdata, s_axis_tx_cpl_0_tdata}),
+    .sfd_rx_pin(phy_gpio0),
+    .sfd_tx_pin(phy_gpio1),
+    .sfd_rx_lvl(phy_gpio0_lvl),
+    .sfd_tx_lvl(phy_gpio1_lvl),
     .m_rec_tdata(m_axis_rec_tdata),
     .m_rec_tvalid(m_axis_rec_tvalid),
     .m_rec_tready(m_axis_rec_tready),

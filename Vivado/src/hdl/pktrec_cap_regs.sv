@@ -7,6 +7,8 @@
 // responses only; unmapped offsets read 0 and ignore writes. 64-bit counters
 // are _LO/_HI pairs: a _LO read latches the matching _HI half (one latch per
 // pair), so software reads _LO then _HI.
+// Offsets 0x400..0xFFF are forwarded to the SFD block (pktrec_sfd: sfd_reg_*;
+// reads complete when it answers with sfd_reg_rvalid).
 //
 // Copyright (c) 2026 Opsero Electronic Design Inc.
 
@@ -87,11 +89,20 @@ module pktrec_cap_regs #(
     input  wire logic [N*64-1:0] p_frames_trunc,
     input  wire logic [N*64-1:0] p_records,
     input  wire logic [N*32-1:0] p_fifo_hwm,
-    input  wire logic [N*16-1:0] p_seq_next
+    input  wire logic [N*16-1:0] p_seq_next,
+
+    // SFD block register port (offsets 0x400..0xFFF)
+    output logic               sfd_reg_wr,
+    output logic      [11:0]   sfd_reg_wa,
+    output logic      [31:0]   sfd_reg_wd,
+    output logic               sfd_reg_rd,
+    output logic      [11:0]   sfd_reg_ra,
+    input  wire logic          sfd_reg_rvalid,
+    input  wire logic [31:0]   sfd_reg_rdata
 );
 
 localparam logic [31:0] ID      = 32'h504B4350;   // "PKCP"
-localparam logic [31:0] VERSION = 32'h0001_0001;   // 1.1: TB_STATUS = domain valid, MAC_OFFSET
+localparam logic [31:0] VERSION = 32'h0001_0002;   // 1.2: SFD timestamping block at 0x400..0xBFF
 
 assign s_axi_bresp = 2'b00;
 assign s_axi_rresp = 2'b00;
@@ -112,8 +123,16 @@ always_ff @(posedge clk) begin
     tb_set      <= 1'b0;
     tb_adj      <= 1'b0;
     tb_inc_load <= 1'b0;
+    sfd_reg_wr  <= 1'b0;
 
-    if (wr_fire) begin
+    if (wr_fire && wa[11:10] != 2'b00) begin
+        s_axi_awready <= 1'b1;
+        s_axi_wready  <= 1'b1;
+        s_axi_bvalid  <= 1'b1;
+        sfd_reg_wr    <= 1'b1;
+        sfd_reg_wa    <= wa;
+        sfd_reg_wd    <= wd;
+    end else if (wr_fire) begin
         s_axi_awready <= 1'b1;
         s_axi_wready  <= 1'b1;
         s_axi_bvalid  <= 1'b1;
@@ -165,6 +184,7 @@ always_ff @(posedge clk) begin
         inc_frac_stage <= '0;
         tb_inc_ns_wr  <= '0;
         tb_inc_frac_wr <= '0;
+        sfd_reg_wr     <= 1'b0;
     end
 end
 
@@ -211,11 +231,23 @@ always_comb begin
 end
 
 logic [31:0] hi_l [64];
-logic        rd_pend = 1'b0;
+logic        sfd_pend = 1'b0;
 
 always_ff @(posedge clk) begin
     s_axi_arready <= 1'b0;
-    if (s_axi_arvalid && !s_axi_arready && !s_axi_rvalid) begin
+    sfd_reg_rd    <= 1'b0;
+    if (sfd_pend) begin
+        if (sfd_reg_rvalid) begin
+            s_axi_rvalid <= 1'b1;
+            s_axi_rdata  <= sfd_reg_rdata;
+            sfd_pend     <= 1'b0;
+        end
+    end else if (s_axi_arvalid && !s_axi_arready && !s_axi_rvalid && ra[11:10] != 2'b00) begin
+        s_axi_arready <= 1'b1;
+        sfd_reg_rd    <= 1'b1;
+        sfd_reg_ra    <= ra;
+        sfd_pend      <= 1'b1;
+    end else if (s_axi_arvalid && !s_axi_arready && !s_axi_rvalid) begin
         s_axi_arready <= 1'b1;
         s_axi_rvalid  <= 1'b1;
         if (pair_is64 && !ra[2]) begin
@@ -253,6 +285,8 @@ always_ff @(posedge clk) begin
         s_axi_arready <= 1'b0;
         s_axi_rvalid  <= 1'b0;
         s_axi_rdata   <= '0;
+        sfd_pend      <= 1'b0;
+        sfd_reg_rd    <= 1'b0;
     end
 end
 

@@ -140,7 +140,7 @@ proc run_tb {tb_file} {
   set tops [list work.$tb]
   if {[file exists $glbl]} { lappend tops work.glbl }
   lassign [run_step $work [file join $work xelab.log] \
-             $xelab -relax -timescale 1ns/1ps -L xpm -L unisims_ver -L unimacro_ver \
+             $xelab -relax -timescale 1ns/1ps -L xpm -L unisims_ver -L unimacro_ver -L secureip \
              -s ${tb}_snap {*}$tops] rc out
   if {$rc != 0} {
     puts $out

@@ -29,6 +29,11 @@
 //      the packetizer is off, then FDREC START = SOFT_RST): the recorded stream
 //      still starts on a record boundary and parses cleanly; FRAMES_RX =
 //      RECORDS + FRAMES_DROP per port at the end (no silent loss)
+//   5. end to end SFD timestamping (M2, real ISERDES/MMCM models): RX SFD
+//      level pulses on PHY GPIO_0 of port 2 shortly before each frame ->
+//      records with TS_MAC = 0 whose timestamp differences equal the pulse
+//      time differences within +-1 ns; SFD registers through the AXI-Lite
+//      forwarding (SFD_STATUS locked, RX_EDGES, RX_MATCHED, MISMATCH 0)
 //
 // Prints PASS / FAIL and calls $finish (sim.tcl contract).
 
@@ -70,6 +75,7 @@ module tb_pktrec_capture;
   wire [63:0] tx_ts [4];
   initial for (int k = 0; k < 4; k++) begin rx_tdata[k] = 0; rx_tkeep[k] = 0; rx_tuser[k] = 0; end
 
+  reg  [3:0]  phy_gpio0 = 0;
   wire [127:0] rec_tdata;
   wire         rec_tvalid, rec_tready, cap_sel, rec_srst;
 
@@ -89,20 +95,25 @@ module tb_pktrec_capture;
     .s_axis_rx_0_tdata(rx_tdata[0]), .s_axis_rx_0_tkeep(rx_tkeep[0]), .s_axis_rx_0_tvalid(rx_tvalid[0]),
     .s_axis_rx_0_tlast(rx_tlast[0]), .s_axis_rx_0_tuser(rx_tuser[0]),
     .rx_ptp_ts_0(rx_ts[0]), .tx_clk_0(tx_clk), .tx_aresetn_0(1'b1), .tx_ptp_ts_0(tx_ts[0]),
+    .s_axis_tx_cpl_0_tdata(64'd0), .s_axis_tx_cpl_0_tid(8'd0), .s_axis_tx_cpl_0_tvalid(1'b0),
     .rx_clk_1(rx_clk[1]), .rx_aresetn_1(rx_aresetn[1]),
     .s_axis_rx_1_tdata(rx_tdata[1]), .s_axis_rx_1_tkeep(rx_tkeep[1]), .s_axis_rx_1_tvalid(rx_tvalid[1]),
     .s_axis_rx_1_tlast(rx_tlast[1]), .s_axis_rx_1_tuser(rx_tuser[1]),
     .rx_ptp_ts_1(rx_ts[1]), .tx_clk_1(tx_clk), .tx_aresetn_1(1'b1), .tx_ptp_ts_1(tx_ts[1]),
+    .s_axis_tx_cpl_1_tdata(64'd0), .s_axis_tx_cpl_1_tid(8'd0), .s_axis_tx_cpl_1_tvalid(1'b0),
     .rx_clk_2(rx_clk[2]), .rx_aresetn_2(rx_aresetn[2]),
     .s_axis_rx_2_tdata(rx_tdata[2]), .s_axis_rx_2_tkeep(rx_tkeep[2]), .s_axis_rx_2_tvalid(rx_tvalid[2]),
     .s_axis_rx_2_tlast(rx_tlast[2]), .s_axis_rx_2_tuser(rx_tuser[2]),
     .rx_ptp_ts_2(rx_ts[2]), .tx_clk_2(tx_clk), .tx_aresetn_2(1'b1), .tx_ptp_ts_2(tx_ts[2]),
+    .s_axis_tx_cpl_2_tdata(64'd0), .s_axis_tx_cpl_2_tid(8'd0), .s_axis_tx_cpl_2_tvalid(1'b0),
     .rx_clk_3(rx_clk[3]), .rx_aresetn_3(rx_aresetn[3]),
     .s_axis_rx_3_tdata(rx_tdata[3]), .s_axis_rx_3_tkeep(rx_tkeep[3]), .s_axis_rx_3_tvalid(rx_tvalid[3]),
     .s_axis_rx_3_tlast(rx_tlast[3]), .s_axis_rx_3_tuser(rx_tuser[3]),
     .rx_ptp_ts_3(rx_ts[3]), .tx_clk_3(tx_clk), .tx_aresetn_3(1'b1), .tx_ptp_ts_3(tx_ts[3]),
+    .s_axis_tx_cpl_3_tdata(64'd0), .s_axis_tx_cpl_3_tid(8'd0), .s_axis_tx_cpl_3_tvalid(1'b0),
     .m_axis_rec_tdata(rec_tdata), .m_axis_rec_tvalid(rec_tvalid), .m_axis_rec_tready(rec_tready),
     .cap_sel(cap_sel), .rec_srst(rec_srst),
+    .phy_gpio0(phy_gpio0), .phy_gpio1(4'd0), .phy_gpio0_lvl(), .phy_gpio1_lvl(),
     .s_axi_awaddr(c_awaddr), .s_axi_awprot(3'b0), .s_axi_awvalid(c_awvalid), .s_axi_awready(c_awready),
     .s_axi_wdata(c_wdata), .s_axi_wstrb(4'hF), .s_axi_wvalid(c_wvalid), .s_axi_wready(c_wready),
     .s_axi_bresp(c_bresp), .s_axi_bvalid(c_bvalid), .s_axi_bready(c_bready),
@@ -270,6 +281,8 @@ module tb_pktrec_capture;
   // stream parser: nbytes of records (fill units allowed), checks the scoreboard
   // ---------------------------------------------------------------------------
   int n_rec [4];
+  bit expect_sfd = 0;
+  longint unsigned ts_list [4][$];
   task automatic parse(input longint unsigned nbytes, input bit allow_drop);
     longint unsigned pos = 0;
     longint unsigned last_ts [4];
@@ -310,7 +323,9 @@ module tb_pktrec_capture;
       end
       if (f == null) begin fail($sformatf("port %0d: record seq %0d not found", port, seq)); return; end
       if (((flags & 1) != 0) != f.bad) fail($sformatf("port %0d seq %0d: BAD flag %0d", port, seq, flags & 1));
-      if ((flags & 4) == 0) fail("TS_MAC flag not set");
+      if (!expect_sfd && (flags & 4) == 0) fail("TS_MAC flag not set");
+      if (expect_sfd && (flags & 12) != 0) fail($sformatf("port %0d seq %0d: flags %02x, expected an SFD timestamp", port, seq, flags));
+      ts_list[port].push_back(ts);
       if (orig != cap + 4) fail($sformatf("port %0d seq %0d: orig_len %0d cap_len %0d", port, seq, orig, cap));
       if (last_seq[port] >= 0 && !allow_drop && seq != ((last_seq[port] + 1) & 16'hFFFF))
         fail($sformatf("port %0d: seq %0d after %0d", port, seq, last_seq[port]));
@@ -378,7 +393,7 @@ module tb_pktrec_capture;
 
     // ---- 1. identity / reset values ----
     cr(C_ID, v);      if (v !== 32'h504B4350) fail($sformatf("ID %08x", v));
-    cr(C_VERSION, v); if (v !== 32'h0001_0001) fail($sformatf("VERSION %08x", v));
+    cr(C_VERSION, v); if (v !== 32'h0001_0002) fail($sformatf("VERSION %08x", v));
     cr(C_CTRL, v);    if (v !== 0) fail($sformatf("CTRL reset %08x", v));
     cr(C_PORT_EN, v); if (v !== 32'hF) fail($sformatf("PORT_EN reset %08x", v));
     cr(C_FIFO_BYTES, v); if (v !== 16384) fail($sformatf("PORT_FIFO_BYTES %0d", v));
@@ -453,6 +468,44 @@ module tb_pktrec_capture;
       if (rx != rc + dr) fail($sformatf("port %0d FRAMES_RX %0d != RECORDS %0d + DROP %0d", p, rx, rc, dr));
       if (n_rec[p] == 0) fail($sformatf("port %0d: nothing recorded after the soft reset", p));
     end
+
+    // ---- 5. SFD timestamps end to end ----
+    $display("test 5: SFD timestamps end to end (port 2)");
+    cr(12'h404, v); if (v[1:0] !== 2'b11) fail($sformatf("SFD_STATUS %08x (locked, ISERDES)", v));
+    stream.delete();
+    for (int p = 0; p < 4; p++) begin n_sent[p] = 0; bytes_sent[p] = 0; exp_q[p].delete(); ts_list[p].delete(); end
+    cw(C_CTRL, CTRL_SRC | CTRL_CLEAR);
+    fdrec_start();
+    cw(C_CTRL, CTRL_SRC | CTRL_EN);
+    repeat (50) @(posedge dp_clk);
+    begin
+      realtime t_pin [$];
+      for (int i = 0; i < 30; i++) begin
+        #($urandom_range(0, 15999) / 1000.0);
+        phy_gpio0[2] = 1;
+        t_pin.push_back($realtime);
+        #350;
+        send(2, 200, 0);
+        #1700;
+        phy_gpio0[2] = 0;
+        #1000;
+      end
+      expect_sfd = 1;
+      stop_capture(bytes_out);
+      parse(bytes_out, 0);
+      expect_sfd = 0;
+      if (n_rec[2] != 30) fail($sformatf("test 5: %0d records on port 2", n_rec[2]));
+      for (int i = 1; i < ts_list[2].size() && i < t_pin.size(); i++) begin
+        real dt_ts = real'(ts_list[2][i] - ts_list[2][0]);
+        real dt_pin = t_pin[i] - t_pin[0];
+        if (dt_ts - dt_pin > 1.001 || dt_ts - dt_pin < -1.001)
+          fail($sformatf("test 5 frame %0d: ts delta %0.1f ns vs pin delta %0.3f ns", i, dt_ts, dt_pin));
+      end
+    end
+    cr(12'h800 + 12'h200 + 12'h00, v); if (v != 30) fail($sformatf("P2 RX_EDGES %0d", v));
+    cr(12'h800 + 12'h200 + 12'h10, v); if (v != 30) fail($sformatf("P2 RX_MATCHED %0d", v));
+    cr(12'h800 + 12'h200 + 12'h1C, v); if (v != 0) fail($sformatf("P2 RX_MISMATCH %0d", v));
+    cr(12'h800 + 12'h200 + 12'h20, v); $display("  P2 MATCH_DELTA last %0d ns (SFD -> MAC stamp, raw)", $signed(v));
 
     if (errors == 0) $display("tb_pktrec_capture: PASS");
     else $display("tb_pktrec_capture: FAIL (%0d errors)", errors);
