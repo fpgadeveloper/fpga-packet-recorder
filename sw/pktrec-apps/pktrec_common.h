@@ -89,6 +89,11 @@ static inline void pktrec_hdr_swap(struct pktrec_file_header *h)
 		p->speed_mbps = le32toh(p->speed_mbps);
 		p->flags = le32toh(p->flags);
 	}
+	h->tb_disc_flags = le32toh(h->tb_disc_flags);
+	h->tb_disc_locked_s = le32toh(h->tb_disc_locked_s);
+	h->tb_disc_offset_ns = (int64_t)le64toh((uint64_t)h->tb_disc_offset_ns);
+	h->tb_disc_freq_ppb = (int64_t)le64toh((uint64_t)h->tb_disc_freq_ppb);
+	h->tb_disc_time_ns = le64toh(h->tb_disc_time_ns);
 }
 
 /* Read and check the header from fd (at its current position). Returns 0, or
@@ -170,6 +175,16 @@ static inline void pktrec_print_header(FILE *f, const struct pktrec_file_header 
 		(h->flags & PKTREC_FILE_FLAG_LIMIT_TIME) ? ", duration limit" : "",
 		(h->flags & PKTREC_FILE_FLAG_DMA_ERROR) ? ", ENDED BY A DMA/IO ERROR" : "");
 	fprintf(f, "timebase inc     %.6f ns/cycle\n", (double)h->tb_inc / 4294967296.0);
+	if (h->tb_disc_flags & PKTREC_TBD_VALID)
+		fprintf(f, "tb discipline    %s%s, offset %+.3f us, trim %+.3f ppm%s%s\n",
+			(h->tb_disc_flags & PKTREC_TBD_DAEMON) ? "pktrec-tb " : "no daemon",
+			(h->tb_disc_flags & PKTREC_TBD_DAEMON) ?
+			((h->tb_disc_flags & PKTREC_TBD_LOCKED) ? "locked" : "not locked") : "",
+			(double)h->tb_disc_offset_ns / 1e3, (double)h->tb_disc_freq_ppb / 1e3,
+			(h->tb_disc_flags & PKTREC_TBD_NTP_SYNC) ? ", NTP synced" : ", NTP not synced",
+			(h->tb_disc_flags & PKTREC_TBD_SET_AT_START) ? ", TB_SET at start" : "");
+	else
+		fprintf(f, "tb discipline    not recorded\n");
 	fprintf(f, "data             %" PRIu64 " bytes, %" PRIu64 " records\n", h->data_bytes,
 		h->records);
 	fprintf(f, "recorder         %" PRIu64 " dropped beats, %" PRIu64 " DMA errors%s\n",

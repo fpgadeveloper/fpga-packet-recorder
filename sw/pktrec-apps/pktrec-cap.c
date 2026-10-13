@@ -5,7 +5,7 @@
  * Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
  *
  *   pktrec-cap [record] [options] <file>   capture to <file>
- *   pktrec-cap stats [--watch S] [--clear] capture counters (no capture)
+ *   pktrec-cap stats [--watch S] [--clear] [--json]  capture counters (no capture)
  *   pktrec-cap info [--records N] <file>   print a capture file's header
  *
  * Recording reuses the FPGA Drive Recorder datapath and its zero-copy loop
@@ -48,6 +48,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/timex.h>
 #include <liburing.h>
 
 #include "fdrec_uapi.h"
@@ -74,6 +75,7 @@ const char *prog_name = "pktrec-cap";
 #define HDR_SIZE        PKTREC_FILE_HEADER_SIZE
 #define UD_POLL         ((uint64_t)-1)
 #define ALL_PORTS       ((1u << PKTREC_NUM_PORTS) - 1)
+#define TB_STATE_FILE   "/run/pktrec/tb.json"   /* pktrec-tb daemon state */
 
 static volatile sig_atomic_t g_stop;
 
@@ -343,6 +345,139 @@ static void fmt_rate(double v, const char *unit, char *buf, size_t len)
 }
 
 /* ------------------------------------------------------------------------ */
+/* timebase discipline state (pktrec-tb daemon, /run/pktrec/tb.json)          */
+
+struct tb_disc {
+	bool valid;             /* state file read */
+	bool fresh;             /* written recently by a live daemon */
+	bool locked;
+	double interval_s;
+	int64_t offset_ns;      /* daemon's last offset */
+	uint64_t updated_ns, locked_since_ns;
+};
+
+/* Minimal lookup in the flat JSON object pktrec-tb writes ("key": value) */
+static const char *json_val(const char *buf, const char *key)
+{
+	char pat[64];
+	const char *p;
+
+	snprintf(pat, sizeof(pat), "\"%s\":", key);
+	p = strstr(buf, pat);
+	if (!p)
+		return NULL;
+	p += strlen(pat);
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	return strncmp(p, "null", 4) ? p : NULL;
+}
+
+static bool json_num(const char *buf, const char *key, double *v)
+{
+	const char *p = json_val(buf, key);
+	char *end;
+
+	if (!p)
+		return false;
+	*v = strtod(p, &end);
+	return end != p;
+}
+
+static bool json_u64(const char *buf, const char *key, uint64_t *v)
+{
+	const char *p = json_val(buf, key);
+	char *end;
+
+	if (!p || *p == '-')
+		return false;
+	*v = strtoull(p, &end, 10);
+	return end != p;
+}
+
+static bool json_true(const char *buf, const char *key)
+{
+	const char *p = json_val(buf, key);
+
+	return p && !strncmp(p, "true", 4);
+}
+
+static void tb_disc_read(struct tb_disc *d, const char *path)
+{
+	char buf[8192];
+	ssize_t n;
+	double pid = 0, off = 0;
+	uint64_t now = realtime_ns();
+	int fd;
+
+	memset(d, 0, sizeof(*d));
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return;
+	buf[n] = 0;
+	d->valid = true;
+	if (!json_num(buf, "interval_s", &d->interval_s) || d->interval_s <= 0)
+		d->interval_s = 1.0;
+	json_u64(buf, "updated_ns", &d->updated_ns);
+	json_u64(buf, "locked_since_ns", &d->locked_since_ns);
+	if (json_num(buf, "offset_ns", &off))
+		d->offset_ns = (int64_t)off;
+	d->locked = json_true(buf, "locked");
+	d->fresh = json_true(buf, "running") && d->updated_ns &&
+		   (double)now < (double)d->updated_ns + (3 * d->interval_s + 5) * 1e9 &&
+		   now + 5000000000ull > d->updated_ns;
+	if (d->fresh && json_num(buf, "pid", &pid) && pid > 0 &&
+	    kill((pid_t)pid, 0) < 0 && errno == ESRCH)
+		d->fresh = false;
+}
+
+/* System clock synchronised (adjtimex returns TIME_ERROR while STA_UNSYNC) */
+static bool ntp_synced(void)
+{
+	struct timex tx;
+	int st;
+
+	memset(&tx, 0, sizeof(tx));
+	st = adjtimex(&tx);
+	return st >= 0 && st != TIME_ERROR;
+}
+
+/* INC (32.32 ns) relative to the nominal 1e9 / DP_CLK_HZ, in ppb */
+static double tb_freq_ppb(const struct regs *cap)
+{
+	uint64_t inc = ((uint64_t)(rd(cap, PKTREC_CAP_TB_INC_NS) & 0xFF) << 32) |
+		       rd(cap, PKTREC_CAP_TB_INC_FRAC);
+	double hz = rd(cap, PKTREC_CAP_DP_CLK_HZ);
+	double nominal = hz > 0 ? 4294967296.0 * 1e9 / hz : (double)inc;
+
+	return nominal > 0 ? ((double)inc / nominal - 1.0) * 1e9 : 0;
+}
+
+/* timebase - CLOCK_REALTIME: the read pair with the shortest latency of 7 */
+static int64_t tb_offset(const struct regs *cap, uint64_t *when)
+{
+	int64_t best_off = 0;
+	uint64_t best_lat = UINT64_MAX;
+	unsigned i;
+
+	for (i = 0; i < 7; i++) {
+		uint64_t t1 = realtime_ns();
+		uint64_t tb = rd64(cap, PKTREC_CAP_TB_NOW_LO);
+		uint64_t t2 = realtime_ns();
+
+		if (t2 - t1 < best_lat) {
+			best_lat = t2 - t1;
+			best_off = (int64_t)(tb - (t1 + best_lat / 2));
+			*when = t2;
+		}
+	}
+	return best_off;
+}
+
+/* ------------------------------------------------------------------------ */
 /* record                                                                    */
 
 struct opts {
@@ -363,6 +498,8 @@ struct opts {
 	bool tb_set;
 	bool devmem;
 	bool quiet;
+	int stats_json_fd;      /* --stats-json[=fd]: -1 = off */
+	const char *tb_state;   /* pktrec-tb state file */
 };
 
 enum phase { RUN, DISABLING, FILLING, STOPPED };
@@ -378,6 +515,8 @@ struct rec {
 	struct io_uring ring;
 	bool fixed;
 	struct pktrec_file_header *hdr;
+	FILE *sj;               /* --stats-json stream */
+	struct tb_disc tbd;
 
 	enum phase phase;
 	unsigned inflight;
@@ -414,7 +553,7 @@ static void usage_record(FILE *f)
 {
 	fprintf(f,
 "Usage: pktrec-cap [record] [options] <output-file>\n"
-"       pktrec-cap stats [--watch <sec>] [--clear] [--devmem]\n"
+"       pktrec-cap stats [--watch <sec>] [--clear] [--json] [--devmem]\n"
 "       pktrec-cap info [--records <n>] <capture-file>\n"
 "\n"
 "Capture the Ethernet FMC Max ports (monitor mode) to <output-file>: a 4 KB\n"
@@ -430,8 +569,14 @@ static void usage_record(FILE *f)
 "                        the capture ends at the next buffer boundary)\n"
 "  --stop-file <path>    stop when this file appears (it is removed)\n"
 "  --no-tb-set           leave the hardware timebase alone (default: set it to\n"
-"                        CLOCK_REALTIME before the start, so timestamps are UTC)\n"
+"                        CLOCK_REALTIME before the start, so timestamps are UTC,\n"
+"                        unless the pktrec-tb daemon has it locked to\n"
+"                        CLOCK_REALTIME already: then it is never stepped)\n"
 "  --stats <sec>         live statistics interval, 0 = off (default 1)\n"
+"  --stats-json[=<fd>]   also write each statistics interval as one JSON object\n"
+"                        per line to stdout or file descriptor <fd>, and a final\n"
+"                        {\"type\":\"result\",...} line (independent of -q)\n"
+"  --tb-state <path>     pktrec-tb daemon state (default " TB_STATE_FILE ")\n"
 "  --buffers <n>         ring buffers (default %d)\n"
 "  --buf-size <bytes>    buffer size, multiple of 2 MB (default 8M)\n"
 "  --qd <n>              io_uring writes in flight (default %d)\n"
@@ -463,6 +608,8 @@ static int parse_record_args(int argc, char **argv, struct opts *o)
 		{ "stop-file", required_argument, NULL, 'F' },
 		{ "no-tb-set", no_argument, NULL, 'T' },
 		{ "stats", required_argument, NULL, 'S' },
+		{ "stats-json", optional_argument, NULL, 'J' },
+		{ "tb-state", required_argument, NULL, 'X' },
 		{ "buffers", required_argument, NULL, 'b' },
 		{ "buf-size", required_argument, NULL, 'B' },
 		{ "qd", required_argument, NULL, 'Q' },
@@ -489,6 +636,8 @@ static int parse_record_args(int argc, char **argv, struct opts *o)
 	o->stats = 1.0;
 	o->timeout = DEF_TIMEOUT;
 	o->tb_set = true;
+	o->stats_json_fd = -1;
+	o->tb_state = TB_STATE_FILE;
 
 	while ((c = getopt_long(argc, argv, "qh", lo, NULL)) != -1) {
 		switch (c) {
@@ -518,6 +667,23 @@ static int parse_record_args(int argc, char **argv, struct opts *o)
 		case 'S':
 			if (parse_double(optarg, &o->stats) || o->stats < 0)
 				return die_usage("invalid --stats '%s'", optarg);
+			break;
+		case 'J':
+			if (!optarg) {
+				o->stats_json_fd = 1;
+			} else {
+				char *end;
+				long fd = strtol(optarg, &end, 10);
+
+				if (*end || end == optarg || fd < 1 || fd > 1023 ||
+				    fcntl((int)fd, F_GETFD) < 0)
+					return die_usage("--stats-json=<fd>: '%s' is not an open file descriptor",
+							 optarg);
+				o->stats_json_fd = (int)fd;
+			}
+			break;
+		case 'X':
+			o->tb_state = optarg;
 			break;
 		case 'b':
 			if (parse_size(optarg, &v) || v < 2 || v > FDREC_MAX_BUFS)
@@ -724,8 +890,8 @@ static void print_stats(struct rec *r, bool final)
 {
 	struct fdrec_stats st;
 	double now = now_s(), el = now - r->t0, dt = now - r->t_last;
-	char line[512];
-	int k;
+	char line[512], jports[1024];
+	int k, jk = 0;
 	unsigned i;
 	uint64_t drops = 0, bp;
 	double dp_hz = rd(&r->hw.cap, PKTREC_CAP_DP_CLK_HZ);
@@ -752,13 +918,35 @@ static void print_stats(struct rec *r, bool final)
 		if (k > 0 && (size_t)k < sizeof(line))
 			k += snprintf(line + k, sizeof(line) - k, " | P%u %s/s %s/s d%" PRIu64,
 				      i, fps, bps, c.frames_drop);
+		if (r->sj)
+			jk += snprintf(jports + jk, sizeof(jports) - jk,
+				       "%s\"%u\":{\"frames_s\":%.1f,\"bits_s\":%.1f,\"drops\":%" PRIu64
+				       ",\"frames_rx\":%" PRIu64 ",\"bytes_rx\":%" PRIu64
+				       ",\"fifo_hwm\":%u}", jk ? "," : "", i,
+				       dt > 0 ? (c.frames_rx - r->pc_last[i].frames_rx) / dt : 0.0,
+				       dt > 0 ? (c.bytes_rx - r->pc_last[i].bytes_rx) * 8.0 / dt : 0.0,
+				       c.frames_drop, c.frames_rx, c.bytes_rx, c.fifo_hwm);
 		drops += c.frames_drop;
 		r->pc_last[i] = c;
 	}
-	fprintf(stderr, "%s%s%s", isatty(2) ? "\r" : "", line,
-		(isatty(2) && !final) ? "\033[K" : "\n");
-	fflush(stderr);
-	(void)drops;
+	if (!r->o.quiet) {
+		fprintf(stderr, "%s%s%s", isatty(2) ? "\r" : "", line,
+			(isatty(2) && !final) ? "\033[K" : "\n");
+		fflush(stderr);
+	}
+	if (r->sj) {
+		/* the same fields as the text line, one object per interval */
+		fprintf(r->sj, "{\"type\":\"stats\",\"final\":%s,\"elapsed_s\":%.3f,"
+			"\"write_mb_s\":%.3f,\"written_bytes\":%" PRIu64 ",\"written_gb\":%.6f,"
+			"\"ring_used\":%u,\"ring_total\":%u,\"backpressure_pct\":%.2f,"
+			"\"drops\":%" PRIu64 ",\"ports\":{%s}}\n", final ? "true" : "false", el,
+			dt > 0 ? (r->bytes_written - r->bytes_last) / dt / 1e6 : 0.0,
+			r->bytes_written, r->bytes_written / 1e9, st.bufs_ready + st.bufs_user,
+			r->o.buffers,
+			dt > 0 && dp_hz > 0 ? 100.0 * (double)(bp - r->bp_last) / (dt * dp_hz) : 0.0,
+			drops, jports);
+		fflush(r->sj);
+	}
 	r->t_last = now;
 	r->bytes_last = r->bytes_written;
 	r->bp_last = bp;
@@ -851,6 +1039,8 @@ static int cmd_record(int argc, char **argv)
 	struct iovec *iov = NULL;
 	double next_stats, deadline = 0;
 	uint64_t drops = 0;
+	double res_el = 0;
+	uint32_t res_fixups = 0;
 	int ret = 1, e;
 	unsigned i;
 
@@ -858,6 +1048,17 @@ static int cmd_record(int argc, char **argv)
 	r->dev = r->out = -1;
 	if (parse_record_args(argc, argv, &r->o))
 		return 1;
+	if (r->o.stats_json_fd == 1) {
+		r->sj = stdout;
+	} else if (r->o.stats_json_fd == 2) {
+		r->sj = stderr;
+	} else if (r->o.stats_json_fd > 2) {
+		r->sj = fdopen(r->o.stats_json_fd, "w");
+		if (!r->sj) {
+			perr("--stats-json=%d", r->o.stats_json_fd);
+			return 1;
+		}
+	}
 	if (r->o.size % 4096)
 		r->o.size = (r->o.size + 4095) & ~4095ull;
 
@@ -957,10 +1158,15 @@ static int cmd_record(int argc, char **argv)
 
 	/* ---- start protocol (pktrec_regs.h) ---- */
 	cap_ctrl(r, PKTREC_CAP_CTRL_SRC_SEL);
-	if (r->o.tb_set) {
+	tb_disc_read(&r->tbd, r->o.tb_state);
+	if (r->tbd.fresh && r->tbd.locked) {
+		/* pktrec-tb keeps the timebase on CLOCK_REALTIME: never step it */
+		r->hdr->flags |= PKTREC_FILE_FLAG_TB_REALTIME;
+	} else if (r->o.tb_set) {
 		if (tb_set_realtime(r))
 			goto out_idle;
 		r->hdr->flags |= PKTREC_FILE_FLAG_TB_REALTIME;
+		r->hdr->tb_disc_flags |= PKTREC_TBD_SET_AT_START;
 	}
 	cap_ctrl(r, PKTREC_CAP_CTRL_SRC_SEL | PKTREC_CAP_CTRL_CLEAR);
 	wr(&r->hw.cap, PKTREC_CAP_PORT_EN, r->o.ports);
@@ -969,6 +1175,33 @@ static int cmd_record(int argc, char **argv)
 		wr(&r->hw.cap, PKTREC_CAP_PORT(i) + PKTREC_CAP_P_FIFO_HWM, 0);
 	r->hdr->tb_inc = ((uint64_t)(rd(&r->hw.cap, PKTREC_CAP_TB_INC_NS) & 0xFF) << 32) |
 			 rd(&r->hw.cap, PKTREC_CAP_TB_INC_FRAC);
+	{
+		/* timebase discipline state at start (header tb_disc_*) */
+		uint64_t when = 0;
+		double ppb = tb_freq_ppb(&r->hw.cap);
+		struct pktrec_file_header *h = r->hdr;
+
+		h->tb_disc_offset_ns = tb_offset(&r->hw.cap, &when);
+		h->tb_disc_time_ns = when;
+		h->tb_disc_freq_ppb = (int64_t)(ppb + (ppb < 0 ? -0.5 : 0.5));
+		h->tb_disc_flags |= PKTREC_TBD_VALID |
+				    (r->tbd.fresh ? PKTREC_TBD_DAEMON : 0) |
+				    (r->tbd.fresh && r->tbd.locked ? PKTREC_TBD_LOCKED : 0) |
+				    (ntp_synced() ? PKTREC_TBD_NTP_SYNC : 0);
+		if ((h->tb_disc_flags & PKTREC_TBD_LOCKED) && r->tbd.locked_since_ns &&
+		    when > r->tbd.locked_since_ns)
+			h->tb_disc_locked_s = (uint32_t)((when - r->tbd.locked_since_ns) / 1000000000ull);
+		if (!r->o.quiet)
+			fprintf(stderr, "pktrec-cap: timebase %s, offset %+.3f us vs CLOCK_REALTIME, "
+				"trim %+.3f ppm%s\n",
+				(h->tb_disc_flags & PKTREC_TBD_LOCKED) ? "disciplined by pktrec-tb (locked)" :
+				(h->tb_disc_flags & PKTREC_TBD_SET_AT_START) ?
+				(r->tbd.fresh ? "set from CLOCK_REALTIME (pktrec-tb not locked yet)" :
+				 "set from CLOCK_REALTIME (pktrec-tb not running)") :
+				"left as is (--no-tb-set)",
+				(double)h->tb_disc_offset_ns / 1e3, ppb / 1e3,
+				(h->tb_disc_flags & PKTREC_TBD_NTP_SYNC) ? "" : ", system clock NOT NTP-synced");
+	}
 
 	memset(&start, 0, sizeof(start));
 	start.flags = 0;                /* no TPG: the capture block is the source */
@@ -1087,7 +1320,7 @@ static int cmd_record(int argc, char **argv)
 			arm_poll(r);
 		io_uring_submit(&r->ring);
 
-		if (!r->o.quiet && r->o.stats > 0 && now >= next_stats) {
+		if ((!r->o.quiet || r->sj) && r->o.stats > 0 && now >= next_stats) {
 			print_stats(r, false);
 			while (next_stats <= now)
 				next_stats += r->o.stats;
@@ -1126,7 +1359,7 @@ static int cmd_record(int argc, char **argv)
 			io_uring_submit(&r->ring);
 		}
 	}
-	if (!r->o.quiet && r->o.stats > 0)
+	if ((!r->o.quiet || r->sj) && r->o.stats > 0)
 		print_stats(r, true);
 
 	/* ---- final header ---- */
@@ -1192,6 +1425,8 @@ static int cmd_record(int argc, char **argv)
 		printf("RESULT bytes=%" PRIu64 " records=%" PRIu64 " seconds=%.3f drops=%" PRIu64
 		       " rec_drop_beats=%" PRIu64 " len_fixups=%u error=%d\n", r->hdr->data_bytes,
 		       r->records_out, el, drops, r->hdr->rec_drop_beats, len_fixups, r->error);
+		res_el = el;
+		res_fixups = len_fixups;
 		if (len_fixups)
 			drops += len_fixups;
 	}
@@ -1203,6 +1438,16 @@ static int cmd_record(int argc, char **argv)
 		ret = 0;
 	if (ret == 2)
 		fprintf(stderr, "pktrec-cap: WARNING: frames were dropped -- the capture is not lossless\n");
+	if (r->sj) {
+		/* the RESULT line as JSON */
+		fprintf(r->sj, "{\"type\":\"result\",\"exit_code\":%d,\"bytes\":%" PRIu64
+			",\"records\":%" PRIu64 ",\"seconds\":%.3f,\"drops\":%" PRIu64
+			",\"rec_drop_beats\":%" PRIu64 ",\"dma_errors\":%" PRIu64
+			",\"len_fixups\":%u,\"error\":%d}\n", ret, r->hdr->data_bytes,
+			r->records_out, res_el, drops - res_fixups, r->hdr->rec_drop_beats,
+			r->hdr->dma_errors, res_fixups, r->error);
+		fflush(r->sj);
+	}
 	goto out;
 
 out_idle:
@@ -1223,6 +1468,8 @@ out:
 	if (r->mem)
 		munmap(r->mem, r->mem_len);
 	free(r->hdr);
+	if (r->sj && r->sj != stdout && r->sj != stderr)
+		fclose(r->sj);
 	free(addrs);
 	free(iov);
 	return ret;
@@ -1283,11 +1530,72 @@ static void print_hw_stats(const struct hw *hw, const struct port_cnt *prev, dou
 	}
 }
 
+/* The same fields as print_hw_stats, as one JSON object on one line */
+static void print_hw_stats_json(const struct hw *hw, const struct port_cnt *prev, double dt,
+				struct port_cnt *now)
+{
+	uint32_t ctrl = rd(&hw->cap, PKTREC_CAP_CTRL), st = rd(&hw->cap, PKTREC_CAP_STATUS);
+	uint32_t en = rd(&hw->cap, PKTREC_CAP_PORT_EN);
+	uint32_t inc_ns = rd(&hw->cap, PKTREC_CAP_TB_INC_NS) & 0xFF;
+	uint32_t inc_frac = rd(&hw->cap, PKTREC_CAP_TB_INC_FRAC);
+	uint64_t t = realtime_ns(), tb = rd64(&hw->cap, PKTREC_CAP_TB_NOW_LO);
+	char ts[64];
+	unsigned i;
+
+	pktrec_fmt_time(tb, ts, sizeof(ts));
+	printf("{\"time_ns\":%" PRIu64 ",\"cap_version\":\"0x%08x\",\"ctrl\":\"0x%08x\","
+	       "\"enabled\":%s,\"source\":\"%s\",\"fill\":%s,\"status\":\"0x%08x\",\"idle\":%s,"
+	       "\"port_en\":%u,\"snaplen\":%u,\"fifo_bytes\":%u,\"dp_clk_hz\":%u,"
+	       "\"timebase_ns\":%" PRIu64 ",\"timebase\":\"%s\",\"tb_inc_ns\":%u,"
+	       "\"tb_inc_frac\":%u,\"tb_inc\":%.9f,\"tb_freq_ppb\":%.1f,\"tb_status\":\"0x%02x\","
+	       "\"merge\":{\"records\":%" PRIu64 ",\"bytes_out\":%" PRIu64 ",\"fill_units\":%"
+	       PRIu64 ",\"bp_cycles\":%" PRIu64 ",\"srst_aborts\":%u,\"len_fixups\":%u},"
+	       "\"ports\":[",
+	       t, rd(&hw->cap, PKTREC_CAP_VERSION), ctrl,
+	       (ctrl & PKTREC_CAP_CTRL_ENABLE) ? "true" : "false",
+	       (ctrl & PKTREC_CAP_CTRL_SRC_SEL) ? "capture" : "TPG",
+	       (ctrl & PKTREC_CAP_CTRL_FILL) ? "true" : "false", st,
+	       (st & PKTREC_CAP_STATUS_IDLE) ? "true" : "false", en,
+	       rd(&hw->cap, PKTREC_CAP_SNAPLEN), rd(&hw->cap, PKTREC_CAP_PORT_FIFO_BYTES),
+	       rd(&hw->cap, PKTREC_CAP_DP_CLK_HZ), tb, ts, inc_ns, inc_frac,
+	       inc_ns + inc_frac / 4294967296.0, tb_freq_ppb(&hw->cap),
+	       rd(&hw->cap, PKTREC_CAP_TB_STATUS),
+	       rd64(&hw->cap, PKTREC_CAP_RECORDS_OUT_LO), rd64(&hw->cap, PKTREC_CAP_BYTES_OUT_LO),
+	       rd64(&hw->cap, PKTREC_CAP_FILL_BEATS_LO), rd64(&hw->cap, PKTREC_CAP_BP_CYCLES_LO),
+	       rd(&hw->cap, PKTREC_CAP_SRST_ABORTS), rd(&hw->cap, PKTREC_CAP_LEN_FIXUPS));
+	for (i = 0; i < PKTREC_NUM_PORTS; i++) {
+		struct port_cnt c;
+		uint32_t sp = port_speed(hw, i);
+		const char *link = !hw->eth.p ? "?" : !sp ? "down" : sp == 1000 ? "1G" :
+				   sp == 100 ? "100M" : "10M";
+
+		read_port(hw, i, &c);
+		printf("%s{\"port\":%u,\"link\":\"%s\",\"enabled\":%s,\"frames_rx\":%" PRIu64
+		       ",\"frames_bad\":%" PRIu64 ",\"frames_drop\":%" PRIu64 ",\"frames_trunc\":%"
+		       PRIu64 ",\"bytes_rx\":%" PRIu64 ",\"bytes_drop\":%" PRIu64 ",\"records\":%"
+		       PRIu64 ",\"fifo_hwm\":%u,\"seq\":%u", i ? "," : "", i, link,
+		       (en & (1u << i)) ? "true" : "false", c.frames_rx, c.frames_bad,
+		       c.frames_drop, c.frames_trunc, c.bytes_rx, c.bytes_drop, c.records,
+		       c.fifo_hwm, rd(&hw->cap, PKTREC_CAP_PORT(i) + PKTREC_CAP_P_SEQ_NEXT) & 0xFFFF);
+		if (prev && dt > 0)
+			printf(",\"frames_s\":%.1f,\"bits_s\":%.1f",
+			       (c.frames_rx - prev[i].frames_rx) / dt,
+			       (c.bytes_rx - prev[i].bytes_rx) * 8.0 / dt);
+		else
+			printf(",\"frames_s\":null,\"bits_s\":null");
+		printf("}");
+		if (now)
+			now[i] = c;
+	}
+	printf("]}\n");
+}
+
 static int cmd_stats(int argc, char **argv)
 {
 	static const struct option lo[] = {
 		{ "watch", required_argument, NULL, 'w' },
 		{ "clear", no_argument, NULL, 'c' },
+		{ "json", no_argument, NULL, 'j' },
 		{ "devmem", no_argument, NULL, 'M' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
@@ -1295,7 +1603,7 @@ static int cmd_stats(int argc, char **argv)
 	struct hw hw;
 	struct port_cnt prev[PKTREC_NUM_PORTS], cur[PKTREC_NUM_PORTS];
 	double watch = 0, t_prev = 0;
-	bool clear = false, devmem = false, have_prev = false;
+	bool clear = false, devmem = false, have_prev = false, json = false;
 	struct sigaction sa;
 	int c;
 
@@ -1308,14 +1616,18 @@ static int cmd_stats(int argc, char **argv)
 		case 'c':
 			clear = true;
 			break;
+		case 'j':
+			json = true;
+			break;
 		case 'M':
 			devmem = true;
 			break;
 		case 'h':
-			printf("Usage: pktrec-cap stats [--watch <sec>] [--clear] [--devmem]\n\n"
+			printf("Usage: pktrec-cap stats [--watch <sec>] [--clear] [--json] [--devmem]\n\n"
 			       "Show the capture block's state and counters without capturing.\n"
 			       "--watch repeats every <sec> seconds with frame and bit rates;\n"
-			       "--clear clears the counters (refused while a capture runs).\n");
+			       "--clear clears the counters (refused while a capture runs);\n"
+			       "--json prints the same fields as one JSON object per line.\n");
 			return 0;
 		default:
 			return 1;
@@ -1340,12 +1652,16 @@ static int cmd_stats(int argc, char **argv)
 	do {
 		double t = now_s();
 
-		print_hw_stats(&hw, have_prev ? prev : NULL, t - t_prev, cur);
+		if (json)
+			print_hw_stats_json(&hw, have_prev ? prev : NULL, t - t_prev, cur);
+		else
+			print_hw_stats(&hw, have_prev ? prev : NULL, t - t_prev, cur);
 		memcpy(prev, cur, sizeof(prev));
 		have_prev = true;
 		t_prev = t;
 		if (watch > 0 && !g_stop) {
-			printf("\n");
+			if (!json)
+				printf("\n");
 			fflush(stdout);
 			usleep((useconds_t)(watch * 1e6));
 		}

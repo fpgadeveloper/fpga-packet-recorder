@@ -144,6 +144,17 @@ struct pktrec_rec_hdr {
 #define PKTREC_FILE_FLAG_LIMIT_TIME     (1u << 3)  /* stopped by the duration limit */
 #define PKTREC_FILE_FLAG_DMA_ERROR      (1u << 4)  /* a DMA/IO error ended the capture */
 
+/* pktrec_file_header.tb_disc_flags: state of the timebase discipline daemon
+ * (pktrec-tb, /run/pktrec/tb.json) when the capture started. Carved out of the
+ * reserved bytes without a header version change: files written before have
+ * zeros there (= "not recorded"). */
+#define PKTREC_TBD_VALID                (1u << 0)  /* the tb_disc_* fields are filled in */
+#define PKTREC_TBD_DAEMON               (1u << 1)  /* pktrec-tb daemon running (state fresh) */
+#define PKTREC_TBD_LOCKED               (1u << 2)  /* timebase locked to CLOCK_REALTIME */
+#define PKTREC_TBD_NTP_SYNC             (1u << 3)  /* system clock NTP-synchronised */
+#define PKTREC_TBD_SET_AT_START         (1u << 4)  /* pktrec-cap did TB_SET at start (the
+                                                      daemon was not locked) */
+
 /* pktrec_file_header.pair_mode: bit p = mode of pair p (P0/P1 = 0, P2/P3 = 1) */
 #define PKTREC_PAIR_MODE_MONITOR        0u
 #define PKTREC_PAIR_MODE_TAP            1u
@@ -190,8 +201,15 @@ struct pktrec_file_header {
 	char     hostname[64];      /* NUL-padded */
 	char     design[32];        /* e.g. git describe of the design, NUL-padded */
 	struct pktrec_file_port port[PKTREC_NUM_PORTS];          /* 320 bytes */
+	/* timebase discipline at start (PKTREC_TBD_*; all zero = not recorded) */
+	uint32_t tb_disc_flags;     /* PKTREC_TBD_* */
+	uint32_t tb_disc_locked_s;  /* seconds the daemon had been locked (0 = not locked) */
+	int64_t  tb_disc_offset_ns; /* timebase - CLOCK_REALTIME, measured by the capture app
+	                               right before ENABLE */
+	int64_t  tb_disc_freq_ppb;  /* INC at start vs nominal 1e9/DP_CLK_HZ, ppb */
+	uint64_t tb_disc_time_ns;   /* CLOCK_REALTIME of the offset measurement */
 	uint8_t  reserved[PKTREC_FILE_HEADER_SIZE - 8 - 10 * 4 - 9 * 8 - 32 - 64 - 32
-	                  - PKTREC_NUM_PORTS * 80];
+	                  - PKTREC_NUM_PORTS * 80 - 32];
 } __attribute__((packed));
 
 #ifdef __cplusplus
