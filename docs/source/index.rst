@@ -21,6 +21,7 @@ fitted with the `Ethernet FMC Max`_ and the `FPGA Drive FMC Gen4`_.
    yocto
    design
    software
+   web_ui
    revision_history
 
 
