@@ -702,7 +702,7 @@ static void print_stats(struct rec *r, bool final)
 	bp = rd64(&r->hw.cap, PKTREC_CAP_BP_CYCLES_LO);
 	k = snprintf(line, sizeof(line), "%7.1fs %7.1f MB/s %9.3f GB ring %2u/%u bp %4.1f%%",
 		     el, dt > 0 ? (r->bytes_written - r->bytes_last) / dt / 1e6 : 0,
-		     r->bytes_written / 1e9, st.bufs_ready + st.bufs_user + r->inflight,
+		     r->bytes_written / 1e9, st.bufs_ready + st.bufs_user,
 		     r->o.buffers,
 		     dt > 0 && dp_hz > 0 ? 100.0 * (double)(bp - r->bp_last) / (dt * dp_hz) : 0);
 	for (i = 0; i < PKTREC_NUM_PORTS; i++) {
