@@ -102,6 +102,19 @@ def main():
     expect(all(s["dups"] == 0 and s["reorders"] == 0 for s in res["streams"]),
            "no duplicates, no reordering")
 
+    print("2b. hardware drops (P0, 5 frames)")
+    cap = synth("drops", "--drops", "5")
+    pc = cap + ".pcapng"
+    r = export(cap, pc)
+    expect(r.returncode == 0, "export exit code 0 (drops are data, not corruption)")
+    expect(lint(pc).returncode == 0, "pcapng_lint PASS")
+    r, res = check(pc, cap + ".sent.json")
+    p0 = res["interfaces"]["P0"]
+    miss0 = [s["missing"] for s in res["streams"] if s["interface"] == "P0"][0]
+    expect(not res["pass"] and miss0 == 5, "check_pcap FAILs with exactly 5 frames missing on P0")
+    expect(p0["isb_ifdrop"] == 5 and p0["dropcount"] == 5,
+           f"isb_ifdrop = sum(epb_dropcount) = 5 (got {p0['isb_ifdrop']}, {p0['dropcount']})")
+
     print("3. window too small")
     cap = os.path.join(work, "clean.cap")
     pc = os.path.join(work, "small-window.pcapng")

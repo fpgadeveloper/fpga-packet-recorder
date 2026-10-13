@@ -69,7 +69,7 @@ const char *prog_name = "pktrec-export";
 #define DEF_WINDOW_BYTES        (4u << 20)
 #define DEF_MAX_FRAME           9622u   /* jumbo frame incl. FCS + VLAN tags */
 #define RD_BUF_SIZE             (8u << 20)
-#define MAX_REC_LEN             (PKTREC_REC_HDR_SIZE + 65536u)
+#define MAX_REC_LEN             (PKTREC_REC_HDR_BYTES + 65536u)
 /* how far a record's timestamp may lie before the newest one seen before a
  * resynchronisation counts it as plausible */
 #define RESYNC_TS_BACK_NS       1000000000ull
@@ -86,9 +86,11 @@ const char *prog_name = "pktrec-export";
 #define SHB_USERAPPL            4
 #define IF_NAME                 2
 #define IF_DESCRIPTION          3
+#define IF_SPEED                8
 #define IF_TSRESOL              9
 #define IF_FCSLEN               13
 #define EPB_FLAGS               2
+#define EPB_DROPCOUNT           4
 #define ISB_STARTTIME           2
 #define ISB_ENDTIME             3
 #define ISB_IFRECV              4
@@ -122,6 +124,7 @@ struct ent {
 	uint64_t ts;            /* raw timebase value */
 	uint64_t arrival;       /* tie-break: arrival order */
 	uint8_t *data;
+	uint64_t dropcount;     /* frames the port dropped just before this one */
 	uint16_t seq;
 	uint16_t cap_len;
 	uint16_t orig_len;
@@ -134,8 +137,10 @@ struct port_st {
 	uint64_t written;       /* EPBs written */
 	uint64_t bad;
 	uint64_t trunc;
-	uint64_t seq_gaps;
-	uint64_t seq_missing;
+	uint64_t seq_gaps;      /* gaps in seq: hardware drops */
+	uint64_t seq_missing;   /* sum of those gaps */
+	uint64_t seq_lost;      /* seq numbers lost across resynchronisations */
+	bool after_resync;
 	uint64_t first_ts, last_ts;
 	uint16_t last_seq;
 	bool have_seq;
@@ -162,10 +167,10 @@ struct exp {
 	uint64_t last_out_ts;
 	bool have_out;
 	/* interfaces */
-	int ifid[PKTREC_NUM_PORTS_FILE];        /* -1 = not exported */
+	int ifid[PKTREC_NUM_PORTS];        /* -1 = not exported */
 	uint32_t ports;                         /* captured ports (mask) */
 	/* stats */
-	struct port_st ps[PKTREC_NUM_PORTS_FILE];
+	struct port_st ps[PKTREC_NUM_PORTS];
 	uint64_t records, out_records, pad_bytes, resyncs, skipped_bytes, late;
 	uint64_t tail_bytes, filtered;
 	uint64_t newest_ts;
@@ -249,8 +254,8 @@ static int parse_args(int argc, char **argv, struct opts *o)
 			o->output = optarg;
 			break;
 		case 'p':
-			if (parse_size(optarg, &v) || v >= PKTREC_NUM_PORTS_FILE)
-				return die_usage("--port must be 0..%d", PKTREC_NUM_PORTS_FILE - 1);
+			if (parse_size(optarg, &v) || v >= PKTREC_NUM_PORTS)
+				return die_usage("--port must be 0..%d", PKTREC_NUM_PORTS - 1);
 			o->port_filter |= 1u << v;
 			break;
 		case 'W':
@@ -364,9 +369,9 @@ static int write_shb(struct exp *e)
 	int k;
 
 	snprintf(hw, sizeof(hw),
-		 "Opsero FPGA Packet Recorder (Ethernet FMC Max OP080), target %.32s, capture block 0x%08x v0x%08x, fdrec v0x%08x",
-		 e->h.target[0] ? e->h.target : "unknown", e->h.cap_id, e->h.cap_version,
-		 e->h.fdrec_version);
+		 "Opsero FPGA Packet Recorder (Ethernet FMC Max OP080), target %.32s, design %.32s, capture block 0x%08x, fdrec_core 0x%08x",
+		 e->h.target[0] ? e->h.target : "unknown", e->h.design[0] ? e->h.design : "-",
+		 e->h.cap_version, e->h.fdrec_version);
 	if (uname(&u) == 0)
 		snprintf(os, sizeof(os), "%s %s", u.sysname, u.release);
 	else
@@ -374,17 +379,23 @@ static int write_shb(struct exp *e)
 	snprintf(appl, sizeof(appl), "pktrec-export %s", PKTREC_APPS_VERSION);
 	pktrec_fmt_time(e->h.start_time_ns, t0, sizeof(t0));
 	k = snprintf(comment, sizeof(comment),
-		     "Captured on %.64s in %s mode, ports", e->h.hostname[0] ? e->h.hostname : "?",
-		     pktrec_mode_name(e->h.mode));
-	for (i = 0; i < PKTREC_NUM_PORTS_FILE; i++)
+		     "Captured on %.64s; P0/P1 %s mode, P2/P3 %s mode; ports",
+		     e->h.hostname[0] ? e->h.hostname : "?", pktrec_port_mode(&e->h, 0),
+		     pktrec_port_mode(&e->h, 2));
+	for (i = 0; i < PKTREC_NUM_PORTS; i++)
 		if (e->ports & (1u << i) && k > 0 && (size_t)k < sizeof(comment))
 			k += snprintf(comment + k, sizeof(comment) - k, "%s P%u", n++ ? "," : "", i);
 	if (k > 0 && (size_t)k < sizeof(comment))
 		k += snprintf(comment + k, sizeof(comment) - k,
-			      ", snaplen %u, started %s%s%s", e->h.snaplen, t0,
-			      e->o.raw_ts ? "; timestamps are raw timebase values" : "",
+			      "; snaplen %u; started %s; timestamps %s%s%s", e->h.snaplen, t0,
+			      e->o.raw_ts ? "are raw timebase values" :
+			      (e->h.flags & PKTREC_FILE_FLAG_TB_REALTIME) ?
+			      "from the hardware timebase set to UTC" :
+			      "= start time + hardware timebase offset",
 			      (e->h.flags & PKTREC_FILE_FLAG_COMPLETE) ? "" :
-			      "; capture file NOT finalised (no stop counters)");
+			      "; capture file NOT finalised (no stop counters)",
+			      (e->h.rec_drop_beats || e->h.dma_errors) ?
+			      "; WARNING: the recorder lost data (record stream has gaps)" : "");
 	(void)k;
 
 	blen = 24 + opt_len(strlen(hw)) + opt_len(strlen(os)) + opt_len(strlen(appl)) +
@@ -406,17 +417,25 @@ static int write_shb(struct exp *e)
 
 static int write_idb(struct exp *e, unsigned port)
 {
-	char name[8], desc[160];
+	const struct pktrec_file_port *hp = &e->h.port[port];
+	char name[20], desc[200];
 	uint8_t tsresol = 9, fcslen = 0;
 	uint32_t snap = e->h.snaplen ? e->h.snaplen : 65535;
+	uint64_t speed = (uint64_t)hp->speed_mbps * 1000000ull;
 	size_t blen;
 
-	snprintf(name, sizeof(name), "P%u", port);
+	if (hp->if_name[0])
+		snprintf(name, sizeof(name), "%.16s", hp->if_name);
+	else
+		snprintf(name, sizeof(name), "P%u", port);
 	snprintf(desc, sizeof(desc),
-		 "Ethernet FMC Max port P%u, %s mode, inbound (frames received on P%u)%s",
-		 port, pktrec_mode_name(e->h.mode), port,
-		 e->h.snaplen ? ", truncated to snaplen" : "");
-	blen = 20 + opt_len(strlen(name)) + opt_len(strlen(desc)) + opt_len(1) + opt_len(1) + 4;
+		 "Ethernet FMC Max port P%u, %s mode, inbound: frames received on P%u%s%s",
+		 port, pktrec_port_mode(&e->h, port), port,
+		 e->h.snaplen ? ", truncated to snaplen" : "",
+		 (e->h.flags & PKTREC_FILE_FLAG_COMPLETE) && !(hp->flags & PKTREC_FPORT_LINK_UP) ?
+		 ", link down at start" : "");
+	blen = 24 + opt_len(strlen(name)) + opt_len(strlen(desc)) + opt_len(1) + opt_len(1) +
+	       (speed ? opt_len(8) : 0);
 	{
 		uint32_t b[2] = { BT_IDB, (uint32_t)blen };
 		uint16_t lt[2] = { LINKTYPE_ETHERNET, 0 };
@@ -426,6 +445,7 @@ static int write_idb(struct exp *e, unsigned port)
 	}
 	if (put_opt_str(e, IF_NAME, name) || put_opt_str(e, IF_DESCRIPTION, desc) ||
 	    put_opt(e, IF_TSRESOL, &tsresol, 1) || put_opt(e, IF_FCSLEN, &fcslen, 1) ||
+	    (speed && put_opt_u64(e, IF_SPEED, speed)) ||
 	    put_endofopt(e) || put32(e, (uint32_t)blen))
 		return -1;
 	return 0;
@@ -449,15 +469,16 @@ static int write_epb(struct exp *e, const struct ent *r)
 		else
 			flags |= EPBF_RX_PROMISC;
 	}
-	if (r->flags & PKTREC_REC_F_BAD)
+	if (r->flags & PKTREC_REC_FLAG_BAD)
 		flags |= EPBF_CRC_ERROR;
-	if (e->o.comments && (r->flags & (PKTREC_REC_F_TS_MAC | PKTREC_REC_F_SFD_MISMATCH)))
+	if (e->o.comments && (r->flags & (PKTREC_REC_FLAG_TS_MAC | PKTREC_REC_FLAG_SFD_MISMATCH)))
 		snprintf(comment, sizeof(comment), "pktrec: %s%s%s, seq %u",
-			 (r->flags & PKTREC_REC_F_TS_MAC) ? "MAC timestamp" : "SFD timestamp",
-			 (r->flags & PKTREC_REC_F_SFD_MISMATCH) ? ", SFD mismatch" : "",
-			 (r->flags & PKTREC_REC_F_BAD) ? ", bad frame" : "", r->seq);
+			 (r->flags & PKTREC_REC_FLAG_TS_MAC) ? "MAC timestamp" : "SFD timestamp",
+			 (r->flags & PKTREC_REC_FLAG_SFD_MISMATCH) ? ", SFD mismatch" : "",
+			 (r->flags & PKTREC_REC_FLAG_BAD) ? ", bad frame" : "", r->seq);
 
-	blen = 32 + r->cap_len + pad + opt_len(4) + (comment[0] ? opt_len(strlen(comment)) : 0) + 4;
+	blen = 32 + r->cap_len + pad + opt_len(4) + (r->dropcount ? opt_len(8) : 0) +
+	       (comment[0] ? opt_len(strlen(comment)) : 0) + 4;
 	b[0] = BT_EPB;
 	b[1] = (uint32_t)blen;
 	b[2] = (uint32_t)e->ifid[r->port];
@@ -467,6 +488,7 @@ static int write_epb(struct exp *e, const struct ent *r)
 	b[6] = r->orig_len;
 	if (put(e, b, sizeof(b)) || put(e, r->data, r->cap_len) || put(e, zero, pad) ||
 	    put_opt(e, EPB_FLAGS, &flags, 4) ||
+	    (r->dropcount && put_opt_u64(e, EPB_DROPCOUNT, r->dropcount)) ||
 	    (comment[0] && put_opt_str(e, OPT_COMMENT, comment)) ||
 	    put_endofopt(e) || put32(e, (uint32_t)blen))
 		return -1;
@@ -482,8 +504,8 @@ static int write_isb(struct exp *e, unsigned port)
 	size_t blen;
 
 	if (e->o.raw_ts) {
-		start = e->h.start_timebase_ns;
-		end = e->h.stop_timebase_ns;
+		start = e->h.tb_start_ns;
+		end = e->h.tb_stop_ns;
 	} else {
 		start = e->h.start_time_ns;
 		end = e->h.stop_time_ns;
@@ -501,9 +523,12 @@ static int write_isb(struct exp *e, unsigned port)
 	}
 	if (put_opt_ts(e, ISB_STARTTIME, start) || put_opt_ts(e, ISB_ENDTIME, end))
 		return -1;
+	/* ifrecv: every frame that started while the port was enabled (incl.
+	 * bad and dropped ones); ifdrop: dropped whole by the hardware;
+	 * filteraccept: records the hardware wrote for the port */
 	if (counters &&
-	    (put_opt_u64(e, ISB_IFRECV, hp->rx_good + hp->rx_bad) ||
-	     put_opt_u64(e, ISB_IFDROP, hp->dropped) ||
+	    (put_opt_u64(e, ISB_IFRECV, hp->frames_rx) ||
+	     put_opt_u64(e, ISB_IFDROP, hp->frames_drop) ||
 	     put_opt_u64(e, ISB_FILTERACCEPT, hp->records)))
 		return -1;
 	if (put_opt_u64(e, ISB_USRDELIV, ps->written) || put_endofopt(e) ||
@@ -592,18 +617,31 @@ static int add_record(struct exp *e, const struct pktrec_rec_hdr *h, const uint8
 {
 	struct ent n;
 	struct port_st *ps = &e->ps[h->port];
+	uint16_t gap;
+	uint64_t dropcount = 0;
 
 	e->records++;
 	ps->records++;
-	if (h->flags & PKTREC_REC_F_BAD)
+	if (h->flags & PKTREC_REC_FLAG_BAD)
 		ps->bad++;
-	if (h->flags & PKTREC_REC_F_TRUNC)
+	if (h->flags & PKTREC_REC_FLAG_TRUNC)
 		ps->trunc++;
-	/* per-port sequence: the port's records arrive in order (one FIFO) */
-	if (ps->have_seq && h->seq != (uint16_t)(ps->last_seq + 1)) {
-		ps->seq_gaps++;
-		ps->seq_missing += (uint16_t)(h->seq - ps->last_seq - 1);
+	/* Per-port sequence: a port's records arrive in order (one FIFO), seq
+	 * starts at 0 and counts every frame that started while the port was
+	 * enabled, so a gap = frames the hardware dropped (epb_dropcount).
+	 * After a resynchronisation the gap also covers destroyed records and
+	 * is not reported as drops. */
+	gap = (uint16_t)(h->seq - (ps->have_seq ? (uint16_t)(ps->last_seq + 1) : 0));
+	if (gap) {
+		if (ps->after_resync) {
+			ps->seq_lost += gap;
+		} else {
+			ps->seq_gaps++;
+			ps->seq_missing += gap;
+			dropcount = gap;
+		}
 	}
+	ps->after_resync = false;
 	ps->last_seq = h->seq;
 	ps->have_seq = true;
 	if (!ps->first_ts)
@@ -624,6 +662,7 @@ static int add_record(struct exp *e, const struct pktrec_rec_hdr *h, const uint8
 	n.port = h->port;
 	n.flags = h->flags;
 	n.seq = h->seq;
+	n.dropcount = dropcount;
 	n.data = malloc(h->cap_len ? h->cap_len : 1);
 	if (!n.data)
 		return -1;
@@ -704,27 +743,34 @@ static void get_hdr(const uint8_t *p, struct pktrec_rec_hdr *h)
 	h->seq = le16toh(h->seq);
 }
 
-/* Plausibility of a record header (the resynchronisation criteria) */
+/* Validity of a record header (include/pktrec_format.h rules + --max-frame,
+ * snaplen and, while resynchronising, a timestamp sanity check) */
 static bool hdr_ok(const struct exp *e, const struct pktrec_rec_hdr *h, bool strict_ts)
 {
+	bool trunc = (uint32_t)h->cap_len + PKTREC_FCS_BYTES < h->orig_len;
+
 	if ((h->flags & PKTREC_REC_MARKER_MASK) != PKTREC_REC_MARKER)
 		return false;
-	if (h->port >= PKTREC_NUM_PORTS_FILE || !(e->ports & (1u << h->port)))
+	if (h->port >= PKTREC_NUM_PORTS || !(e->ports & (1u << h->port)))
 		return false;
-	if (h->orig_len == 0 || h->orig_len > e->o.max_frame || h->cap_len > h->orig_len)
+	if (h->cap_len < 1 || (uint32_t)h->cap_len + PKTREC_FCS_BYTES > h->orig_len ||
+	    h->orig_len > e->o.max_frame)
+		return false;
+	if (!!(h->flags & PKTREC_REC_FLAG_TRUNC) != trunc)
 		return false;
 	if (e->h.snaplen && h->cap_len > e->h.snaplen)
 		return false;
-	if (!(h->flags & (PKTREC_REC_F_BAD | PKTREC_REC_F_TRUNC))) {
-		/* a good, whole frame: everything but the FCS is stored */
-		if ((uint32_t)h->cap_len + 4 != h->orig_len)
-			return false;
-	} else if ((h->flags & PKTREC_REC_F_TRUNC) && (uint32_t)h->cap_len + 4 >= h->orig_len) {
-		return false;
-	}
 	if (strict_ts && e->have_newest && h->ts_ns + RESYNC_TS_BACK_NS < e->newest_ts)
 		return false;
 	return true;
+}
+
+/* While resynchronising: does the port's sequence continue at this header? */
+static bool seq_continues(const struct exp *e, const struct pktrec_rec_hdr *h)
+{
+	const struct port_st *ps = &e->ps[h->port];
+
+	return ps->have_seq && h->seq == (uint16_t)(ps->last_seq + 1);
 }
 
 /* A header at p (avail bytes from p) that is followed by another valid header,
@@ -737,7 +783,7 @@ static bool chain_ok(const struct exp *e, const uint8_t *p, size_t avail)
 	get_hdr(p, &h);
 	if (!hdr_ok(e, &h, true))
 		return false;
-	rl = PKTREC_REC_LEN(h.cap_len);
+	rl = PKTREC_REC_BYTES(h.cap_len);
 	if (rl > avail)
 		return false;
 	if (rl == avail)
@@ -777,8 +823,10 @@ static int parse_stream(struct exp *e)
 			continue;
 		}
 		get_hdr(p, &h);
-		if (e->resyncing ? chain_ok(e, p, avail) : hdr_ok(e, &h, false)) {
-			rl = PKTREC_REC_LEN(h.cap_len);
+		if (e->resyncing ?
+		    hdr_ok(e, &h, true) && (seq_continues(e, &h) || chain_ok(e, p, avail)) :
+		    hdr_ok(e, &h, false)) {
+			rl = PKTREC_REC_BYTES(h.cap_len);
 			if (rl > avail) {
 				/* the data ends inside this record */
 				e->tail_bytes += avail;
@@ -789,7 +837,7 @@ static int parse_stream(struct exp *e)
 				err_msg("resynchronised at stream offset %" PRIu64 " after %" PRIu64
 					" bytes", e->offset, e->offset - e->resync_start);
 			e->resyncing = false;
-			if (add_record(e, &h, p + PKTREC_REC_HDR_SIZE)) {
+			if (add_record(e, &h, p + PKTREC_REC_HDR_BYTES)) {
 				err_msg("out of memory (reorder window)");
 				return -1;
 			}
@@ -800,6 +848,10 @@ static int parse_stream(struct exp *e)
 			continue;
 		}
 		if (!e->resyncing) {
+			unsigned i;
+
+			for (i = 0; i < PKTREC_NUM_PORTS; i++)
+				e->ps[i].after_resync = true;
 			e->resyncing = true;
 			e->resyncs++;
 			e->resync_start = e->offset;
@@ -822,17 +874,19 @@ static void print_summary(struct exp *e)
 		" packets written%s%s\n", e->records, e->out_records,
 		e->filtered ? " (other ports filtered out)" : "",
 		e->o.raw_ts ? ", raw timestamps" : "");
-	for (i = 0; i < PKTREC_NUM_PORTS_FILE; i++) {
+	for (i = 0; i < PKTREC_NUM_PORTS; i++) {
 		struct port_st *ps = &e->ps[i];
 
 		if (!(e->ports & (1u << i)))
 			continue;
 		fprintf(stderr, "  P%u: %" PRIu64 " records, %" PRIu64 " bad, %" PRIu64
-			" truncated, sequence gaps %" PRIu64 " (%" PRIu64 " numbers)",
-			i, ps->records, ps->bad, ps->trunc, ps->seq_gaps, ps->seq_missing);
+			" truncated; drops from seq gaps %" PRIu64 " (%" PRIu64 " gaps)",
+			i, ps->records, ps->bad, ps->trunc, ps->seq_missing, ps->seq_gaps);
+		if (ps->seq_lost)
+			fprintf(stderr, ", %" PRIu64 " lost in corrupt stretches", ps->seq_lost);
 		if (e->h.flags & PKTREC_FILE_FLAG_COMPLETE)
 			fprintf(stderr, "; hardware: %" PRIu64 " records, %" PRIu64 " dropped%s",
-				e->h.port[i].records, e->h.port[i].dropped,
+				e->h.port[i].records, e->h.port[i].frames_drop,
 				e->h.port[i].records != ps->records ? "  ** record count mismatch **" : "");
 		fputc('\n', stderr);
 	}
@@ -842,9 +896,10 @@ static void print_summary(struct exp *e)
 	fprintf(stderr, "  padding %" PRIu64 " bytes; resyncs %" PRIu64 " (%" PRIu64
 		" bytes skipped); truncated tail %" PRIu64 " bytes\n",
 		e->pad_bytes, e->resyncs, e->skipped_bytes, e->tail_bytes);
-	if (e->h.ring_drops)
-		fprintf(stderr, "  WARNING: the recorder dropped %" PRIu64
-			" beats: the record stream has gaps\n", e->h.ring_drops);
+	if (e->h.rec_drop_beats || e->h.dma_errors)
+		fprintf(stderr, "  WARNING: the recorder dropped %" PRIu64 " beats / had %" PRIu64
+			" DMA errors: the record stream has gaps\n", e->h.rec_drop_beats,
+			e->h.dma_errors);
 	if (!(e->h.flags & PKTREC_FILE_FLAG_COMPLETE))
 		fprintf(stderr, "  WARNING: capture not finalised: no stop counters, data read to the end of the file\n");
 }
@@ -890,17 +945,17 @@ int main(int argc, char **argv)
 				" data bytes)", e->o.input,
 				(uint64_t)st.st_size - PKTREC_FILE_HEADER_SIZE, e->h.data_bytes);
 	}
-	e->ports = e->h.port_mask & ((1u << PKTREC_NUM_PORTS_FILE) - 1);
+	e->ports = e->h.port_mask & ((1u << PKTREC_NUM_PORTS) - 1);
 	if (!e->ports)
-		e->ports = (1u << PKTREC_NUM_PORTS_FILE) - 1;   /* unknown: allow all */
+		e->ports = (1u << PKTREC_NUM_PORTS) - 1;   /* unknown: allow all */
 	if (!e->o.port_filter)
 		e->o.port_filter = e->ports;
 	if (e->o.port_filter & ~e->ports) {
 		err_msg("--port: the capture has ports mask 0x%x", e->ports);
 		goto out;
 	}
-	if (!e->o.raw_ts && !(e->h.flags & PKTREC_FILE_FLAG_TS_WALL))
-		e->ts_offset = (int64_t)(e->h.start_time_ns - e->h.start_timebase_ns);
+	if (!e->o.raw_ts && !(e->h.flags & PKTREC_FILE_FLAG_TB_REALTIME))
+		e->ts_offset = (int64_t)(e->h.start_time_ns - e->h.tb_start_ns);
 
 	if (!strcmp(e->o.output, "-")) {
 		if (isatty(STDOUT_FILENO) && !e->o.force) {
@@ -922,11 +977,11 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	for (i = 0; i < PKTREC_NUM_PORTS_FILE; i++)
+	for (i = 0; i < PKTREC_NUM_PORTS; i++)
 		e->ifid[i] = (e->o.port_filter & (1u << i)) ? nif++ : -1;
 	if (write_shb(e))
 		goto werr;
-	for (i = 0; i < PKTREC_NUM_PORTS_FILE; i++)
+	for (i = 0; i < PKTREC_NUM_PORTS; i++)
 		if (e->ifid[i] >= 0 && write_idb(e, i))
 			goto werr;
 
@@ -941,7 +996,7 @@ int main(int argc, char **argv)
 		if (emit_one(e))
 			goto werr;
 	if (!e->o.no_isb)
-		for (i = 0; i < PKTREC_NUM_PORTS_FILE; i++)
+		for (i = 0; i < PKTREC_NUM_PORTS; i++)
 			if (e->ifid[i] >= 0 && write_isb(e, i))
 				goto werr;
 	if (fflush(e->out) || ferror(e->out))
@@ -955,7 +1010,8 @@ int main(int argc, char **argv)
 	}
 	if (!e->o.quiet)
 		print_summary(e);
-	ret = (e->resyncs || e->late || e->tail_bytes || e->h.ring_drops) ? 2 : 0;
+	ret = (e->resyncs || e->late || e->tail_bytes || e->h.rec_drop_beats ||
+	       e->h.dma_errors) ? 2 : 0;
 	goto out;
 werr:
 	if (errno == EPIPE)

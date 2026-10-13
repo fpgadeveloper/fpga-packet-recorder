@@ -29,8 +29,8 @@ LIBURING_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags liburing 2>/dev/null)
 LIBURING_LIBS ?= $(shell $(PKG_CONFIG) --libs liburing 2>/dev/null || echo -luring)
 
 PROGS = pktrec-cap pktrec-export
-HEADERS = pktrec_common.h pktrec_format_draft.h $(FDREC_APPS)/fdrec_common.h \
-	  $(PKTREC_INCLUDE)/fdrec_uapi.h $(PKTREC_INCLUDE)/pktrec_regs.h
+HEADERS = pktrec_common.h $(FDREC_APPS)/fdrec_common.h \
+	  $(PKTREC_INCLUDE)/fdrec_uapi.h $(PKTREC_INCLUDE)/pktrec_regs.h $(PKTREC_INCLUDE)/pktrec_format.h
 
 all: $(PROGS)
 

@@ -37,28 +37,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_seq import FrameBuilder, mac_bytes  # noqa: E402
 
 HDR_SIZE = 4096
-MAGIC = b"PKTREC\x00\x00"
-FLAG_COMPLETE = 1 << 1
+MAGIC = b"PKTRCAP\x00"
+FLAG_COMPLETE = 1 << 0
 REC_BAD, REC_TRUNC, REC_TS_MAC = 1, 2, 4
 MARKER = 0xA0
-# pktrec_format_draft.h: struct pktrec_file_header
-HDR_FMT = "<8s10I6Q32s64s"
-PORT_FMT = "<8Q"
+# include/pktrec_format.h: struct pktrec_file_header / pktrec_file_port
+HDR_FMT = "<8s10I9Q32s64s32s"
+PORT_FMT = "<7QII16s"
 
 
 def rec_len(cap):
     return (16 + cap + 15) & ~15
 
 
-def make_header(port_mask, snaplen, start_ns, tb0, tb1, data_bytes, ports, stop_ns):
+def make_header(port_mask, snaplen, start_ns, tb0, tb1, data_bytes, ports, stop_ns, records):
     h = struct.pack(HDR_FMT, MAGIC, 1, HDR_SIZE, 1, FLAG_COMPLETE,
-                    0x504B4350, 0x00010000, 0x00010001, 0, port_mask, snaplen,
-                    start_ns, tb0, stop_ns, tb1, data_bytes, 0,
-                    b"zcu106", b"synthetic")
+                    0x00010000, 0x00010001, 4, port_mask, 0, snaplen,
+                    start_ns, stop_ns, tb0, tb1, int(4.0004 * 2 ** 32), data_bytes, records,
+                    0, 0, b"zcu106", b"synthetic", b"make_synth_capture")
     for p in range(4):
-        st = ports.get(p, {})
-        h += struct.pack(PORT_FMT, st.get("rx_good", 0), st.get("rx_bad", 0),
-                         st.get("dropped", 0), st.get("bytes", 0), st.get("records", 0), 0, 0, 0)
+        st = ports[p]
+        h += struct.pack(PORT_FMT, st["frames_rx"], st["frames_bad"], st["frames_drop"],
+                         st["bytes_rx"], st["bytes_drop"], st["frames_trunc"], st["records"],
+                         1000, 3, f"P{p}".encode())
     assert len(h) <= HDR_SIZE
     return h + bytes(HDR_SIZE - len(h))
 
@@ -70,6 +71,8 @@ def main():
     ap.add_argument("--damage", action="store_true")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--snaplen", type=int, default=1514)
+    ap.add_argument("--drops", type=int, default=0,
+                    help="hardware drops to model on P0 (frames skipped, seq still counts)")
     ap.add_argument("--expect", help="write the expected per-stream result here")
     ap.add_argument("--sent", help="write a gen_seq.py-style summary here")
     a = ap.parse_args()
@@ -110,8 +113,9 @@ def main():
     seqs = [0] * 4
     out = bytearray()
     starts = []                             # (offset, length, port)
-    stats = {p: {"rx_good": 0, "rx_bad": 0, "dropped": 0, "bytes": 0, "records": 0}
-             for p in range(4)}
+    stats = {p: {k: 0 for k in ("frames_rx", "frames_bad", "frames_drop", "bytes_rx",
+                                 "bytes_drop", "frames_trunc", "records")} for p in range(4)}
+    drop_at = set(range(1000, 1000 + 7 * a.drops, 7)) if a.drops else set()
     trunc_done = False
     for n, (deliver, port, ts, size, data, flags) in enumerate(frames):
         cap = size - 4
@@ -122,21 +126,31 @@ def main():
             cap = 128
             flags |= REC_TRUNC
             trunc_done = True
+        st = stats[port]
+        st["frames_rx"] += 1
+        st["bytes_rx"] += size
+        if flags & REC_BAD:
+            st["frames_bad"] += 1
+        if port == 0 and seqs[0] in drop_at:     # hardware drop: seq consumed, no record
+            st["frames_drop"] += 1
+            st["bytes_drop"] += size
+            seqs[0] = (seqs[0] + 1) & 0xFFFF
+            continue
+        if flags & REC_TRUNC:
+            st["frames_trunc"] += 1
         body = data[:cap]
         hdr = struct.pack("<QHHBBH", ts, cap, size, port, MARKER | flags, seqs[port])
         rec = hdr + body + bytes(rec_len(cap) - 16 - cap)
         starts.append((len(out), len(rec), port))
         out += rec
         seqs[port] = (seqs[port] + 1) & 0xFFFF
-        st = stats[port]
         st["records"] += 1
-        st["bytes"] += size
-        st["rx_bad" if flags & REC_BAD else "rx_good"] += 1
         if n % 997 == 500:
             out += bytes(16 * rnd.randint(1, 3))    # padding between records
     out += bytes(4096 - len(out) % 4096) if len(out) % 4096 else b""
 
     lost = {p: 0 for p in range(4)}
+    lost[0] = a.drops
     tail = 0
     if a.damage:
         # corrupt whole records 40 % into the stream: from one record's start
@@ -155,14 +169,15 @@ def main():
         tail = last_len - 40
 
     tb1 = frames[-1][0] + 1000
+    nrec = sum(st["records"] for st in stats.values())
     hdr = make_header(0xF, a.snaplen, start_ns, tb0, tb1, len(out), stats,
-                      start_ns + (tb1 - tb0))
+                      start_ns + (tb1 - tb0), nrec)
     with open(a.output, "wb") as f:
         f.write(hdr)
         f.write(out)
 
     ooo = sum(1 for x, y in zip(frames, frames[1:]) if y[2] < x[2])
-    print(f"make_synth_capture: {a.output}: {len(frames)} records, {len(out)} data bytes, "
+    print(f"make_synth_capture: {a.output}: {nrec} records, {len(out)} data bytes, "
           f"{ooo} timestamp inversions in record order"
           + (f", damaged: {sum(lost.values())} records destroyed, tail {tail} bytes"
              if a.damage else ""))
@@ -174,7 +189,7 @@ def main():
     if a.expect:
         with open(a.expect, "w") as f:
             json.dump({"frames_per_port": a.frames, "lost": lost,
-                       "records": len(frames) - sum(lost.values()),
+                       "records": len(frames) - sum(lost.values()), "drops_p0": a.drops,
                        "bad_fcs_port": 2, "trunc_port": 1}, f, indent=1)
 
 

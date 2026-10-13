@@ -166,11 +166,13 @@ class Interface:
 
 
 class Packet:
-    __slots__ = ("ifid", "ts", "caplen", "wirelen", "data", "flags", "comments", "index")
+    __slots__ = ("ifid", "ts", "caplen", "wirelen", "data", "flags", "comments", "index",
+                 "dropcount")
 
-    def __init__(self, ifid, ts, caplen, wirelen, data, flags, comments, index):
+    def __init__(self, ifid, ts, caplen, wirelen, data, flags, comments, index, dropcount=0):
         self.ifid, self.ts, self.caplen, self.wirelen, self.data = ifid, ts, caplen, wirelen, data
         self.flags, self.comments, self.index = flags, comments, index
+        self.dropcount = dropcount
 
 
 class Capture:
@@ -203,16 +205,19 @@ class Capture:
                 optstart = 20 + ((caplen + 3) & ~3)
                 opts, _ = parse_options(b.body, optstart, e, EPB_OPTS, f"EPB@{b.offset}")
                 flags = 0
+                dropcount = 0
                 comments = []
                 for code, name, raw in opts:
                     if name == "epb_flags":
                         (flags,) = struct.unpack(e + "I", raw)
+                    elif name == "epb_dropcount" and len(raw) == 8:
+                        (dropcount,) = struct.unpack(e + "Q", raw)
                     elif name == "opt_comment":
                         comments.append(raw.decode("utf-8", "replace"))
                 if ifid >= len(self.interfaces):
                     raise PcapngError(f"EPB@{b.offset}: interface {ifid} not defined")
                 ts = self.interfaces[ifid].ts_ns((tsh << 32) | tsl)
-                yield Packet(ifid, ts, caplen, wirelen, data, flags, comments, idx)
+                yield Packet(ifid, ts, caplen, wirelen, data, flags, comments, idx, dropcount)
                 idx += 1
             elif b.btype == BT_ISB:
                 ifid, tsh, tsl = struct.unpack(e + "III", b.body[:12])

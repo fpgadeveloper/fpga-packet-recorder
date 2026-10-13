@@ -4,7 +4,8 @@
  *
  * pktrec_common.h -- capture file header helpers shared by pktrec-cap and
  * pktrec-export (header-only). Generic helpers (err_msg, parse_size, ...)
- * come from the recorder's fdrec_common.h.
+ * come from the recorder's fdrec_common.h; the formats from
+ * include/pktrec_format.h.
  */
 
 #ifndef PKTREC_COMMON_H
@@ -21,17 +22,18 @@
 #include <unistd.h>
 
 #include "fdrec_common.h"
-#include "pktrec_format_draft.h"
+#include "pktrec_format.h"
 
 #define PKTREC_APPS_VERSION     "1.0"
 
-static inline const char *pktrec_mode_name(uint32_t mode)
+/* pktrec_file_port.flags */
+#define PKTREC_FPORT_ENABLED    (1u << 0)
+#define PKTREC_FPORT_LINK_UP    (1u << 1)
+
+/* Mode of the pair a port belongs to */
+static inline const char *pktrec_port_mode(const struct pktrec_file_header *h, unsigned port)
 {
-	switch (mode) {
-	case PKTREC_MODE_MONITOR: return "monitor";
-	case PKTREC_MODE_TAP: return "tap";
-	default: return "unknown";
-	}
+	return (h->pair_mode >> (port / 2)) & 1 ? "TAP" : "monitor";
 }
 
 /* "2026-10-13 12:34:56.123456789 UTC" */
@@ -49,42 +51,44 @@ static inline void pktrec_fmt_time(uint64_t ns, char *buf, size_t len)
 		 tm.tm_sec, (uint64_t)(ns % 1000000000ull));
 }
 
-/* Header in host byte order (the file is little-endian) */
-static inline void pktrec_hdr_to_host(struct pktrec_file_header *h)
+/* Byte-swap every multi-byte field between little-endian (file) and host
+ * order; the same swap works in both directions. */
+static inline void pktrec_hdr_swap(struct pktrec_file_header *h)
 {
 	unsigned i;
 
 	h->header_version = le32toh(h->header_version);
 	h->header_size = le32toh(h->header_size);
-	h->record_version = le32toh(h->record_version);
+	h->record_format = le32toh(h->record_format);
 	h->flags = le32toh(h->flags);
-	h->cap_id = le32toh(h->cap_id);
 	h->cap_version = le32toh(h->cap_version);
 	h->fdrec_version = le32toh(h->fdrec_version);
-	h->mode = le32toh(h->mode);
+	h->num_ports = le32toh(h->num_ports);
 	h->port_mask = le32toh(h->port_mask);
+	h->pair_mode = le32toh(h->pair_mode);
 	h->snaplen = le32toh(h->snaplen);
 	h->start_time_ns = le64toh(h->start_time_ns);
-	h->start_timebase_ns = le64toh(h->start_timebase_ns);
 	h->stop_time_ns = le64toh(h->stop_time_ns);
-	h->stop_timebase_ns = le64toh(h->stop_timebase_ns);
+	h->tb_start_ns = le64toh(h->tb_start_ns);
+	h->tb_stop_ns = le64toh(h->tb_stop_ns);
+	h->tb_inc = le64toh(h->tb_inc);
 	h->data_bytes = le64toh(h->data_bytes);
-	h->ring_drops = le64toh(h->ring_drops);
-	for (i = 0; i < PKTREC_NUM_PORTS_FILE; i++) {
+	h->records = le64toh(h->records);
+	h->rec_drop_beats = le64toh(h->rec_drop_beats);
+	h->dma_errors = le64toh(h->dma_errors);
+	for (i = 0; i < PKTREC_NUM_PORTS; i++) {
 		struct pktrec_file_port *p = &h->port[i];
 
-		p->rx_good = le64toh(p->rx_good);
-		p->rx_bad = le64toh(p->rx_bad);
-		p->dropped = le64toh(p->dropped);
-		p->bytes = le64toh(p->bytes);
+		p->frames_rx = le64toh(p->frames_rx);
+		p->frames_bad = le64toh(p->frames_bad);
+		p->frames_drop = le64toh(p->frames_drop);
+		p->bytes_rx = le64toh(p->bytes_rx);
+		p->bytes_drop = le64toh(p->bytes_drop);
+		p->frames_trunc = le64toh(p->frames_trunc);
 		p->records = le64toh(p->records);
+		p->speed_mbps = le32toh(p->speed_mbps);
+		p->flags = le32toh(p->flags);
 	}
-}
-
-/* The inverse (it is its own inverse on little-endian hosts) */
-static inline void pktrec_hdr_to_le(struct pktrec_file_header *h)
-{
-	pktrec_hdr_to_host(h);  /* leXXtoh and htoleXX are the same swap */
 }
 
 /* Read and check the header from fd (at its current position). Returns 0, or
@@ -117,15 +121,15 @@ static inline int pktrec_read_header(int fd, const char *name, struct pktrec_fil
 			err_msg("%s: not a packet capture file (bad magic)", name);
 		return -1;
 	}
-	pktrec_hdr_to_host(h);
+	pktrec_hdr_swap(h);
 	if (h->header_size != PKTREC_FILE_HEADER_SIZE) {
 		err_msg("%s: header size %u, expected %u", name, h->header_size,
 			PKTREC_FILE_HEADER_SIZE);
 		return -1;
 	}
-	if (h->record_version != 1) {
-		err_msg("%s: record format version %u, this tool reads version 1", name,
-			h->record_version);
+	if (h->record_format != PKTREC_REC_FORMAT_VERSION) {
+		err_msg("%s: record format version %u, this tool reads version %u", name,
+			h->record_format, PKTREC_REC_FORMAT_VERSION);
 		return -1;
 	}
 	return 0;
@@ -140,16 +144,17 @@ static inline void pktrec_print_header(FILE *f, const struct pktrec_file_header 
 
 	pktrec_fmt_time(h->start_time_ns, t0, sizeof(t0));
 	pktrec_fmt_time(h->stop_time_ns, t1, sizeof(t1));
-	fprintf(f, "header version   %u (record format %u)%s\n", h->header_version,
-		h->record_version,
+	fprintf(f, "header version   %u, record format %u%s\n", h->header_version,
+		h->record_format,
 		(h->flags & PKTREC_FILE_FLAG_COMPLETE) ? "" :
-		"  ** NOT COMPLETE: capture did not stop cleanly; counters missing **");
+		"  ** NOT COMPLETE: the capture did not stop cleanly; no stop counters **");
 	fprintf(f, "target / host    %.32s / %.64s\n", h->target, h->hostname);
-	fprintf(f, "design           capture ID 0x%08x version 0x%08x, fdrec 0x%08x\n",
-		h->cap_id, h->cap_version, h->fdrec_version);
-	fprintf(f, "mode             %s\n", pktrec_mode_name(h->mode));
+	fprintf(f, "design           %.32s (capture block 0x%08x, fdrec_core 0x%08x)\n",
+		h->design[0] ? h->design : "-", h->cap_version, h->fdrec_version);
+	fprintf(f, "pair modes       P0/P1 %s, P2/P3 %s\n", pktrec_port_mode(h, 0),
+		pktrec_port_mode(h, 2));
 	fprintf(f, "ports            ");
-	for (i = 0; i < PKTREC_NUM_PORTS_FILE; i++)
+	for (i = 0; i < PKTREC_NUM_PORTS; i++)
 		if (h->port_mask & (1u << i))
 			fprintf(f, "P%u ", i);
 	fprintf(f, "(mask 0x%x)\n", h->port_mask);
@@ -157,24 +162,35 @@ static inline void pktrec_print_header(FILE *f, const struct pktrec_file_header 
 		fprintf(f, "snaplen          %u bytes\n", h->snaplen);
 	else
 		fprintf(f, "snaplen          none (whole frames)\n");
-	fprintf(f, "start            %s (timebase %" PRIu64 " ns%s)\n", t0,
-		h->start_timebase_ns,
-		(h->flags & PKTREC_FILE_FLAG_TS_WALL) ? ", wall clock" : "");
-	fprintf(f, "stop             %s (timebase %" PRIu64 " ns), %.3f s\n", t1,
-		h->stop_timebase_ns, el);
-	fprintf(f, "data             %" PRIu64 " bytes of records\n", h->data_bytes);
-	fprintf(f, "ring drops       %" PRIu64 " beats%s\n", h->ring_drops,
-		h->ring_drops ? "  ** the record stream has gaps **" : "");
-	fprintf(f, "port   %14s %10s %12s %16s %14s\n", "rx_good", "rx_bad", "dropped",
-		"bytes", "records");
-	for (i = 0; i < PKTREC_NUM_PORTS_FILE; i++) {
+	fprintf(f, "start            %s (timebase %" PRIu64 " ns%s)\n", t0, h->tb_start_ns,
+		(h->flags & PKTREC_FILE_FLAG_TB_REALTIME) ? ", set from CLOCK_REALTIME" : "");
+	fprintf(f, "stop             %s (timebase %" PRIu64 " ns), %.3f s%s%s%s\n", t1,
+		h->tb_stop_ns, el,
+		(h->flags & PKTREC_FILE_FLAG_LIMIT_SIZE) ? ", size limit" : "",
+		(h->flags & PKTREC_FILE_FLAG_LIMIT_TIME) ? ", duration limit" : "",
+		(h->flags & PKTREC_FILE_FLAG_DMA_ERROR) ? ", ENDED BY A DMA/IO ERROR" : "");
+	fprintf(f, "timebase inc     %.6f ns/cycle\n", (double)h->tb_inc / 4294967296.0);
+	fprintf(f, "data             %" PRIu64 " bytes, %" PRIu64 " records\n", h->data_bytes,
+		h->records);
+	fprintf(f, "recorder         %" PRIu64 " dropped beats, %" PRIu64 " DMA errors%s\n",
+		h->rec_drop_beats, h->dma_errors,
+		(h->rec_drop_beats || h->dma_errors) ? "  ** the record stream has gaps **" : "");
+	fprintf(f, "port  link      %12s %10s %12s %14s %10s %12s\n", "frames_rx", "bad",
+		"dropped", "bytes_rx", "truncated", "records");
+	for (i = 0; i < PKTREC_NUM_PORTS; i++) {
 		const struct pktrec_file_port *p = &h->port[i];
+		char link[16];
 
-		if (!(h->port_mask & (1u << i)) && !p->rx_good && !p->rx_bad)
+		if (!(h->port_mask & (1u << i)))
 			continue;
-		fprintf(f, "P%u     %14" PRIu64 " %10" PRIu64 " %12" PRIu64 " %16" PRIu64
-			" %14" PRIu64 "%s\n", i, p->rx_good, p->rx_bad, p->dropped, p->bytes,
-			p->records, (h->port_mask & (1u << i)) ? "" : "  (not captured)");
+		if (p->flags & PKTREC_FPORT_LINK_UP)
+			snprintf(link, sizeof(link), "%uM", p->speed_mbps);
+		else
+			snprintf(link, sizeof(link), "down");
+		fprintf(f, "%-5.16s %-9s %12" PRIu64 " %10" PRIu64 " %12" PRIu64 " %14" PRIu64
+			" %10" PRIu64 " %12" PRIu64 "\n", p->if_name[0] ? p->if_name : "?", link,
+			p->frames_rx, p->frames_bad, p->frames_drop, p->bytes_rx,
+			p->frames_trunc, p->records);
 	}
 }
 

@@ -237,8 +237,10 @@ def main():
             st = per_if.setdefault(itf.name, {"frames": 0, "test": 0, "other": 0, "bad_fcs": 0,
                                               "truncated": 0, "unreadable": 0,
                                               "ts_backwards": 0, "prev_ts": None,
-                                              "first_ts": None, "last_ts": None, "bytes": 0})
+                                              "first_ts": None, "last_ts": None, "bytes": 0,
+                                              "dropcount": 0})
             st["frames"] += 1
+            st["dropcount"] += pkt.dropcount
             st["bytes"] += pkt.wirelen
             if st["prev_ts"] is not None and pkt.ts < st["prev_ts"]:
                 st["ts_backwards"] += 1
@@ -267,6 +269,7 @@ def main():
         print(f"check_pcap: {a.file}: {ex}")
         sys.exit(2)
 
+    result = {"file": a.file, "interfaces": {}, "streams": []}
     print(f"{a.file}: {len(cap.interfaces)} interfaces, {len(streams)} test streams")
     for itf in cap.interfaces:
         st = per_if.get(itf.name)
@@ -276,11 +279,18 @@ def main():
         if st is None:
             st = {"frames": 0, "test": 0, "other": 0, "bad_fcs": 0, "truncated": 0,
                   "unreadable": 0, "ts_backwards": 0, "first_ts": None, "last_ts": None,
-                  "bytes": 0}
+                  "bytes": 0, "dropcount": 0}
         dur = ((st["last_ts"] - st["first_ts"]) / 1e9) if st["first_ts"] is not None else 0
         print(f"  {itf.name}: {st['frames']} frames ({st['test']} test, {st['other']} other), "
               f"{st['bytes']} bytes on the wire in {dur:.6f} s; bad FCS {st['bad_fcs']}, "
               f"truncated {st['truncated']}, timestamps backwards {st['ts_backwards']}")
+        if st["dropcount"]:
+            print(f"      epb_dropcount total {st['dropcount']} (frames the hardware dropped "
+                  f"between captured frames)")
+        result["interfaces"][itf.name] = {"frames": st["frames"], "test": st["test"],
+                                          "dropcount": st["dropcount"],
+                                          "isb_ifdrop": isb.get("isb_ifdrop"),
+                                          "isb_ifrecv": isb.get("isb_ifrecv")}
         if isb:
             print(f"      ISB: ifrecv {isb.get('isb_ifrecv', '-')}, ifdrop {isb.get('isb_ifdrop', '-')}, "
                   f"filteraccept {isb.get('isb_filteraccept', '-')}, osdrop {isb.get('isb_osdrop', '-')}, "
@@ -305,7 +315,6 @@ def main():
         for ss in sent.get("streams", []):
             sent_streams[ss["key"]] = ss
 
-    result = {"file": a.file, "streams": []}
     for (ifname, key), s in sorted(streams.items()):
         first = count = None
         if key in sent_streams:
