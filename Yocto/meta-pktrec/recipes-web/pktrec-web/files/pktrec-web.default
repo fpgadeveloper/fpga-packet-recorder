@@ -1,0 +1,7 @@
+# pktrec-web settings (read by pktrec-web.service and pktrec-banner.service).
+# The web UI listens on PKTREC_WEB_IFACE only (SO_BINDTODEVICE: it follows
+# DHCP address changes). end0 = the ZCU106 PS Ethernet port (GEM3).
+PKTREC_WEB_IFACE=end0
+PKTREC_WEB_PORT=8080
+# Extra options, e.g. "--bind 0.0.0.0" (all interfaces) or "--rec-dir /mnt/rec"
+PKTREC_WEB_ARGS=

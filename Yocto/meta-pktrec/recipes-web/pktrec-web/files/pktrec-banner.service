@@ -1,0 +1,19 @@
+# Print the web UI address on the UART console (and in the journal) once the
+# PS Ethernet port has an IPv4 address (DHCP). The login prompt shows it too,
+# via /etc/issue.d/pktrec-web.issue.
+[Unit]
+Description=Show the pktrec web UI address on the console
+Wants=network-online.target
+After=network-online.target pktrec-web.service
+
+[Service]
+# simple, not oneshot: never hold up multi-user.target while DHCP is pending
+Type=simple
+EnvironmentFile=-/etc/default/pktrec-web
+ExecStart=/usr/bin/python3 /usr/bin/pktrec-web --banner --interface ${PKTREC_WEB_IFACE} --port ${PKTREC_WEB_PORT} --wait 180
+StandardOutput=journal+console
+# no address after 180 s is reported but is not a failed boot
+SuccessExitStatus=1
+
+[Install]
+WantedBy=multi-user.target

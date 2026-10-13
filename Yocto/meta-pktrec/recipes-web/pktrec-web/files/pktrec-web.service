@@ -1,0 +1,22 @@
+# FPGA Packet Recorder web interface (sw/pktrec-web).
+# Runs as root: it drives pktrec-cap (/dev/fdrec0, hugepages, the capture
+# block's UIO registers, O_DIRECT writes to the SSD) and pktrec-phy (UIO
+# registers, MDIO lock in /run/lock), which all need root, and it binds to the
+# GEM with SO_BINDTODEVICE. No authentication: keep the board on a trusted network.
+[Unit]
+Description=FPGA Packet Recorder web interface (pktrec-web)
+Wants=network-online.target
+After=network-online.target pktrec-phy-watch.service local-fs.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/pktrec-web
+ExecStart=/usr/bin/python3 -u /usr/bin/pktrec-web -q --interface ${PKTREC_WEB_IFACE} --port ${PKTREC_WEB_PORT} $PKTREC_WEB_ARGS
+Restart=on-failure
+RestartSec=3
+# On stop, a running capture is ended cleanly (pktrec-cap gets SIGTERM, writes
+# the final header); leave it time to flush the ring to the SSD.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
