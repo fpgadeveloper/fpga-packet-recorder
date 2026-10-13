@@ -12,6 +12,10 @@
  *                 datapath (per-port idle / loopback / forward), frame counters,
  *                 PHY GPIO_0/1 and power-good inputs
  *                 PS address 0x4_2002_0000, 4 KB
+ *   PKTREC_CAP_*  pktrec_capture (Vivado/src/hdl/pktrec_cap_regs.sv; hierarchy
+ *                 capture): capture control, per-port capture counters, record
+ *                 merge statistics and the shared timebase (PHC)
+ *                 PS address 0x4_2003_0000, 4 KB
  *
  * Both blocks are bound to generic-uio in the device tree (user space maps them
  * through /dev/uioN; sw/pktrec-tools/pktrec-phy). All registers are 32 bits wide;
@@ -33,6 +37,8 @@
 #define PKTREC_ETH_SIZE            0x80000
 #define PKTREC_M0_BASE             0x420020000ULL
 #define PKTREC_M0_SIZE             0x1000
+#define PKTREC_CAP_BASE            0x420030000ULL
+#define PKTREC_CAP_SIZE            0x1000
 
 #define PKTREC_NUM_PORTS           4
 #define PKTREC_PHY_ADDR(n)         ((n) == 0 ? 0x01 : (n) == 1 ? 0x03 : (n) == 2 ? 0x0C : 0x0F)
@@ -137,5 +143,133 @@
 #define PKTREC_M0_P_DROP_FWD       0x14    /* frames for TX n dropped by the FWD FIFO */
 #define PKTREC_M0_P_GPIO0_EDGES    0x18    /* rising edges of GPIO_0 (RX SFD) */
 #define PKTREC_M0_P_GPIO1_EDGES    0x1C    /* rising edges of GPIO_1 (TX SFD) */
+
+/* ------------------------------------------------------------------------- */
+/* pktrec_capture: capture control, counters and timebase (dp_clk domain)    */
+/* ------------------------------------------------------------------------- */
+/*
+ * Datapath (see docs/source/design.md "Capture path"): per port n the MAC RX
+ * stream is tapped (in parallel with the TAP forward path), each frame is
+ * stored whole in a 16 KB per-port frame FIFO (dropped whole and counted when
+ * it does not fit), turned into a record (include/pktrec_format.h) and the
+ * records of the four ports are merged round robin into ONE 128-bit stream
+ * that goes straight into the fdrec packetizer with back-pressure (bypassing
+ * fdrec_ingest's beat-dropping FIFO) when CTRL.SRC_SEL = 1.
+ *
+ * 64-bit counters are _LO/_HI pairs: reading _LO latches the matching _HI
+ * (one latch per counter), so read _LO then _HI. Counters that originate in a
+ * port's RX clock arrive as one coherent per-port snapshot, at most ~0.5 us old.
+ *
+ * Capture start (with the fdrec driver; the capture app does this):
+ *   1. CTRL = SRC_SEL (ENABLE = 0, FILL = 0); optionally TB_SET to CLOCK_REALTIME
+ *   2. CTRL |= CLEAR (counters and seq := 0; self-clearing)
+ *   3. PORT_EN / SNAPLEN (only while ENABLE = 0)
+ *   4. FDREC_IOC_START without the TPG flag (SOFT_RST + packetizer enable)
+ *   5. CTRL = SRC_SEL | ENABLE  -- ports accept frames that START from now on
+ * Capture stop:
+ *   1. CTRL = SRC_SEL           -- frames in progress complete, no new ones
+ *   2. poll STATUS.IDLE = 1     -- every accepted frame is now a record that
+ *                                  the merge has handed to the recorder
+ *   3. read BYTES_OUT (= valid stream bytes) and the counters
+ *   4. CTRL = SRC_SEL | FILL    -- zero fill units push the tail through the
+ *                                  DMA at up to 4 GB/s
+ *   5. keep collecting filled buffers until the total >= BYTES_OUT (the rest of
+ *      the last buffer is fill), then FDREC_IOC_STOP (its drain completes at
+ *      once because FILL keeps the DMA fed), then CTRL = SRC_SEL (FILL off)
+ * The fdrec driver discards buffers that are still queued or uncollected at
+ * STOP, so collect up to BYTES_OUT BEFORE calling STOP.
+ * A recorder SOFT_RST (every FDREC_IOC_START) while the merge is mid-record
+ * discards the rest of that record (SRST_ABORTS), so the recorded stream always
+ * starts on a record boundary.
+ */
+#define PKTREC_CAP_ID              0x000   /* RO 0x504B4350 "PKCP" */
+#define PKTREC_CAP_ID_VALUE        0x504B4350
+#define PKTREC_CAP_VERSION         0x004   /* RO 0x00010000 (record format v1) */
+#define PKTREC_CAP_CTRL            0x008   /* RW */
+#define   PKTREC_CAP_CTRL_ENABLE         (1u << 0)   /* global capture enable (reset 0);
+                                                        sampled at each frame's start */
+#define   PKTREC_CAP_CTRL_FILL           (1u << 1)   /* merge sends all-zero fill units
+                                                        whenever it has no record */
+#define   PKTREC_CAP_CTRL_SRC_SEL        (1u << 2)   /* recorder source: 0 = fdrec TPG via
+                                                        fdrec_ingest (reset; fdrec --rate
+                                                        tests), 1 = capture records */
+#define   PKTREC_CAP_CTRL_CLEAR          (1u << 8)   /* self-clearing: clear every counter,
+                                                        HWM and seq (reads 0) */
+#define PKTREC_CAP_STATUS          0x00C   /* RO */
+#define   PKTREC_CAP_STATUS_IDLE         (1u << 0)   /* no frame in progress or queued on any
+                                                        port, merge empty */
+#define   PKTREC_CAP_STATUS_MERGE_BUSY   (1u << 1)   /* merge inside a record */
+#define   PKTREC_CAP_STATUS_PORT_IDLE_SHIFT 8        /* [11:8] per-port idle */
+#define   PKTREC_CAP_STATUS_RX_ACTIVE_SHIFT 12       /* [15:12] port receiving a captured frame */
+#define   PKTREC_CAP_STATUS_TB_LOCKED_SHIFT 16       /* [23:16] = TB_STATUS[7:0] */
+#define PKTREC_CAP_PORT_EN         0x010   /* RW [3:0] per-port capture enable (reset 0xF);
+                                              change only while CTRL.ENABLE = 0 */
+#define PKTREC_CAP_SNAPLEN         0x014   /* RW [15:0] max bytes stored per frame (FCS
+                                              excluded); 0 = whole frames (reset 0);
+                                              change only while CTRL.ENABLE = 0 */
+#define PKTREC_CAP_DP_CLK_HZ       0x018   /* RO dp_clk frequency (timebase clock) */
+#define PKTREC_CAP_PORT_FIFO_BYTES 0x01C   /* RO per-port frame FIFO size (16384) */
+#define PKTREC_CAP_BYTES_OUT_LO    0x020   /* RO 64: record bytes handed to the recorder */
+#define PKTREC_CAP_BYTES_OUT_HI    0x024
+#define PKTREC_CAP_RECORDS_OUT_LO  0x028   /* RO 64: records handed to the recorder */
+#define PKTREC_CAP_RECORDS_OUT_HI  0x02C
+#define PKTREC_CAP_FILL_BEATS_LO   0x030   /* RO 64: 16-byte fill units sent */
+#define PKTREC_CAP_FILL_BEATS_HI   0x034
+#define PKTREC_CAP_BP_CYCLES_LO    0x038   /* RO 64: dp_clk cycles a beat waited for the
+                                              recorder (back-pressure) */
+#define PKTREC_CAP_BP_CYCLES_HI    0x03C
+#define PKTREC_CAP_SRST_ABORTS     0x040   /* RO records cut by a recorder SOFT_RST */
+#define PKTREC_CAP_LEN_FIXUPS      0x044   /* RO records whose FIFO data length disagreed
+                                              with cap_len, or that lost their data to a
+                                              port reset (link drop); data zero-filled /
+                                              cut to keep the stream framed; expect 0 */
+
+/*
+ * Timebase (pktrec_timebase): 64-bit ns counter in dp_clk with a 32.32 ns
+ * increment per dp_clk cycle (PHC-style; reset INC = 1e9 / DP_CLK_HZ, i.e.
+ * 4.0004 ns at 249.975 MHz). Distributed to the 4 RX and 4 TX MAC clock domains
+ * with Taxi taxi_ptp_clock_cdc (48.16 ns format; the record header gets the
+ * upper 16 ns bits back from the timebase).
+ *   settime:  TB_SET_LO/HI = t, then TB_CTRL = SET
+ *   adjtime:  TB_ADJ_LO/HI = signed delta ns, then TB_CTRL = ADJ
+ *   adjfine:  TB_INC_FRAC = f, then TB_INC_NS = n (the NS write applies both)
+ *   gettime:  read TB_NOW_LO, then TB_NOW_HI (coherent)
+ * After SET/ADJ the per-domain copies re-lock (TB_STATUS) within ~100 us.
+ */
+#define PKTREC_CAP_TB_CTRL         0x080   /* WO [0] SET, [1] ADJ (reads 0) */
+#define   PKTREC_CAP_TB_CTRL_SET         (1u << 0)
+#define   PKTREC_CAP_TB_CTRL_ADJ         (1u << 1)
+#define PKTREC_CAP_TB_INC_FRAC     0x084   /* RW fractional ns of the increment (2^-32) */
+#define PKTREC_CAP_TB_INC_NS       0x088   /* RW [7:0] integer ns; a write applies
+                                              {INC_NS, INC_FRAC} atomically */
+#define PKTREC_CAP_TB_STATUS       0x08C   /* RO [3:0] RX n copy locked, [7:4] TX n locked */
+#define PKTREC_CAP_TB_NOW_LO       0x090   /* RO 64: current time, ns */
+#define PKTREC_CAP_TB_NOW_HI       0x094
+#define PKTREC_CAP_TB_SET_LO       0x098   /* RW 64: value loaded by TB_CTRL.SET */
+#define PKTREC_CAP_TB_SET_HI       0x09C
+#define PKTREC_CAP_TB_ADJ_LO       0x0A0   /* RW 64 (signed): added by TB_CTRL.ADJ */
+#define PKTREC_CAP_TB_ADJ_HI       0x0A4
+
+/* pktrec_capture: per-port counters at PKTREC_CAP_PORT(n) + offset (64-bit
+ * unless noted). Only frames that START while the port is enabled count.
+ * FRAMES_RX = RECORDS + FRAMES_DROP once STATUS.IDLE = 1. */
+#define PKTREC_CAP_PORT(n)         (0x100 + (n) * 0x40)
+#define PKTREC_CAP_P_FRAMES_RX_LO    0x00  /* frames seen (good + bad, incl. dropped) */
+#define PKTREC_CAP_P_FRAMES_RX_HI    0x04
+#define PKTREC_CAP_P_FRAMES_BAD_LO   0x08  /* of which flagged bad by the MAC */
+#define PKTREC_CAP_P_FRAMES_BAD_HI   0x0C
+#define PKTREC_CAP_P_FRAMES_DROP_LO  0x10  /* dropped whole: FIFO full / oversize */
+#define PKTREC_CAP_P_FRAMES_DROP_HI  0x14
+#define PKTREC_CAP_P_BYTES_RX_LO     0x18  /* wire bytes (incl. FCS) of FRAMES_RX */
+#define PKTREC_CAP_P_BYTES_RX_HI     0x1C
+#define PKTREC_CAP_P_BYTES_DROP_LO   0x20  /* wire bytes of FRAMES_DROP */
+#define PKTREC_CAP_P_BYTES_DROP_HI   0x24
+#define PKTREC_CAP_P_FRAMES_TRUNC_LO 0x28  /* frames cut by SNAPLEN */
+#define PKTREC_CAP_P_FRAMES_TRUNC_HI 0x2C
+#define PKTREC_CAP_P_RECORDS_LO      0x30  /* records handed to the merge */
+#define PKTREC_CAP_P_RECORDS_HI      0x34
+#define PKTREC_CAP_P_FIFO_HWM        0x38  /* RW 32: frame FIFO high-water mark in bytes;
+                                              any write clears it */
+#define PKTREC_CAP_P_SEQ_NEXT        0x3C  /* RO [15:0] seq of the next frame */
 
 #endif /* PKTREC_REGS_H */
