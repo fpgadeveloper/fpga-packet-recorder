@@ -1,0 +1,1157 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Opsero Electronic Design Inc.
+"""pktrec-tb - timebase discipline and calibration of the FPGA Packet Recorder.
+
+The capture block (include/pktrec_regs.h PKTREC_CAP_*, 0x4_2003_0000) holds one
+64-bit nanosecond timebase shared by all four ports: it advances by INC (32.32
+ns, TB_INC_NS/TB_INC_FRAC) on every dp_clk cycle (249.975 MHz), and software can
+SET it, ADJ (add a signed step to) it and read it (TB_NOW). Every capture record
+and every PHY SFD timestamp comes from it. pktrec-tb keeps it on CLOCK_REALTIME
+(which systemd-timesyncd keeps on NTP through the PS Ethernet port) so that
+timestamps are absolute wall-clock times, and it loads and saves the persistent
+calibration (timebase frequency, MAC_OFFSET, SFD windows and per-port offsets).
+
+Commands:
+  status [--json]          timebase vs CLOCK_REALTIME now (offset, INC, ppm vs
+                           nominal), NTP state, and the daemon's state if it runs
+  set [--force]            one-shot TB_SET from CLOCK_REALTIME (what pktrec-cap
+                           does at start); refused while a capture runs
+  trim (--ppm X | --ppb X | --inc 0xNNNNNNNNNN) [--force]
+                           write INC (frequency); a running daemon adopts it
+  daemon [options]         discipline the timebase to CLOCK_REALTIME
+                           (pktrec-tb.service); state in /run/pktrec/tb.json
+  apply-calibration [--file F] [--dry-run] [--force] [--no-timebase]
+                           write /etc/pktrec/calibration.conf to the registers
+                           (pktrec-calibration.service, at boot)
+  save-calibration [--file F | --stdout] [--defaults]
+                           write the current register values (or the design
+                           defaults) as a calibration file
+  show-calibration [--file F] [--json]
+                           registers vs the calibration file, key by key
+
+Daemon (controller, see docs/source/software.md "Timebase discipline"):
+  every --interval s (1): read TB_NOW between two CLOCK_REALTIME reads --samples
+  times (7) and keep the pair with the shortest read latency:
+      offset = TB_NOW - (t1 + t2) / 2         (> 0: the timebase is ahead)
+  start-up: TB_SET (+ one ADJ for the residual), then --estimate s (8) of free
+  running to estimate the frequency error (least-squares slope), INC corrected,
+  TB_SET again; then a PI controller on the frequency:
+      freq_ppb = I - kp * offset / dt,   I += -ki * offset / dt
+  (kp 0.2, ki 0.02; |freq| <= --max-ppm 200, with anti-windup), written as
+  INC = nominal * (1 + freq_ppb * 1e-9), nominal = 2^32 * 1e9 / DP_CLK_HZ.
+  TB_ADJ steps only when |offset| > --adj-threshold (20 us) and no capture
+  runs, at most --max-adj (1 us) per interval. TB_SET only at start-up and when
+  |offset| > --step-threshold (1 s, e.g. NTP stepped the system clock), never
+  while a capture runs. While a capture runs the phase is corrected through the
+  frequency only (an INC change moves a frame waiting in a FIFO by
+  cycles x dINC, picoseconds; a TB_ADJ step would move it by the step).
+  locked = |offset| < --lock-threshold (10 us) for --lock-time (30 s); lost
+  after 3 samples with |offset| > 5 x the threshold, or after a SET / step.
+
+All commands that touch the hardware map the capture block through generic-uio
+(the Regs helper of pktrec-phy, imported from the same directory) or /dev/mem
+(--devmem). --sim <ppm> replaces the hardware with a simulated timebase whose
+oscillator is off by <ppm> (host testing; registers in $PKTREC_RUN_DIR).
+"""
+
+import argparse
+import configparser
+import datetime
+import json
+import math
+import os
+import random
+import signal
+import socket
+import sys
+import time
+
+RUN_DIR = os.environ.get("PKTREC_RUN_DIR", "/run/pktrec")
+TB_STATE = os.path.join(RUN_DIR, "tb.json")
+CAL_STATE = os.path.join(RUN_DIR, "calibration.json")
+CAL_FILE = os.environ.get("PKTREC_CAL_FILE", "/etc/pktrec/calibration.conf")
+STATE_VERSION = 1
+
+# capture block, include/pktrec_regs.h (map 1.2)
+CAP_BASE, CAP_SIZE = 0x4_2003_0000, 0x1000
+CAP_ID, CAP_ID_VALUE, CAP_VERSION = 0x000, 0x504B4350, 0x004
+CAP_CTRL, CTRL_ENABLE, CTRL_FILL = 0x008, 0x1, 0x2
+CAP_DP_CLK_HZ = 0x018
+TB_CTRL, TB_CTRL_SET, TB_CTRL_ADJ = 0x080, 0x1, 0x2
+TB_INC_FRAC, TB_INC_NS, TB_STATUS = 0x084, 0x088, 0x08C
+TB_NOW_LO, TB_SET_LO, TB_ADJ_LO = 0x090, 0x098, 0x0A0
+MAC_OFFSET = 0x0A8
+SFD_CTRL, SFD_MATCH_EN = 0x400, 0x1
+SFD_RX_WIN_MIN, SFD_RX_WIN_MAX, SFD_TX_WIN_MIN, SFD_TX_WIN_MAX = 0x410, 0x414, 0x418, 0x41C
+SFD_MIN_LOW, SFD_MIN_HIGH = 0x420, 0x424
+SFD_PORT_BASE, SFD_PORT_STRIDE, SFD_P_RX_OFFSET, SFD_P_TX_OFFSET = 0x800, 0x100, 0x38, 0xB8
+DP_CLK_HZ_DEFAULT = 249975006
+NUM_PORTS = 4
+FRAME_TIME_64B_NS = 672           # minimum frame start-to-start at 1 Gb/s (SFD window bound)
+
+# Calibration registers: key -> (section, offset, kind, design default)
+#   kind "s" = signed 32-bit ns, "u8" = 8-bit cycles, "en" = SFD_CTRL.MATCH_EN bit
+CAL_REGS = [
+    ("capture", "mac_offset_ns", MAC_OFFSET, "s", 52),
+    ("sfd", "match", SFD_CTRL, "en", 1),
+    ("sfd", "rx_window_min_ns", SFD_RX_WIN_MIN, "s", 100),
+    ("sfd", "rx_window_max_ns", SFD_RX_WIN_MAX, "s", 700),
+    ("sfd", "tx_window_min_ns", SFD_TX_WIN_MIN, "s", 0),
+    ("sfd", "tx_window_max_ns", SFD_TX_WIN_MAX, "s", 900),
+    ("sfd", "min_low_cycles", SFD_MIN_LOW, "u8", 25),
+    ("sfd", "min_high_cycles", SFD_MIN_HIGH, "u8", 8),
+] + [(f"port{n}", f"{d}_offset_ns", SFD_PORT_BASE + n * SFD_PORT_STRIDE + off, "s", 0)
+     for n in range(NUM_PORTS) for d, off in (("rx", SFD_P_RX_OFFSET), ("tx", SFD_P_TX_OFFSET))]
+
+
+def s32(v):
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
+def iso_ns(ns):
+    if not ns:
+        return None
+    return datetime.datetime.fromtimestamp(ns / 1e9, datetime.timezone.utc) \
+        .isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def fmt_ns(v):
+    """Signed nanoseconds, human scale."""
+    if v is None:
+        return "-"
+    a = abs(v)
+    if a >= 1e9:
+        return f"{v / 1e9:+.6f} s"
+    if a >= 1e6:
+        return f"{v / 1e6:+.3f} ms"
+    if a >= 1e3:
+        return f"{v / 1e3:+.3f} us"
+    return f"{v:+.0f} ns"
+
+
+# ---------------------------------------------------------------------------
+# hardware: the capture block's timebase and calibration registers
+# ---------------------------------------------------------------------------
+def load_pktrec_phy():
+    """Import pktrec-phy (same directory, else /usr/bin) for its Regs/UIO helper."""
+    import importlib.machinery
+    import importlib.util
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(here, "pktrec-phy"), "/usr/bin/pktrec-phy"):
+        if os.path.isfile(path):
+            sys.dont_write_bytecode = True        # no __pycache__ next to /usr/bin
+            loader = importlib.machinery.SourceFileLoader("pktrec_phy", path)
+            spec = importlib.util.spec_from_loader("pktrec_phy", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise SystemExit("pktrec-tb: pktrec-phy not found (needed for the register access)")
+
+
+class Hw:
+    """Timebase + calibration registers of the capture block (UIO or /dev/mem)."""
+
+    def __init__(self, devmem=False):
+        phy = load_pktrec_phy()
+        self.r = phy.Regs(CAP_BASE, CAP_SIZE, devmem)
+        cid = self.r.rd(CAP_ID)
+        if cid != CAP_ID_VALUE:
+            raise SystemExit(f"pktrec-tb: capture block ID 0x{cid:08x}, expected "
+                             f"0x{CAP_ID_VALUE:08x} (wrong bitstream?)")
+        self.version = self.r.rd(CAP_VERSION)
+        self.dp_clk_hz = self.r.rd(CAP_DP_CLK_HZ) or DP_CLK_HZ_DEFAULT
+        self.has_sfd = self.version >= 0x00010002
+        self.src = self.r.src
+
+    def rd(self, off):
+        return self.r.rd(off)
+
+    def wr(self, off, v):
+        self.r.wr(off, v & 0xFFFFFFFF)
+
+    def now_ns(self):
+        lo = self.r.rd(TB_NOW_LO)                 # the LO read latches HI
+        return lo | (self.r.rd(TB_NOW_LO + 4) << 32)
+
+    def set_ns(self, t):
+        self.wr(TB_SET_LO, t)
+        self.wr(TB_SET_LO + 4, t >> 32)
+        self.wr(TB_CTRL, TB_CTRL_SET)
+
+    def adj_ns(self, d):
+        v = int(d) & 0xFFFFFFFFFFFFFFFF
+        self.wr(TB_ADJ_LO, v)
+        self.wr(TB_ADJ_LO + 4, v >> 32)
+        self.wr(TB_CTRL, TB_CTRL_ADJ)
+
+    def inc_raw(self):
+        return ((self.r.rd(TB_INC_NS) & 0xFF) << 32) | self.r.rd(TB_INC_FRAC)
+
+    def set_inc_raw(self, v):
+        self.wr(TB_INC_FRAC, v)
+        self.wr(TB_INC_NS, (v >> 32) & 0xFF)       # the NS write applies both
+
+    def tb_status(self):
+        return self.r.rd(TB_STATUS) & 0xFF
+
+    def capture_running(self):
+        """Frames are being stamped into a recording (ENABLE) or drained (FILL)."""
+        return bool(self.r.rd(CAP_CTRL) & (CTRL_ENABLE | CTRL_FILL))
+
+
+class SimHw(Hw):
+    """Simulated capture block for host tests: a timebase whose oscillator is off by
+    err_ppm, measurement jitter noise_ns, registers persisted in RUN_DIR (so that
+    separate CLI invocations see one board)."""
+
+    def __init__(self, err_ppm, clock=None, noise_ns=0.0, persist=True, seed=1):
+        self.clock = clock or SysClock()
+        self.err = err_ppm * 1e-6
+        self.noise = noise_ns
+        self.rng = random.Random(seed)
+        self.version = 0x00010002
+        self.dp_clk_hz = DP_CLK_HZ_DEFAULT
+        self.has_sfd = True
+        self.src = "simulation"
+        self.path = os.path.join(RUN_DIR, "sim-regs.json") if persist else None
+        self.cap_ctrl = 0
+        self.log = []                               # (what, value) of every SET/ADJ/INC
+        st = None
+        if self.path:
+            try:
+                with open(self.path) as f:
+                    st = json.load(f)
+            except (OSError, ValueError):
+                st = None
+        if st and st.get("err_ppm") == err_ppm:
+            self.regs = {int(k): v for k, v in st["regs"].items()}
+            self.base_true, self.base_tb = st["base_true"], st["base_tb"]
+        else:
+            self.regs = {off: (dflt if kind != "en" else 1) & 0xFFFFFFFF
+                         for _, _, off, kind, dflt in CAL_REGS}
+            self.regs[SFD_CTRL] = 1
+            self.regs[TB_INC_FRAC], self.regs[TB_INC_NS] = nominal_inc_raw(self.dp_clk_hz) & \
+                0xFFFFFFFF, nominal_inc_raw(self.dp_clk_hz) >> 32
+            self.base_true, self.base_tb = self.clock.true_ns(), 0
+        self.save()
+
+    def save(self):
+        if self.path:
+            os.makedirs(RUN_DIR, exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"err_ppm": self.err * 1e6, "regs": self.regs,
+                           "base_true": self.base_true, "base_tb": self.base_tb}, f)
+            os.replace(tmp, self.path)
+
+    def _rate(self):
+        return self.inc_raw() / nominal_inc_raw(self.dp_clk_hz) * (1 + self.err)
+
+    def _tb(self):
+        return self.base_tb + (self.clock.true_ns() - self.base_true) * self._rate()
+
+    def _rebase(self, tb):
+        self.base_true, self.base_tb = self.clock.true_ns(), tb
+
+    def rd(self, off):
+        if off == CAP_CTRL:
+            return self.cap_ctrl
+        return self.regs.get(off, 0)
+
+    def wr(self, off, v):
+        if off == CAP_CTRL:
+            self.cap_ctrl = v
+            return
+        self.regs[off] = v & 0xFFFFFFFF
+        self.save()
+
+    def now_ns(self):
+        n = self.rng.gauss(0, self.noise) if self.noise else 0.0
+        return int(self._tb() + n)
+
+    def set_ns(self, t):
+        self._rebase(int(t))
+        self.log.append((self.clock.true_ns(),) + ("set", int(t)))
+        self.save()
+
+    def adj_ns(self, d):
+        self._rebase(self._tb() + int(d))
+        self.log.append((self.clock.true_ns(),) + ("adj", int(d)))
+        self.save()
+
+    def inc_raw(self):
+        return ((self.regs[TB_INC_NS] & 0xFF) << 32) | self.regs[TB_INC_FRAC]
+
+    def set_inc_raw(self, v):
+        self._rebase(self._tb())
+        self.regs[TB_INC_FRAC], self.regs[TB_INC_NS] = v & 0xFFFFFFFF, (v >> 32) & 0xFF
+        self.log.append((self.clock.true_ns(),) + ("inc", v))
+        self.save()
+
+    def tb_status(self):
+        return 0xFF
+
+    def capture_running(self):
+        return bool(self.cap_ctrl & (CTRL_ENABLE | CTRL_FILL))
+
+
+class SysClock:
+    """CLOCK_REALTIME / CLOCK_MONOTONIC of this system."""
+    realtime_ns = staticmethod(time.time_ns)
+    true_ns = staticmethod(time.monotonic_ns)     # the simulation's reference
+
+    @staticmethod
+    def monotonic():
+        return time.monotonic()
+
+    @staticmethod
+    def sleep(s):
+        if s > 0:
+            time.sleep(s)
+
+
+def nominal_inc_raw(dp_clk_hz):
+    return round((1 << 32) * 1e9 / dp_clk_hz)
+
+
+def inc_to_ppb(inc, dp_clk_hz):
+    return (inc / nominal_inc_raw(dp_clk_hz) - 1.0) * 1e9
+
+
+def ppb_to_inc(ppb, dp_clk_hz):
+    return round(nominal_inc_raw(dp_clk_hz) * (1.0 + ppb * 1e-9))
+
+
+def measure(hw, clock, samples=7):
+    """Timebase - CLOCK_REALTIME (ns) from the read pair with the shortest latency."""
+    best = None
+    for _ in range(max(1, samples)):
+        t1 = clock.realtime_ns()
+        tb = hw.now_ns()
+        t2 = clock.realtime_ns()
+        lat = t2 - t1
+        if best is None or lat < best[1]:
+            best = (tb - (t1 + lat // 2), lat, t2)
+    return best                                    # (offset_ns, latency_ns, realtime_ns)
+
+
+def ntp_synced():
+    """True/False from adjtimex (STA_UNSYNC -> TIME_ERROR), else None."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        buf = ctypes.create_string_buffer(256)    # struct timex, modes = 0 (read only)
+        r = libc.adjtimex(buf)
+        if r >= 0:
+            return r != 5                          # TIME_ERROR
+    except (ImportError, OSError, AttributeError):
+        pass
+    if os.path.isdir("/run/systemd/timesync"):
+        return os.path.exists("/run/systemd/timesync/synchronized")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# daemon state file (/run/pktrec/tb.json), read by pktrec-web and pktrec-cap
+# ---------------------------------------------------------------------------
+def write_json_atomic(path, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_state(path=TB_STATE, now_ns=None):
+    """The daemon's state, with 'fresh' = updated recently by a live process."""
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    now_ns = now_ns or time.time_ns()
+    age = (now_ns - st.get("updated_ns", 0)) / 1e9
+    alive = True
+    pid = st.get("pid")
+    if pid:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            pass
+    st["age_s"] = round(age, 3)
+    st["fresh"] = bool(alive and st.get("running") and
+                       -5 < age < 3 * st.get("interval_s", 1.0) + 5)
+    return st
+
+
+class Servo:
+    """PI controller on the timebase frequency (ppb); offset in ns, dt in s."""
+
+    def __init__(self, kp, ki, max_ppb):
+        self.kp, self.ki, self.max = kp, ki, max_ppb
+        self.i = 0.0
+
+    def reset(self, ppb):
+        self.i = max(-self.max, min(self.max, ppb))
+
+    def update(self, x_ns, dt, integrate=True):
+        dt = max(dt, 1e-3)
+        p = -self.kp * x_ns / dt
+        i = self.i - self.ki * x_ns / dt if integrate else self.i
+        i = max(-self.max, min(self.max, i))
+        out = i + p
+        if out > self.max or out < -self.max:
+            out = max(-self.max, min(self.max, out))
+            # anti-windup: integrate only toward the unsaturated side
+            if integrate and abs(i) > abs(self.i):
+                i = self.i
+        self.i = i
+        return out
+
+
+class Daemon:
+    def __init__(self, hw, clock, o, out=sys.stdout, state_path=TB_STATE):
+        self.hw, self.clock, self.o, self.out, self.state_path = hw, clock, o, out, state_path
+        self.max_ppb = o.max_ppm * 1e3
+        self.servo = Servo(o.kp, o.ki, self.max_ppb)
+        self.st = {
+            "version": STATE_VERSION, "pid": os.getpid(), "running": True,
+            "state": "startup", "locked": False, "locked_since_ns": None,
+            "offset_ns": None, "offset_abs_max_30s_ns": None, "offset_rms_30s_ns": None,
+            "latency_ns": None, "freq_ppb": None, "freq_est_ppb": None, "ppm": None,
+            "inc_raw": None, "inc_ns": None, "dp_clk_hz": hw.dp_clk_hz,
+            "last_set_ns": None, "last_set_reason": None, "sets": 0, "adj_steps": 0,
+            "adj_total_ns": 0, "steps_detected": 0, "ntp_synced": None,
+            "capture_running": None, "started_ns": clock.realtime_ns(),
+            "interval_s": o.interval, "lock_threshold_ns": o.lock_threshold,
+            "lock_time_s": o.lock_time, "max_ppm": o.max_ppm,
+            "max_adj_ns": o.max_adj, "step_threshold_ns": o.step_threshold,
+            "source": hw.src, "message": None,
+        }
+        self.good = 0.0             # seconds with |offset| < lock threshold
+        self.bad = 0                # consecutive samples beyond the unlock threshold
+        self.hist = []              # (mono, offset) of the last lock_time seconds
+        self.est = []               # (mono, offset) while estimating the frequency
+        self.prev = None            # (mono, offset, adj applied after it)
+        self.inc_written = None
+        self.stop = False
+        self.ntp_t = -1e9
+        self.warned_cap = False
+        self.next_summary = 0.0
+
+    # ---- helpers ----
+    def log(self, msg):
+        self.st["message"] = msg
+        print(f"pktrec-tb: {msg}", file=self.out, flush=True)
+
+    def write_freq(self, ppb):
+        ppb = max(-self.max_ppb, min(self.max_ppb, ppb))
+        inc = ppb_to_inc(ppb, self.hw.dp_clk_hz)
+        if inc != self.inc_written:
+            self.hw.set_inc_raw(inc)
+            self.inc_written = inc
+        self.st.update(freq_ppb=round(ppb, 3), ppm=round(ppb / 1e3, 6), inc_raw=f"0x{inc:010x}",
+                       inc_ns=inc / 2 ** 32)
+        return ppb
+
+    def do_set(self, reason):
+        t = self.clock.realtime_ns()
+        self.hw.set_ns(t)
+        x, _, _ = measure(self.hw, self.clock, self.o.samples)
+        if abs(x) < 1e6:            # the register writes took a few us: one ADJ for the rest
+            self.hw.adj_ns(-x)
+        self.st["sets"] += 1
+        self.st["last_set_ns"] = t
+        self.st["last_set_reason"] = reason
+        self.prev = None
+        self.unlock("timebase set")
+        self.log(f"TB_SET from CLOCK_REALTIME ({reason}), residual {fmt_ns(x)} corrected")
+
+    def unlock(self, why):
+        if self.st["locked"]:
+            self.log(f"lock lost: {why}")
+        self.st["locked"] = False
+        self.st["locked_since_ns"] = None
+        self.good = 0.0
+        self.bad = 0
+        self.hist = []
+
+    # ---- start-up ----
+    def startup(self):
+        inc = self.hw.inc_raw()
+        f0 = inc_to_ppb(inc, self.hw.dp_clk_hz)
+        if abs(f0) > self.max_ppb:
+            self.log(f"INC 0x{inc:010x} = {f0 / 1e3:+.3f} ppm is outside +-{self.o.max_ppm} ppm; "
+                     "starting from 0")
+            f0 = 0.0
+        self.servo.reset(f0)
+        self.inc_written = None
+        self.write_freq(f0)
+        self.log(f"start: dp_clk {self.hw.dp_clk_hz} Hz, INC from calibration "
+                 f"{f0 / 1e3:+.3f} ppm, interval {self.o.interval} s, kp {self.o.kp} ki {self.o.ki}, "
+                 f"lock < {fmt_ns(self.o.lock_threshold)} for {self.o.lock_time} s")
+        x, _, _ = measure(self.hw, self.clock, self.o.samples)
+        if self.hw.capture_running():
+            self.log(f"a capture is running: no TB_SET at start-up (offset {fmt_ns(x)})")
+            self.st["state"] = "estimating" if abs(x) < self.o.step_threshold else "waiting"
+        elif self.o.no_set:
+            self.log(f"--no-set: offset {fmt_ns(x)} left as is")
+            self.st["state"] = "estimating"
+        else:
+            self.do_set("start-up")
+            self.st["state"] = "estimating"
+        self.est = []
+
+    # ---- one control step ----
+    def step(self):
+        o, hw = self.o, self.hw
+        mono = self.clock.monotonic()
+        x, lat, t_rt = measure(hw, self.clock, o.samples)
+        cap = hw.capture_running()
+        if mono - self.ntp_t > 10:
+            self.st["ntp_synced"] = ntp_synced()
+            self.ntp_t = mono
+        self.st.update(offset_ns=int(x), latency_ns=int(lat), capture_running=cap,
+                       measured_ns=t_rt)
+        # external change of INC (pktrec-tb trim / apply-calibration): adopt it
+        inc = hw.inc_raw()
+        if self.inc_written is not None and inc != self.inc_written:
+            f = inc_to_ppb(inc, hw.dp_clk_hz)
+            self.log(f"INC changed externally to 0x{inc:010x} ({f / 1e3:+.3f} ppm): adopted")
+            self.servo.reset(f)
+            self.inc_written = inc
+            self.prev = None
+
+        # huge offset: system clock stepped (NTP sync after boot), or someone SET us
+        if abs(x) > o.step_threshold:
+            if not cap and not o.no_set:
+                self.do_set(f"offset {fmt_ns(x)} > step threshold")
+                if self.st["state"] == "waiting":
+                    self.st["state"] = "estimating"
+                    self.est = []
+                return self.finish(mono)
+            if self.st["state"] == "waiting":
+                return self.finish(mono)
+            if not self.warned_cap:
+                self.log(f"offset {fmt_ns(x)} beyond the step threshold"
+                         + (" while a capture runs: slewing only, TB_SET once it has ended"
+                            if cap else " (--no-set): slewing only"))
+                self.warned_cap = True
+        else:
+            self.warned_cap = False
+            if self.st["state"] == "waiting":
+                self.st["state"] = "estimating"
+                self.est = []
+
+        if self.st["state"] == "estimating":
+            self.est.append((mono, x))
+            span = self.est[-1][0] - self.est[0][0]
+            if span >= o.estimate and len(self.est) >= 3:
+                slope = lsq_slope(self.est)          # ns/s = ppb (timebase too fast > 0)
+                f = self.servo.i - slope
+                self.servo.reset(f)
+                f = self.write_freq(self.servo.i)
+                self.log(f"frequency estimate: timebase {slope / 1e3:+.3f} ppm vs CLOCK_REALTIME "
+                         f"over {span:.1f} s -> INC trim {f / 1e3:+.3f} ppm")
+                self.st["state"] = "tracking"
+                self.est = []
+                if not cap and not o.no_set and abs(x) > o.lock_threshold / 2:
+                    self.do_set("start-up, after the frequency estimate")
+            return self.finish(mono)
+
+        # ---- tracking ----
+        integrate = True
+        if self.prev is not None:
+            pm, px, padj = self.prev
+            dtp = mono - pm
+            jump = x - (px + padj)
+            bound = 1e6 + 2 * self.max_ppb * dtp           # 1 ms + worst-case slew
+            if abs(jump) > bound:
+                self.st["steps_detected"] += 1
+                self.log(f"step of {fmt_ns(jump)} detected (system clock or timebase set "
+                         "by someone else)")
+                self.unlock("step")
+                integrate = False
+            dt = dtp
+        else:
+            dt = o.interval
+        adj = 0
+        if not cap and abs(x) > o.adj_threshold:
+            adj = -max(-o.max_adj, min(o.max_adj, x))
+            hw.adj_ns(adj)
+            self.st["adj_steps"] += 1
+            self.st["adj_total_ns"] += int(adj)
+        f = self.servo.update(x, dt, integrate)
+        self.write_freq(f)
+        self.st["freq_est_ppb"] = round(self.servo.i, 3)
+        self.prev = (mono, x, adj)
+
+        # lock state
+        self.hist = [(m, v) for m, v in self.hist if mono - m < o.lock_time] + [(mono, x)]
+        vals = [v for _, v in self.hist]
+        self.st["offset_abs_max_30s_ns"] = int(max(abs(v) for v in vals))
+        self.st["offset_rms_30s_ns"] = int(math.sqrt(sum(v * v for v in vals) / len(vals)))
+        if abs(x) < o.lock_threshold:
+            self.good += dt
+            self.bad = 0
+        else:
+            self.good = 0.0
+            if abs(x) > 5 * o.lock_threshold:
+                self.bad += 1
+        if not self.st["locked"] and self.good >= o.lock_time:
+            self.st["locked"] = True
+            self.st["locked_since_ns"] = t_rt
+            self.log(f"locked: |offset| < {fmt_ns(o.lock_threshold)} for {o.lock_time} s, "
+                     f"rms {fmt_ns(self.st['offset_rms_30s_ns'])}, "
+                     f"frequency trim {self.servo.i / 1e3:+.3f} ppm")
+        elif self.st["locked"] and self.bad >= 3:
+            self.unlock(f"|offset| {fmt_ns(x)} > {fmt_ns(5 * o.lock_threshold)} for 3 samples")
+        return self.finish(mono)
+
+    def finish(self, mono):
+        st = self.st
+        st["updated_ns"] = self.clock.realtime_ns()
+        st["updated"] = iso_ns(st["updated_ns"])
+        st["last_set"] = iso_ns(st["last_set_ns"])
+        st["locked_since"] = iso_ns(st["locked_since_ns"])
+        if self.state_path:
+            try:
+                write_json_atomic(self.state_path, st)
+            except OSError as e:
+                self.log(f"cannot write {self.state_path}: {e}")
+        if self.o.verbose:
+            print(f"pktrec-tb: {st['state']:10s} offset {fmt_ns(st['offset_ns']):>13} "
+                  f"lat {st['latency_ns']} ns freq {st['freq_ppb']} ppb"
+                  f"{' LOCKED' if st['locked'] else ''}{' CAPTURE' if st['capture_running'] else ''}",
+                  file=self.out, flush=True)
+        elif mono >= self.next_summary and st["state"] == "tracking":
+            self.next_summary = mono + self.o.summary
+            print(f"pktrec-tb: {'locked' if st['locked'] else 'tracking'}, offset "
+                  f"{fmt_ns(st['offset_ns'])} (rms {fmt_ns(st['offset_rms_30s_ns'])}, max "
+                  f"{fmt_ns(st['offset_abs_max_30s_ns'])} over {self.o.lock_time} s), trim "
+                  f"{(st['freq_ppb'] or 0) / 1e3:+.3f} ppm, NTP "
+                  f"{ {True: 'synced', False: 'NOT synced', None: '?'}[st['ntp_synced']] }",
+                  file=self.out, flush=True)
+        return st
+
+    def shutdown(self):
+        self.st.update(running=False, state="stopped", locked=False)
+        self.log("stopped (INC left at the last trim: free-running holdover)")
+        self.finish(self.clock.monotonic())
+
+    def run(self, duration=None):
+        self.startup()
+        t_next = self.clock.monotonic()
+        t_end = t_next + duration if duration else None
+        while not self.stop:
+            self.step()
+            t_next += self.o.interval
+            now = self.clock.monotonic()
+            if t_next < now:                       # overrun: skip, keep the phase
+                t_next = now + self.o.interval
+            if t_end is not None and t_next > t_end:
+                break
+            self.clock.sleep(t_next - now)
+        self.shutdown()
+
+
+def lsq_slope(pts):
+    n = len(pts)
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    sxx = sum((p[0] - mx) ** 2 for p in pts)
+    sxy = sum((p[0] - mx) * (p[1] - my) for p in pts)
+    return sxy / sxx if sxx > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# calibration file
+# ---------------------------------------------------------------------------
+CAL_HEADER = """\
+# FPGA Packet Recorder calibration ({origin})
+#
+# Applied at boot by pktrec-calibration.service ('pktrec-tb apply-calibration'),
+# after the PHY init (pktrec-phy-watch.service) and before pktrec-tb.service and
+# pktrec-web.service. Write it from the board's current registers with
+# 'pktrec-tb save-calibration' once the bench calibration (docs: software.md,
+# "Calibration") has set them; check with 'pktrec-tb show-calibration'.
+# A missing key leaves that register at its bitstream reset value (the design
+# defaults below). The values hold for one bitstream build: re-calibrate after
+# every bitstream change (the SFD sampler's clock phase moves between builds).
+# Package updates never overwrite this file (CONFFILES).
+"""
+
+CAL_BODY = """
+[timebase]
+# Frequency of the 64-bit ns timebase (dp_clk, nominally {dp} Hz) relative to
+# the nominal increment 1e9/DP_CLK_HZ: INC = nominal x (1 + ppm / 1e6);
+# > 0 = the timebase runs faster. pktrec-tb.service starts from this value and
+# keeps disciplining it to CLOCK_REALTIME (NTP); a good value makes it lock
+# sooner and is the holdover frequency when the daemon is stopped. The M1 bench
+# board needed about +10.4 ppm.
+ppm = {ppm}
+
+[capture]
+# PKTREC_CAP_MAC_OFFSET (0x0A8), signed ns added to MAC-fallback timestamps
+# (records with flags bit2 = TS_MAC). Calibrated: RX_OFFSET - median(RX_DELTA),
+# so MAC-fallback records land on the SFD scale (+-16 ns). Design default 52.
+mac_offset_ns = {mac_offset_ns}
+
+[sfd]
+# PHY SFD timestamping (PKTREC_SFD_*, capture map 1.2). The windows are global
+# (all four ports share them).
+# match: on = records carry the PHY RX SFD timestamp (SFD_CTRL.MATCH_EN),
+# off = every record is MAC-stamped.
+match = {match}
+# RX match window, raw MAC - SFD ns (SFD_RX_WIN_MIN/MAX, defaults 100 / 700).
+# Keep max - min below {ft} ns (one minimum frame time at 1 Gb/s).
+rx_window_min_ns = {rx_window_min_ns}
+rx_window_max_ns = {rx_window_max_ns}
+# TX pairing window, MAC completion -> TX SFD pin ns (defaults 0 / 900).
+tx_window_min_ns = {tx_window_min_ns}
+tx_window_max_ns = {tx_window_max_ns}
+# Glitch filter, dp_clk cycles (4 ns): low before an edge (25), high after (8).
+min_low_cycles = {min_low_cycles}
+min_high_cycles = {min_high_cycles}
+"""
+
+CAL_PORT = """
+[port{n}]
+# P{n}: signed ns added to the RX SFD (SFD_P_RX_OFFSET) and TX SFD
+# (SFD_P_TX_OFFSET) times. TX SFD is the reference (tx 0); rx = -(PHY RX
+# indication delay - TX indication delay), from the P2<->P3 loopback.
+rx_offset_ns = {rx}
+tx_offset_ns = {tx}
+"""
+
+
+def cal_from_regs(hw):
+    v = {}
+    for sec, key, off, kind, _ in CAL_REGS:
+        if sec != "capture" and not hw.has_sfd:
+            continue
+        r = hw.rd(off)
+        v[(sec, key)] = (r & SFD_MATCH_EN) if kind == "en" else (r & 0xFF if kind == "u8" else s32(r))
+    v[("timebase", "ppm")] = round(inc_to_ppb(hw.inc_raw(), hw.dp_clk_hz) / 1e3, 6)
+    return v
+
+
+def cal_defaults():
+    v = {(sec, key): dflt for sec, key, _, _, dflt in CAL_REGS}
+    v[("timebase", "ppm")] = 0.0
+    return v
+
+
+def render_cal(v, origin, dp_clk_hz=DP_CLK_HZ_DEFAULT):
+    flat = {key: val for (sec, key), val in v.items() if not sec.startswith("port")}
+    flat["match"] = "on" if flat.get("match", 1) else "off"
+    flat["ppm"] = f"{flat.get('ppm', 0.0):.6f}"
+    text = CAL_HEADER.format(origin=origin) + CAL_BODY.format(dp=dp_clk_hz, ft=FRAME_TIME_64B_NS,
+                                                               **flat)
+    for n in range(NUM_PORTS):
+        text += CAL_PORT.format(n=n, rx=v.get((f"port{n}", "rx_offset_ns"), 0),
+                                tx=v.get((f"port{n}", "tx_offset_ns"), 0))
+    return text
+
+
+def parse_cal(path):
+    """-> ({(section, key): value}, [errors]); unknown keys are errors."""
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
+    with open(path) as f:
+        cp.read_file(f)
+    known = {(sec, key): kind for sec, key, _, kind, _ in CAL_REGS}
+    known[("timebase", "ppm")] = "ppm"
+    known[("timebase", "ppb")] = "ppb"
+    known[("timebase", "inc")] = "inc"
+    v, errs = {}, []
+    for sec in cp.sections():
+        for key, raw in cp.items(sec):
+            kind = known.get((sec, key))
+            if kind is None:
+                errs.append(f"[{sec}] {key}: unknown key")
+                continue
+            try:
+                if kind == "en":
+                    val = {"on": 1, "1": 1, "true": 1, "yes": 1,
+                           "off": 0, "0": 0, "false": 0, "no": 0}[raw.strip().lower()]
+                elif kind in ("ppm", "ppb"):
+                    val = float(raw)
+                    if not math.isfinite(val):
+                        raise ValueError
+                else:
+                    val = int(raw, 0)
+            except (ValueError, KeyError):
+                errs.append(f"[{sec}] {key} = {raw!r}: not a valid value")
+                continue
+            if kind == "u8" and not 0 <= val <= 255:
+                errs.append(f"[{sec}] {key} = {val}: must be 0..255")
+                continue
+            if kind == "s" and not -2 ** 31 <= val < 2 ** 31 - 1:
+                errs.append(f"[{sec}] {key} = {val}: out of the signed 32-bit range")
+                continue
+            v[(sec, key)] = val
+    # one timebase form only; normalise to ppm
+    tbk = [k for k in ("ppm", "ppb", "inc") if ("timebase", k) in v]
+    if len(tbk) > 1:
+        errs.append(f"[timebase] give one of ppm / ppb / inc, not {' and '.join(tbk)}")
+    for lo, hi in (("rx_window_min_ns", "rx_window_max_ns"), ("tx_window_min_ns", "tx_window_max_ns")):
+        a, b = v.get(("sfd", lo)), v.get(("sfd", hi))
+        if a is not None and b is not None and a >= b:
+            errs.append(f"[sfd] {lo} {a} must be < {hi} {b}")
+    return v, errs
+
+
+def tb_ppb_from_cal(v, dp_clk_hz):
+    if ("timebase", "ppm") in v:
+        return v[("timebase", "ppm")] * 1e3
+    if ("timebase", "ppb") in v:
+        return v[("timebase", "ppb")]
+    if ("timebase", "inc") in v:
+        return inc_to_ppb(v[("timebase", "inc")], dp_clk_hz)
+    return None
+
+
+def apply_cal(hw, v, timebase=True, dry=False, max_ppm=200.0):
+    """Write the values to the registers -> (applied {name: value}, [warnings], [errors])."""
+    applied, warns, errs = {}, [], []
+    a, b = v.get(("sfd", "rx_window_min_ns")), v.get(("sfd", "rx_window_max_ns"))
+    if a is not None and b is not None and b - a >= FRAME_TIME_64B_NS:
+        warns.append(f"RX window {a}..{b} ns is {b - a} ns wide (>= {FRAME_TIME_64B_NS} ns): "
+                     "a neighbouring frame's SFD can match")
+    for sec, key, off, kind, _ in CAL_REGS:
+        if (sec, key) not in v:
+            continue
+        if sec != "capture" and not hw.has_sfd:
+            warns.append(f"[{sec}] {key}: this bitstream has no SFD block (capture map "
+                         f"0x{hw.version:08x}), skipped")
+            continue
+        val = v[(sec, key)]
+        if not dry:
+            if kind == "en":
+                # keep LOG_EN (bit 1), never write the self-clearing CLEAR bit
+                hw.wr(off, (hw.rd(off) & 0x2) | (SFD_MATCH_EN if val else 0))
+            else:
+                hw.wr(off, val)
+        applied[f"{sec}.{key}"] = val
+    if timebase:
+        ppb = tb_ppb_from_cal(v, hw.dp_clk_hz)
+        if ppb is not None:
+            if abs(ppb) > max_ppm * 1e3:
+                errs.append(f"[timebase] {ppb / 1e3:+.3f} ppm is beyond +-{max_ppm} ppm: not applied")
+            else:
+                inc = ppb_to_inc(ppb, hw.dp_clk_hz)
+                if not dry:
+                    hw.set_inc_raw(inc)
+                applied["timebase.ppm"] = round(ppb / 1e3, 6)
+                applied["timebase.inc"] = f"0x{inc:010x}"
+    return applied, warns, errs
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+def open_hw(a):
+    if a.sim is not None:
+        return SimHw(a.sim, noise_ns=a.sim_noise)
+    return Hw(a.devmem)
+
+
+def status_doc(hw, clock, samples=15):
+    x, lat, t_rt = measure(hw, clock, samples)
+    inc = hw.inc_raw()
+    ppb = inc_to_ppb(inc, hw.dp_clk_hz)
+    d = st_daemon = read_state()
+    doc = {
+        "time_ns": t_rt, "time": iso_ns(t_rt), "timebase_ns": hw.now_ns(),
+        "offset_ns": int(x), "latency_ns": int(lat),
+        "inc_raw": f"0x{inc:010x}", "inc_ns": inc / 2 ** 32,
+        "nominal_inc_ns": nominal_inc_raw(hw.dp_clk_hz) / 2 ** 32, "dp_clk_hz": hw.dp_clk_hz,
+        "freq_ppb": round(ppb, 3), "ppm": round(ppb / 1e3, 6), "tb_status": f"0x{hw.tb_status():02x}",
+        "capture_running": hw.capture_running(), "ntp_synced": ntp_synced(),
+        "cap_version": f"0x{hw.version:08x}", "source": hw.src,
+        "daemon": None, "locked": False, "calibration": calibration_info(),
+    }
+    if d is not None:
+        doc["daemon"] = {k: d.get(k) for k in (
+            "fresh", "state", "locked", "locked_since", "offset_ns", "offset_rms_30s_ns",
+            "offset_abs_max_30s_ns", "freq_ppb", "freq_est_ppb", "last_set", "last_set_reason",
+            "sets", "adj_steps", "steps_detected", "updated", "age_s", "pid", "message")}
+        doc["locked"] = bool(st_daemon.get("fresh") and st_daemon.get("locked"))
+    return doc
+
+
+def calibration_info(path=CAL_FILE, applied_path=CAL_STATE):
+    info = {"file": path, "present": os.path.isfile(path), "mtime": None, "applied": None}
+    if info["present"]:
+        info["mtime"] = iso_ns(int(os.stat(path).st_mtime * 1e9))
+    try:
+        with open(applied_path) as f:
+            ap = json.load(f)
+        info["applied"] = {k: ap.get(k) for k in ("applied", "file", "ok", "errors", "warnings")}
+    except (OSError, ValueError):
+        pass
+    return info
+
+
+def cmd_status(a):
+    hw = open_hw(a)
+    doc = status_doc(hw, SysClock())
+    if a.json:
+        print(json.dumps(doc, indent=1))
+        return 0
+    yn = {True: "yes", False: "NO", None: "unknown"}
+    print(f"timebase      {doc['timebase_ns']} ns ({iso_ns(doc['timebase_ns'])})")
+    print(f"offset        {fmt_ns(doc['offset_ns'])} vs CLOCK_REALTIME (read latency "
+          f"{doc['latency_ns']} ns)")
+    print(f"INC           {doc['inc_raw']} = {doc['inc_ns']:.9f} ns/cycle, nominal "
+          f"{doc['nominal_inc_ns']:.9f} (dp_clk {doc['dp_clk_hz']} Hz): {doc['ppm']:+.3f} ppm")
+    print(f"system clock  NTP synchronised: {yn[doc['ntp_synced']]}")
+    print(f"capture       {'RUNNING' if doc['capture_running'] else 'idle'}, TB_STATUS "
+          f"{doc['tb_status']}, capture map {doc['cap_version']} ({doc['source']})")
+    d = doc["daemon"]
+    if d is None:
+        print("daemon        not running (no state file " + TB_STATE + ")")
+    else:
+        print(f"daemon        {'running' if d['fresh'] else 'NOT running (stale state, age %ss)' % d['age_s']}"
+              f", state {d['state']}, {'LOCKED since ' + str(d['locked_since']) if d['locked'] else 'not locked'}")
+        print(f"              last offset {fmt_ns(d['offset_ns'])}, rms {fmt_ns(d['offset_rms_30s_ns'])}"
+              f", max {fmt_ns(d['offset_abs_max_30s_ns'])} (30 s); frequency estimate "
+              f"{(d['freq_est_ppb'] or 0) / 1e3:+.3f} ppm")
+        print(f"              {d['sets']} TB_SET (last {d['last_set']}: {d['last_set_reason']}), "
+              f"{d['adj_steps']} ADJ steps, {d['steps_detected']} steps detected")
+    c = doc["calibration"]
+    ap = c["applied"]
+    print(f"calibration   {c['file']}: {'present' if c['present'] else 'MISSING'}"
+          + (f", applied {ap['applied']} ({'ok' if ap['ok'] else 'with errors'})" if ap else
+             ", not applied since boot"))
+    return 0
+
+
+def daemon_running():
+    st = read_state()
+    return st is not None and st.get("fresh")
+
+
+def cmd_set(a):
+    hw = open_hw(a)
+    clock = SysClock()
+    if hw.capture_running() and not a.force:
+        print("pktrec-tb: a capture is running: a TB_SET would mis-stamp the frames in the "
+              "FIFOs and break the file's time scale (use --force)", file=sys.stderr)
+        return 1
+    if daemon_running():
+        print("pktrec-tb: note: pktrec-tb daemon is running; it will see this as a step",
+              file=sys.stderr)
+    x0, _, _ = measure(hw, clock)
+    t = clock.realtime_ns()
+    hw.set_ns(t)
+    x1, _, _ = measure(hw, clock)
+    print(f"timebase set to CLOCK_REALTIME {iso_ns(t)}: offset {fmt_ns(x0)} -> {fmt_ns(x1)}")
+    return 0
+
+
+def cmd_trim(a):
+    hw = open_hw(a)
+    if a.inc is not None:
+        inc = int(a.inc, 0)
+    else:
+        ppb = a.ppm * 1e3 if a.ppm is not None else a.ppb
+        inc = ppb_to_inc(ppb, hw.dp_clk_hz)
+    ppb = inc_to_ppb(inc, hw.dp_clk_hz)
+    if not 0 < inc < (1 << 40):
+        print(f"pktrec-tb: INC 0x{inc:x} out of range", file=sys.stderr)
+        return 1
+    if abs(ppb) > 200e3 and not a.force:
+        print(f"pktrec-tb: {ppb / 1e3:+.3f} ppm is beyond +-200 ppm (use --force)", file=sys.stderr)
+        return 1
+    old = hw.inc_raw()
+    hw.set_inc_raw(inc)
+    print(f"INC 0x{old:010x} ({inc_to_ppb(old, hw.dp_clk_hz) / 1e3:+.3f} ppm) -> 0x{inc:010x} "
+          f"({ppb / 1e3:+.3f} ppm)")
+    if daemon_running():
+        print("pktrec-tb: note: the running daemon adopts this value and keeps disciplining "
+              "from it", file=sys.stderr)
+    return 0
+
+
+def cmd_daemon(a):
+    hw = open_hw(a)
+    d = Daemon(hw, SysClock(), a, state_path=a.state)
+
+    def on_sig(signum, frame):
+        d.stop = True
+    signal.signal(signal.SIGTERM, on_sig)
+    signal.signal(signal.SIGINT, on_sig)
+    try:
+        d.run(a.duration)
+    except KeyboardInterrupt:
+        d.shutdown()
+    return 0
+
+
+def cmd_apply(a):
+    hw = open_hw(a)
+    try:
+        v, errs = parse_cal(a.file)
+    except FileNotFoundError:
+        print(f"pktrec-tb: {a.file}: no such file (registers left at their reset values)",
+              file=sys.stderr)
+        return 1
+    except configparser.Error as e:
+        print(f"pktrec-tb: {a.file}: {e}", file=sys.stderr)
+        return 1
+    if hw.capture_running() and not a.force and not a.dry_run:
+        print("pktrec-tb: a capture is running: calibration changes would apply in the middle "
+              "of it (use --force)", file=sys.stderr)
+        return 1
+    applied, warns, errs2 = apply_cal(hw, v, timebase=not a.no_timebase, dry=a.dry_run)
+    errs += errs2
+    for w in warns:
+        print(f"pktrec-tb: warning: {w}", file=sys.stderr)
+    for e in errs:
+        print(f"pktrec-tb: error: {e}", file=sys.stderr)
+    print(f"pktrec-tb: {'would apply' if a.dry_run else 'applied'} {a.file}: " +
+          ", ".join(f"{k}={val}" for k, val in applied.items()))
+    if not a.dry_run:
+        now = time.time_ns()
+        try:
+            write_json_atomic(a.state, {"applied_ns": now, "applied": iso_ns(now), "file": a.file,
+                                        "ok": not errs, "values": applied, "errors": errs,
+                                        "warnings": warns})
+        except OSError as e:
+            print(f"pktrec-tb: cannot write {a.state}: {e}", file=sys.stderr)
+    return 1 if errs else 0
+
+
+def cmd_save(a):
+    if a.defaults:
+        v, origin, dp = cal_defaults(), "design defaults (register reset values)", DP_CLK_HZ_DEFAULT
+    else:
+        hw = open_hw(a)
+        v, dp = cal_from_regs(hw), hw.dp_clk_hz
+        st = read_state()
+        if st and st.get("fresh") and st.get("locked") and st.get("freq_est_ppb") is not None:
+            # the daemon's frequency estimate, not the momentary P-term-loaded INC
+            v[("timebase", "ppm")] = round(st["freq_est_ppb"] / 1e3, 6)
+        origin = (f"saved {iso_ns(time.time_ns())} on {socket.gethostname()} by "
+                  f"'pktrec-tb save-calibration', capture map 0x{hw.version:08x}")
+    text = render_cal(v, origin, dp)
+    if a.stdout:
+        sys.stdout.write(text)
+        return 0
+    os.makedirs(os.path.dirname(a.file) or ".", exist_ok=True)
+    if os.path.exists(a.file):
+        try:
+            os.replace(a.file, a.file + ".bak")
+        except OSError:
+            pass
+    tmp = a.file + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, a.file)
+    print(f"pktrec-tb: wrote {a.file}" + (" (previous version: .bak)" if
+                                          os.path.exists(a.file + ".bak") else ""))
+    return 0
+
+
+def cmd_show(a):
+    hw = open_hw(a)
+    cur = cal_from_regs(hw)
+    try:
+        filev, errs = parse_cal(a.file)
+    except (OSError, configparser.Error) as e:
+        filev, errs = {}, [str(e)]
+    if ("timebase", "ppm") not in filev:
+        p = tb_ppb_from_cal(filev, hw.dp_clk_hz)
+        if p is not None:
+            filev[("timebase", "ppm")] = round(p / 1e3, 6)
+    keys = [("timebase", "ppm")] + [(s, k) for s, k, _, _, _ in CAL_REGS]
+    dflt = cal_defaults()
+    rows = [{"key": f"{s}.{k}", "register": cur.get((s, k)), "file": filev.get((s, k)),
+             "default": dflt.get((s, k))} for s, k in keys]
+    if a.json:
+        print(json.dumps({"file": a.file, "errors": errs, "keys": rows,
+                          "calibration": calibration_info(a.file)}, indent=1))
+        return 0
+    print(f"{'key':26} {'register':>12} {'file':>12} {'default':>10}")
+    for r in rows:
+        mark = "" if r["file"] is None or r["file"] == r["register"] else "   <- differs"
+        if r["key"] == "timebase.ppm" and r["file"] is not None and r["register"] is not None:
+            mark = "   (daemon trims it)" if abs(r["file"] - r["register"]) > 1e-3 else ""
+        print(f"{r['key']:26} {str(r['register']):>12} {str(r['file'] if r['file'] is not None else '-'):>12}"
+              f" {str(r['default']):>10}{mark}")
+    for e in errs:
+        print(f"file error: {e}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="pktrec-tb", description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("Commands:", 1)[1])
+    ap.add_argument("--devmem", action="store_true", help="use /dev/mem instead of UIO")
+    ap.add_argument("--sim", type=float, metavar="PPM",
+                    help="host test: simulated timebase whose clock is off by PPM")
+    ap.add_argument("--sim-noise", type=float, default=300.0, metavar="NS",
+                    help="--sim: read jitter, ns rms (default 300)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("status", help="timebase vs CLOCK_REALTIME, daemon state")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("set", help="TB_SET from CLOCK_REALTIME")
+    p.add_argument("--force", action="store_true", help="even while a capture runs")
+    p = sub.add_parser("trim", help="write INC (frequency)")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--ppm", type=float)
+    g.add_argument("--ppb", type=float)
+    g.add_argument("--inc", help="raw 32.32 value, e.g. 0x0400068db8")
+    p.add_argument("--force", action="store_true", help="allow beyond +-200 ppm")
+    p = sub.add_parser("daemon", help="discipline the timebase to CLOCK_REALTIME")
+    p.add_argument("--interval", type=float, default=1.0, help="seconds per sample (1)")
+    p.add_argument("--samples", type=int, default=7, help="read pairs per sample, min latency kept (7)")
+    p.add_argument("--kp", type=float, default=0.2)
+    p.add_argument("--ki", type=float, default=0.02)
+    p.add_argument("--max-ppm", type=float, default=200.0, help="frequency bound (200)")
+    p.add_argument("--estimate", type=float, default=8.0,
+                   help="seconds of frequency estimation at start-up (8)")
+    p.add_argument("--lock-threshold", type=float, default=10000.0, help="ns (10000)")
+    p.add_argument("--lock-time", type=float, default=30.0, help="seconds (30)")
+    p.add_argument("--adj-threshold", type=float, default=20000.0,
+                   help="TB_ADJ only above this |offset|, ns (20000)")
+    p.add_argument("--max-adj", type=float, default=1000.0, help="largest TB_ADJ step, ns (1000)")
+    p.add_argument("--step-threshold", type=float, default=1e9,
+                   help="TB_SET above this |offset|, ns (1e9 = 1 s)")
+    p.add_argument("--no-set", action="store_true", help="never TB_SET (not even at start-up)")
+    p.add_argument("--state", default=TB_STATE, help=f"state file ({TB_STATE})")
+    p.add_argument("--summary", type=float, default=60.0, help="log a summary every S s (60)")
+    p.add_argument("--duration", type=float, help="exit after S seconds (tests)")
+    p.add_argument("-v", "--verbose", action="store_true", help="log every sample")
+    p = sub.add_parser("apply-calibration", help="calibration file -> registers")
+    p.add_argument("--file", default=CAL_FILE)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true", help="even while a capture runs")
+    p.add_argument("--no-timebase", action="store_true", help="leave INC alone")
+    p.add_argument("--state", default=CAL_STATE, help=f"result record ({CAL_STATE})")
+    p = sub.add_parser("save-calibration", help="registers -> calibration file")
+    p.add_argument("--file", default=CAL_FILE)
+    p.add_argument("--stdout", action="store_true")
+    p.add_argument("--defaults", action="store_true",
+                   help="the design defaults instead of the registers (no hardware)")
+    p = sub.add_parser("show-calibration", help="registers vs the calibration file")
+    p.add_argument("--file", default=CAL_FILE)
+    p.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    fn = {"status": cmd_status, "set": cmd_set, "trim": cmd_trim, "daemon": cmd_daemon,
+          "apply-calibration": cmd_apply, "save-calibration": cmd_save,
+          "show-calibration": cmd_show}[a.cmd]
+    return fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
