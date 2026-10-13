@@ -29,6 +29,11 @@
 #                              per-port frame FIFOs -> records -> round-robin merge ->
 #                              fdrec_core/S_AXIS_CAP; shared timebase (PHC) feeding the
 #                              MACs' timestamp inputs
+#   replay                     M6 capture replay (pktrec_replay_top): the recorder's
+#                              playback stream (fdrec_core/M_AXIS_SNK) -> record parser,
+#                              frame store, scheduler against the timebase -> one
+#                              port's TX (eth_ports S_AXIS_RPL, path mode 4 REPLAY);
+#                              passes the stream on to user_data_sink while CTRL.SEL = 0
 #
 # Names that software depends on (do not rename without updating
 # Yocto/bsp/zcu106/.../system-user.dtsi): fdrec_core/fdrec_core_0 (DT label
@@ -36,7 +41,8 @@
 # eth_ports/pktrec_m0_path_0 (DT labels eth_ports_pktrec_eth_ports_0 and
 # eth_ports_pktrec_m0_path_0, bound to generic-uio for sw/pktrec-tools),
 # capture/pktrec_capture_0 (DT label capture_pktrec_capture_0, generic-uio for
-# sw/pktrec-apps pktrec-cap).
+# sw/pktrec-apps pktrec-cap), replay/pktrec_replay_0 (DT label
+# replay_pktrec_replay_0, generic-uio for sw/pktrec-apps pktrec-replay).
 #
 # Ethernet FMC Max (OP080) on HPC0 (hierarchy eth_ports): GTH quad 226
 # (GTHE4_CHANNEL_X0Y12..X0Y15, refclk GBTCLK0_M2C V8/V7), MDIO, PHY resets, PHY
@@ -52,6 +58,7 @@
 #   fdrec_core_0 s_axi            0x04_2001_0000    4K
 #   eth_ports/pktrec_m0_path_0    0x04_2002_0000    4K   (M0 path registers)
 #   capture/pktrec_capture_0      0x04_2003_0000    4K   (capture + timebase registers)
+#   replay/pktrec_replay_0        0x04_2004_0000    4K   (replay registers, M6)
 #   eth_ports/pktrec_eth_ports_0  0x04_2008_0000  512K   (MAC/PCS/MDIO regs + GT APB)
 #   pl_ps_irq0[0..2]  xdma_0 interrupt_out, MSI 0-31, MSI 32-63  (GIC SPI 89..91)
 #   pl_ps_irq0[3..5]  reserved, tied low                         (GIC SPI 92..94)
@@ -456,7 +463,8 @@ connect_bd_intf_net [get_bd_intf_pins user_data_source/M_AXIS] [get_bd_intf_pins
 foreach p {tpg_enable tpg_seq_rst tpg_rate_inc tpg_seq_next} {
   connect_bd_net [get_bd_pins fdrec_core/$p] [get_bd_pins user_data_source/$p]
 }
-connect_bd_intf_net [get_bd_intf_pins fdrec_core/M_AXIS_SNK] [get_bd_intf_pins user_data_sink/S_AXIS]
+# (fdrec_core/M_AXIS_SNK -> user_data_sink/S_AXIS goes through the replay
+# hierarchy, see "Replay" below)
 foreach p [concat {chk_enable chk_reset chk_rate_inc} $chk_counters] {
   connect_bd_net [get_bd_pins fdrec_core/$p] [get_bd_pins user_data_sink/$p]
 }
@@ -628,6 +636,15 @@ foreach p {rx_stat_pkt_good rx_stat_pkt_bad tx_stat_pkt_good tx_stat_err_underfl
 }
 # dynamic inter-frame gap (M3): [8n+7:8n] in tx_clk_n
 connect_bd_net [get_bd_pins $mp/tx_ifg] [get_bd_pins $ep/tx_ifg]
+# replay input (M6): frames from replay/pktrec_replay_0 (dp_clk, tdest = TX port)
+create_bd_pin -dir I -type clk eth_ports/dp_clk
+create_bd_pin -dir I -type rst eth_ports/dp_aresetn
+create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 eth_ports/S_AXIS_RPL
+create_bd_pin -dir O -from 3 -to 0 eth_ports/rpl_eff
+connect_bd_net [get_bd_pins eth_ports/dp_clk] [get_bd_pins $mp/dp_clk]
+connect_bd_net [get_bd_pins eth_ports/dp_aresetn] [get_bd_pins $mp/dp_aresetn]
+connect_bd_intf_net [get_bd_intf_pins eth_ports/S_AXIS_RPL] [get_bd_intf_pins $mp/s_axis_rpl]
+connect_bd_net [get_bd_pins $mp/rpl_eff] [get_bd_pins eth_ports/rpl_eff]
 
 # External ports (names match src/constraints/zcu106.xdc)
 create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 gt_ref_clk
@@ -702,6 +719,11 @@ foreach p {dp_clk dp_resetn rec_srst} {
   connect_bd_net [get_bd_pins capture/$p] [get_bd_pins $cp/$p]
 }
 connect_bd_net [get_bd_pins $cp/cap_sel] [get_bd_pins capture/cap_sel]
+# shared timebase for the replay scheduler (M6)
+create_bd_pin -dir O -from 63 -to 0 capture/tb_now
+create_bd_pin -dir O -from 7 -to 0 capture/tb_inc_ns
+connect_bd_net [get_bd_pins $cp/tb_now] [get_bd_pins capture/tb_now]
+connect_bd_net [get_bd_pins $cp/tb_inc_ns] [get_bd_pins capture/tb_inc_ns]
 for {set n 0} {$n < 4} {incr n} {
   create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 capture/S_AXIS_RX_$n
   connect_bd_intf_net [get_bd_intf_pins capture/S_AXIS_RX_$n] [get_bd_intf_pins $cp/s_axis_rx_$n]
@@ -737,6 +759,54 @@ connect_bd_net [get_bd_pins rst_dp_clk/peripheral_aresetn] [get_bd_pins capture/
 add_periph_slave capture/S_AXI $ps/pl_clk1 rst_dp_clk/peripheral_aresetn
 
 # ------------------------------------------------------------------------------
+# Replay (M6): hierarchy replay
+# ------------------------------------------------------------------------------
+#
+#  axi_dma_0 MM2S -> fdrec_core egress FIFO -> M_AXIS_SNK (src_clk, 128 bit)
+#        -> replay/pktrec_replay_0 (pktrec_replay_top):
+#             CTRL.SEL = 0: passed on unchanged -> user_data_sink (fdrec_check, fdplay)
+#             CTRL.SEL = 1: async FIFO -> dp_clk record parser -> frame store (32 KB)
+#                           -> scheduler (release when timebase >= target; timebase
+#                           from capture/tb_now) -> 16 bit -> M_AXIS_RPL (tdest = port)
+#        -> eth_ports/S_AXIS_RPL -> pktrec_m0_path replay FIFO of the port
+#           (PATH_RPL bit n = path mode 4 REPLAY) -> MAC TX
+#  s_axi on dp_clk: include/pktrec_regs.h PKTREC_RPL_*
+
+create_bd_cell -type hier replay
+create_bd_cell -type module -reference pktrec_replay_top replay/pktrec_replay_0
+set rp replay/pktrec_replay_0
+create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 replay/S_AXI
+create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 replay/S_AXIS_EGR
+create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 replay/M_AXIS_CHK
+create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 replay/M_AXIS_RPL
+create_bd_pin -dir I -type clk replay/src_clk
+create_bd_pin -dir I -type rst replay/src_resetn
+create_bd_pin -dir I -type clk replay/dp_clk
+create_bd_pin -dir I -type rst replay/dp_resetn
+create_bd_pin -dir I -from 63 -to 0 replay/tb_now
+create_bd_pin -dir I -from 7 -to 0 replay/tb_inc_ns
+create_bd_pin -dir I -from 3 -to 0 replay/rpl_eff
+connect_bd_intf_net [get_bd_intf_pins replay/S_AXI] [get_bd_intf_pins $rp/s_axi]
+connect_bd_intf_net [get_bd_intf_pins replay/S_AXIS_EGR] [get_bd_intf_pins $rp/s_axis_egr]
+connect_bd_intf_net [get_bd_intf_pins $rp/m_axis_chk] [get_bd_intf_pins replay/M_AXIS_CHK]
+connect_bd_intf_net [get_bd_intf_pins $rp/m_axis_rpl] [get_bd_intf_pins replay/M_AXIS_RPL]
+foreach p {src_clk src_resetn dp_clk dp_resetn tb_now tb_inc_ns rpl_eff} {
+  connect_bd_net [get_bd_pins replay/$p] [get_bd_pins $rp/$p]
+}
+connect_bd_intf_net [get_bd_intf_pins fdrec_core/M_AXIS_SNK] [get_bd_intf_pins replay/S_AXIS_EGR]
+connect_bd_intf_net [get_bd_intf_pins replay/M_AXIS_CHK] [get_bd_intf_pins user_data_sink/S_AXIS]
+connect_bd_intf_net [get_bd_intf_pins replay/M_AXIS_RPL] [get_bd_intf_pins eth_ports/S_AXIS_RPL]
+connect_bd_net [get_bd_pins capture/tb_now] [get_bd_pins replay/tb_now]
+connect_bd_net [get_bd_pins capture/tb_inc_ns] [get_bd_pins replay/tb_inc_ns]
+connect_bd_net [get_bd_pins eth_ports/rpl_eff] [get_bd_pins replay/rpl_eff]
+connect_bd_net [get_bd_pins $ps/pl_clk2] [get_bd_pins replay/src_clk]
+connect_bd_net [get_bd_pins rst_src_clk/peripheral_aresetn] [get_bd_pins replay/src_resetn]
+connect_bd_net [get_bd_pins $ps/pl_clk1] [get_bd_pins replay/dp_clk] [get_bd_pins eth_ports/dp_clk]
+connect_bd_net [get_bd_pins rst_dp_clk/peripheral_aresetn] [get_bd_pins replay/dp_resetn] \
+  [get_bd_pins eth_ports/dp_aresetn]
+add_periph_slave replay/S_AXI $ps/pl_clk1 rst_dp_clk/peripheral_aresetn
+
+# ------------------------------------------------------------------------------
 # Address map
 # ------------------------------------------------------------------------------
 
@@ -746,6 +816,7 @@ assign_ps_addr axi_dma_0/S_AXI_LITE        0x0420000000 64K
 assign_ps_addr fdrec_core/fdrec_core_0/s_axi 0x0420010000 4K
 assign_ps_addr eth_ports/pktrec_m0_path_0/s_axi   0x0420020000 4K
 assign_ps_addr capture/pktrec_capture_0/s_axi     0x0420030000 4K
+assign_ps_addr replay/pktrec_replay_0/s_axi       0x0420040000 4K
 assign_ps_addr eth_ports/pktrec_eth_ports_0/s_axi 0x0420080000 512K
 # Everything else: the masters' (PCIe M_AXI_B, DMA SG/S2MM/MM2S) view of PS DDR
 assign_bd_address

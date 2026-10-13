@@ -110,3 +110,13 @@
 &capture_pktrec_capture_0 {
    compatible = "generic-uio";
 };
+
+/*
+ * Replay (block-design hierarchy replay, M6): record parser, frame store and
+ * scheduler, for pktrec-replay (sw/pktrec-apps), which finds the UIO device by
+ * its address.
+ *   replay_pktrec_replay_0        0x4_2004_0000   4K  include/pktrec_regs.h PKTREC_RPL_*
+ */
+&replay_pktrec_replay_0 {
+   compatible = "generic-uio";
+};
