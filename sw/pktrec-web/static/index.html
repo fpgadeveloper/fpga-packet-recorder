@@ -1,0 +1,76 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Copyright (c) 2026 Opsero Electronic Design Inc. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Packet Recorder</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>FPGA Packet Recorder</h1>
+  <span id="conn" class="pill">connecting…</span>
+</header>
+<main>
+  <section>
+    <h2>Ports</h2>
+    <div id="ports" class="cards"></div>
+    <div id="pairs" class="pairs"></div>
+  </section>
+
+  <section>
+    <h2>Capture</h2>
+    <div class="panel">
+      <form id="capform">
+        <fieldset>
+          <legend>Ports</legend>
+          <label><input type="checkbox" name="port" value="0" checked> P0</label>
+          <label><input type="checkbox" name="port" value="1" checked> P1</label>
+          <label><input type="checkbox" name="port" value="2" checked> P2</label>
+          <label><input type="checkbox" name="port" value="3" checked> P3</label>
+        </fieldset>
+        <label>Snap length <input type="number" id="snaplen" min="0" max="65535" value="0"> <small>bytes, 0 = whole frames</small></label>
+        <label>Stop after <input type="number" id="duration" min="0" step="any" placeholder="—"> <small>seconds</small></label>
+        <label>or after <input type="number" id="size" min="0" step="any" placeholder="—">
+          <select id="sizeunit"><option value="1e6">MB</option><option value="1e9" selected>GB</option></select></label>
+        <label>Name <input type="text" id="capname" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" placeholder="cap-&lt;date&gt;-&lt;time&gt;"></label>
+        <div class="buttons">
+          <button type="submit" id="start" class="primary">Start capture</button>
+          <button type="button" id="stop" class="danger" disabled>Stop</button>
+        </div>
+      </form>
+      <div id="live">
+        <div class="kv"><span>State</span><b id="cstate">idle</b></div>
+        <div class="kv"><span>File</span><b id="cfile">—</b></div>
+        <div class="kv"><span>Elapsed</span><b id="celapsed">—</b></div>
+        <div class="kv"><span>Written</span><b id="cbytes">—</b></div>
+        <div class="kv"><span>Write rate</span><b id="crate">—</b></div>
+        <div class="kv"><span>Ring buffers</span><span class="bar"><i id="ringbar"></i></span><b id="ring">—</b></div>
+        <div class="kv"><span>SSD free</span><span class="bar"><i id="diskbar"></i></span><b id="disk">—</b></div>
+        <p id="cmsg" class="msg"></p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Captures <button id="refresh" class="small">Refresh</button></h2>
+    <div class="tablewrap">
+      <table id="caps">
+        <thead><tr><th>Name</th><th>Start (UTC)</th><th>Duration</th><th>Size</th><th>Ports</th><th>Drops</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<footer id="footer">—</footer>
+
+<dialog id="infodlg">
+  <h3 id="infotitle"></h3>
+  <pre id="infotext"></pre>
+  <form method="dialog"><button>Close</button></form>
+</dialog>
+<script src="app.js"></script>
+</body>
+</html>

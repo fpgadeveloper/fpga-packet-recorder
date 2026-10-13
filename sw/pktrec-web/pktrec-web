@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Opsero Electronic Design Inc.
+"""pktrec-web - web interface of the FPGA Packet Recorder.
+
+A small HTTP server (Python 3 standard library only) that serves a single-page
+UI and a JSON API on the board's PS Ethernet port. It drives the existing
+command-line tools as subprocesses:
+
+  pktrec-phy status / path        port link state, per-pair TAP/monitor mode
+  pktrec-cap stats                capture block counters (per port), timebase
+  pktrec-cap record               one capture at a time, to <rec-dir>/captures
+  pktrec-cap info                 capture file header (text, for the info view)
+  pktrec-export <file> -o -       streamed to the browser as pcapng (no temp file)
+
+There is no authentication: run it on a trusted network only.
+
+API (all JSON, errors as {"error": "..."} with an HTTP status code):
+  GET    /api/status                 ports, pair modes, capture, disk, time, versions
+  GET    /api/stats                  live counters and rates (poll every second)
+  POST   /api/mode                   {"pair": 0|1, "mode": "tap"|"monitor"}
+  POST   /api/capture/start          {"ports": [0..3], "snaplen": N, "duration_s": S,
+                                      "size_bytes": B, "name": "..."}
+  POST   /api/capture/stop
+  GET    /api/captures               list of capture files (from their 4 KB headers)
+  GET    /api/captures/<name>/info   header fields + 'pktrec-cap info' text
+  GET    /api/captures/<name>.pcapng download, converted on the fly by pktrec-export
+  GET    /api/captures/<name>.cap    download the raw capture file
+  DELETE /api/captures/<name>        delete a capture
+
+--mock replaces the tools by sw/pktrec-web/mock_tools.py (host testing, no board).
+"""
+
+import argparse
+import datetime
+import errno
+import fcntl
+import http.server
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+VERSION = "1.0"
+PAIRS = ((0, 1), (2, 3))          # pair p = ports 2p, 2p+1 (include/pktrec_format.h)
+NUM_PORTS = 4
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+CHUNK = 256 * 1024
+
+# --------------------------------------------------------------------------
+# Capture file header (include/pktrec_format.h, header version 1).
+# Duplicated here (as in test/make_synth_capture.py) so that listing a
+# directory of captures does not cost one 'pktrec-cap info' per file; the
+# format is versioned and the parser refuses any other header_version.
+# --------------------------------------------------------------------------
+HDR_SIZE = 4096
+HDR_FMT = "<8s10I9Q32s64s32s"
+PORT_FMT = "<7QII16s"
+MAGIC = b"PKTRCAP\x00"
+FF_COMPLETE, FF_TB_REALTIME, FF_LIMIT_SIZE, FF_LIMIT_TIME, FF_DMA_ERROR = 1, 2, 4, 8, 16
+FPORT_ENABLED, FPORT_LINK_UP = 1, 2
+
+
+def _cstr(b):
+    return b.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def parse_header(raw):
+    """Parse the 4 KB pktrec capture file header; raise ValueError if invalid."""
+    n = struct.calcsize(HDR_FMT)
+    pn = struct.calcsize(PORT_FMT)
+    if len(raw) < n + NUM_PORTS * pn:
+        raise ValueError("file shorter than the 4 KB header")
+    f = struct.unpack_from(HDR_FMT, raw, 0)
+    if f[0] != MAGIC:
+        raise ValueError("not a pktrec capture file (bad magic)")
+    (hver, hsize, recfmt, flags, cap_ver, fdrec_ver, nports, mask, pair_mode,
+     snaplen) = f[1:11]
+    (t0, t1, tb0, tb1, tb_inc, data_bytes, records, drop_beats, dma_err) = f[11:20]
+    if hver != 1:
+        raise ValueError(f"unsupported header version {hver}")
+    ports = []
+    for i in range(min(nports, NUM_PORTS)):
+        p = struct.unpack_from(PORT_FMT, raw, n + i * pn)
+        ports.append({
+            "port": i, "name": _cstr(p[9]) or f"P{i}",
+            "enabled": bool(mask >> i & 1),
+            "frames_rx": p[0], "frames_bad": p[1], "frames_drop": p[2], "bytes_rx": p[3],
+            "bytes_drop": p[4], "frames_trunc": p[5], "records": p[6],
+            "speed_mbps": p[7], "link_up": bool(p[8] & FPORT_LINK_UP),
+        })
+    complete = bool(flags & FF_COMPLETE)
+    return {
+        "header_version": hver, "record_format": recfmt, "complete": complete,
+        "flags": {"tb_realtime": bool(flags & FF_TB_REALTIME),
+                  "limit_size": bool(flags & FF_LIMIT_SIZE),
+                  "limit_time": bool(flags & FF_LIMIT_TIME),
+                  "dma_error": bool(flags & FF_DMA_ERROR)},
+        "cap_version": f"0x{cap_ver:08x}", "fdrec_version": f"0x{fdrec_ver:08x}",
+        "port_mask": mask, "ports_captured": [i for i in range(NUM_PORTS) if mask >> i & 1],
+        "pair_modes": ["tap" if pair_mode >> p & 1 else "monitor" for p in range(2)],
+        "snaplen": snaplen, "start_time_ns": t0, "stop_time_ns": t1,
+        "start_time": iso_ns(t0), "stop_time": iso_ns(t1) if complete else None,
+        "duration_s": (t1 - t0) / 1e9 if complete and t1 >= t0 else None,
+        "tb_start_ns": tb0, "tb_stop_ns": tb1, "tb_inc_ns": tb_inc / 2 ** 32,
+        "data_bytes": data_bytes, "records": records,
+        "rec_drop_beats": drop_beats, "dma_errors": dma_err,
+        "drops": sum(p["frames_drop"] for p in ports if p["enabled"]) if complete else None,
+        "target": _cstr(f[20]), "hostname": _cstr(f[21]), "design": _cstr(f[22]),
+        "ports": ports,
+    }
+
+
+def iso_ns(ns):
+    if not ns:
+        return None
+    return datetime.datetime.fromtimestamp(ns / 1e9, datetime.timezone.utc) \
+        .isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+# --------------------------------------------------------------------------
+# Text parsers for the CLI tools' output. The formats are those of
+# sw/pktrec-tools/pktrec-phy 'status' and sw/pktrec-apps/pktrec-cap
+# 'stats' / live statistics; the regexes only anchor on the fields used.
+# --------------------------------------------------------------------------
+RATE_RE = re.compile(r"^([\d.]+)([kMG]?)b?$")
+LIVE_RE = re.compile(r"^\s*([\d.]+)s\s+([\d.]+) MB/s\s+([\d.]+) GB ring\s+(\d+)/(\d+)"
+                     r" bp\s+([\d.]+)%")
+LIVE_PORT_RE = re.compile(r"\| P(\d) (\S+)/s (\S+)/s d(\d+)")
+RESULT_RE = re.compile(r"^RESULT (.*)$")
+STATS_PORT_RE = re.compile(r"^P(\d)\s+(\S+)" + r"\s+(\d+)" * 8)
+PHY_PORT_RE = re.compile(r"^P(\d)\s+0x[0-9a-fA-F]+\s+(.*)$")
+PHY_TAIL_RE = re.compile(r"0x[0-9a-fA-F]{4}\s+(\d)\s+(\d)\s+(\d)\s+(\S+)\s*$")
+
+
+def parse_rate(s):
+    m = RATE_RE.match(s)
+    if not m:
+        return None
+    return float(m.group(1)) * {"": 1, "k": 1e3, "M": 1e6, "G": 1e9}[m.group(2)]
+
+
+def parse_live_line(line):
+    m = LIVE_RE.match(line)
+    if not m:
+        return None
+    d = {"elapsed_s": float(m.group(1)), "write_mb_s": float(m.group(2)),
+         "written_gb": float(m.group(3)), "ring_used": int(m.group(4)),
+         "ring_total": int(m.group(5)), "backpressure_pct": float(m.group(6)), "ports": {}}
+    for pm in LIVE_PORT_RE.finditer(line):
+        d["ports"][int(pm.group(1))] = {"frames_s": parse_rate(pm.group(2)),
+                                        "bits_s": parse_rate(pm.group(3)),
+                                        "drops": int(pm.group(4))}
+    return d
+
+
+def parse_cap_stats(text):
+    d = {"ports": {}}
+    for line in text.splitlines():
+        if line.startswith("capture "):
+            m = re.search(r"version (0x[0-9a-fA-F]+)", line)
+            d["cap_version"] = m.group(1) if m else None
+            d["enabled"] = "ENABLED" in line
+        elif line.startswith("ports "):
+            m = re.search(r"enabled (0x[0-9a-fA-F]+), snaplen (\d+), FIFO (\d+) bytes", line)
+            if m:
+                d["port_en"] = int(m.group(1), 16)
+                d["snaplen"] = int(m.group(2))
+                d["fifo_bytes"] = int(m.group(3))
+        elif line.startswith("timebase "):
+            m = re.search(r"^timebase (\d+) ns \(([^)]*?)(?: if set from CLOCK_REALTIME)?\)",
+                          line)
+            if m:
+                d["timebase_ns"] = int(m.group(1))
+                d["timebase"] = m.group(2)
+            m = re.search(r"TB_STATUS (0x[0-9a-fA-F]+)", line)
+            d["tb_status"] = m.group(1) if m else None
+        else:
+            m = STATS_PORT_RE.match(line)
+            if m:
+                v = [int(x) for x in m.groups()[2:]]
+                d["ports"][int(m.group(1))] = {
+                    "link": m.group(2), "frames_rx": v[0], "frames_bad": v[1],
+                    "frames_drop": v[2], "frames_trunc": v[3], "bytes_rx": v[4],
+                    "records": v[5], "fifo_hwm": v[6]}
+    return d
+
+
+def parse_phy_status(text):
+    ports = {}
+    for line in text.splitlines():
+        m = PHY_PORT_RE.match(line)
+        if not m:
+            continue
+        n, rest = int(m.group(1)), m.group(2)
+        p = {"link": False, "speed": None, "duplex": None, "error": None,
+             "sgmii_sync": None, "pcs_link": None, "path": None}
+        c = re.match(r"up\s+(\S+)\s+(FD|HD)", rest)
+        if c:
+            p.update(link=True, speed=c.group(1), duplex="full" if c.group(2) == "FD" else "half")
+        elif rest.startswith("MDIO error"):
+            p["error"] = rest.split("sync=", 1)[0].strip()
+        s = re.search(r"sync=(\d)", rest)
+        p["sgmii_sync"] = bool(int(s.group(1))) if s else None
+        t = PHY_TAIL_RE.search(rest)
+        if t:
+            p["pcs_link"] = bool(int(t.group(1)))
+            p["path"] = t.group(4)
+        ports[n] = p
+    return ports
+
+
+def pair_mode_from_paths(paths):
+    if all(p == "fwd" for p in paths):
+        return "tap"
+    if all(p == "idle" for p in paths):
+        return "monitor"
+    return "other"
+
+
+# --------------------------------------------------------------------------
+# Network interface address (SIOCGIFADDR), for the banner and --bind fallback
+# --------------------------------------------------------------------------
+def iface_ipv4(ifname):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        r = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", ifname.encode()[:15]))
+        return socket.inet_ntoa(r[20:24])
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def wait_iface_ipv4(ifname, timeout):
+    t_end = time.monotonic() + timeout
+    while True:
+        a = iface_ipv4(ifname)
+        if a or time.monotonic() >= t_end:
+            return a
+        time.sleep(1)
+
+
+class ApiError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+
+
+# --------------------------------------------------------------------------
+# Backend: the tools, the capture subprocess and cached hardware snapshots
+# --------------------------------------------------------------------------
+class Backend:
+    def __init__(self, args):
+        self.a = args
+        self.cap_dir = os.path.join(args.rec_dir, "captures")
+        here = os.path.dirname(os.path.realpath(__file__))
+        if args.mock:
+            mock = [sys.executable, os.path.join(here, "mock_tools.py")]
+            self.cmd_cap = mock + ["cap"]
+            self.cmd_phy = mock + ["phy"]
+        else:
+            self.cmd_cap = [args.pktrec_cap]
+            self.cmd_phy = [args.pktrec_phy]
+        self.cmd_export = [args.pktrec_export]
+        self.lock = threading.Lock()          # capture state
+        self.hw_lock = threading.Lock()       # stats / phy caches
+        self.proc = None
+        self.cap = None                        # current capture (dict)
+        self.last = None                       # last finished capture (dict)
+        self.stats_cache = (0.0, None)
+        self.prev_counters = None              # (t, {port: counters})
+        self.rates = {}
+        self.phy_cache = (0.0, None)
+        self.version = self._image_version()
+
+    # ---- helpers ----
+    def run(self, cmd, timeout=10):
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=timeout, text=True)
+        except FileNotFoundError:
+            raise ApiError(500, f"{cmd[0]} not found")
+        except subprocess.TimeoutExpired:
+            raise ApiError(504, f"{os.path.basename(cmd[0])} timed out")
+        return r
+
+    def _image_version(self):
+        v = {"web": VERSION}
+        try:
+            with open("/etc/os-release") as f:
+                kv = dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+            v["image"] = " ".join(x.strip('"') for x in
+                                  (kv.get("PRETTY_NAME", ""), kv.get("BUILD_ID", "")) if x)
+        except OSError:
+            v["image"] = None
+        if self.a.mock:
+            v["image"] = "mock (host test)"
+        return v
+
+    def ssd_mounted(self):
+        if not self.a.mount_check:
+            return os.path.isdir(self.a.rec_dir)
+        return os.path.ismount(self.a.rec_dir)
+
+    def disk(self):
+        d = {"path": self.a.rec_dir, "mounted": self.ssd_mounted()}
+        if d["mounted"]:
+            st = os.statvfs(self.a.rec_dir)
+            d.update(total_bytes=st.f_blocks * st.f_frsize, free_bytes=st.f_bavail * st.f_frsize)
+        return d
+
+    def cap_path(self, name):
+        if name.endswith(".cap"):
+            name = name[:-4]
+        if not NAME_RE.match(name):
+            raise ApiError(400, "invalid capture name (letters, digits, '.', '_', '-'; max 64)")
+        return name, os.path.join(self.cap_dir, name + ".cap")
+
+    # ---- hardware snapshots (cached; every client shares them) ----
+    def hw_stats(self):
+        with self.hw_lock:
+            t, cached = self.stats_cache
+            now = time.monotonic()
+            if cached is not None and now - t < 0.8:
+                return cached
+            try:
+                r = self.run(self.cmd_cap + ["stats"], timeout=5)
+            except ApiError as e:               # tool missing / hung: report, keep serving
+                r = subprocess.CompletedProcess([], 1, "", e.msg)
+            if r.returncode != 0:
+                d = {"error": (r.stderr.strip() or "pktrec-cap stats failed")[-300:], "ports": {}}
+            else:
+                d = parse_cap_stats(r.stdout)
+                if self.prev_counters:
+                    t0, prev = self.prev_counters
+                    dt = now - t0
+                    for n, c in d["ports"].items():
+                        p = prev.get(n)
+                        if p and dt > 0 and c["frames_rx"] >= p["frames_rx"]:
+                            self.rates[n] = {
+                                "frames_s": (c["frames_rx"] - p["frames_rx"]) / dt,
+                                "bits_s": (c["bytes_rx"] - p["bytes_rx"]) * 8 / dt}
+                        else:
+                            self.rates[n] = {"frames_s": 0.0, "bits_s": 0.0}
+                self.prev_counters = (now, d["ports"])
+                for n, c in d["ports"].items():
+                    c.update(self.rates.get(n, {"frames_s": None, "bits_s": None}))
+            self.stats_cache = (now, d)
+            return d
+
+    def phy_status(self, max_age=2.0):
+        with self.hw_lock:
+            t, cached = self.phy_cache
+            now = time.monotonic()
+            if cached is not None and now - t < max_age:
+                return cached
+            try:
+                r = self.run(self.cmd_phy + ["status"], timeout=10)
+            except ApiError as e:
+                r = subprocess.CompletedProcess([], 1, "", e.msg)
+            if r.returncode != 0:
+                d = {"error": (r.stderr.strip() or "pktrec-phy status failed")[-300:],
+                     "ports": {}}
+            else:
+                d = {"error": None, "ports": parse_phy_status(r.stdout)}
+            self.phy_cache = (now, d)
+            return d
+
+    # ---- per-pair mode ----
+    def set_mode(self, pair, mode):
+        """tap = both ports of the pair forward to each other (path fwd),
+        monitor = both ports idle (receive only). M3 replaces this mapping by
+        pktrec-phy's own per-pair mode command; the API stays the same."""
+        with self.lock:
+            if self.proc is not None:
+                raise ApiError(409, "a capture is running; stop it before changing the mode")
+            path = {"tap": "fwd", "monitor": "idle"}[mode]
+            for port in PAIRS[pair]:
+                r = self.run(self.cmd_phy + ["path", str(port), path])
+                if r.returncode != 0:
+                    raise ApiError(500, f"pktrec-phy path {port} {path}: "
+                                   f"{(r.stderr or r.stdout).strip()[-300:]}")
+        with self.hw_lock:
+            self.phy_cache = (0.0, None)
+
+    # ---- capture control ----
+    def start(self, req):
+        ports = req.get("ports", list(range(NUM_PORTS)))
+        if (not isinstance(ports, list) or not ports or
+                any(not isinstance(p, int) or not 0 <= p < NUM_PORTS for p in ports)):
+            raise ApiError(400, "ports must be a non-empty list of 0..3")
+        ports = sorted(set(ports))
+        snaplen = req.get("snaplen", 0) or 0
+        if not isinstance(snaplen, int) or not 0 <= snaplen <= 65535:
+            raise ApiError(400, "snaplen must be 0..65535 (0 = whole frames)")
+        dur = req.get("duration_s")
+        size = req.get("size_bytes")
+        if dur is not None and (not isinstance(dur, (int, float)) or dur <= 0):
+            raise ApiError(400, "duration_s must be > 0")
+        if size is not None and (not isinstance(size, int) or size <= 0):
+            raise ApiError(400, "size_bytes must be a positive integer")
+        name = req.get("name") or time.strftime("cap-%Y%m%d-%H%M%S", time.gmtime())
+        name, path = self.cap_path(str(name))
+        with self.lock:
+            if self.proc is not None:
+                raise ApiError(409, f"a capture is already running ({self.cap['name']})")
+            if not self.ssd_mounted():
+                raise ApiError(503, f"the SSD is not mounted at {self.a.rec_dir}")
+            os.makedirs(self.cap_dir, exist_ok=True)
+            if os.path.exists(path):
+                raise ApiError(409, f"capture '{name}' already exists")
+            cmd = self.cmd_cap + ["record", "--ports", ",".join(map(str, ports)),
+                                  "--snaplen", str(snaplen), "--stats", "1"]
+            if dur is not None:
+                cmd += ["--duration", f"{dur:g}"]
+            if size is not None:
+                cmd += ["--size", str(size)]
+            cmd.append(path)
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        stdin=subprocess.DEVNULL, text=True, bufsize=1,
+                                        start_new_session=True)
+            except OSError as e:
+                raise ApiError(500, f"cannot run pktrec-cap: {e}")
+            self.proc = proc
+            self.cap = {"name": name, "file": path, "ports": ports, "snaplen": snaplen,
+                        "duration_s": dur, "size_bytes": size, "started": time.time(),
+                        "t0": time.monotonic(), "live": None, "log": [], "stdout": [],
+                        "stopping": False}
+            cap = self.cap
+            threading.Thread(target=self._read_stderr, args=(proc, cap), daemon=True).start()
+            threading.Thread(target=self._reap, args=(proc, cap), daemon=True).start()
+        # an immediate failure (no device, no hugepages, ...) is reported here
+        try:
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            return self.capture_state()
+        for _ in range(50):                    # let _reap record the result
+            if self.proc is not proc:
+                break
+            time.sleep(0.02)
+        res = self.last if self.last and self.last["name"] == name else None
+        if res and res["exit_code"] == 1:
+            try:
+                if os.path.getsize(path) <= HDR_SIZE:
+                    os.unlink(path)
+            except OSError:
+                pass
+            raise ApiError(500, "pktrec-cap failed: " + (res["message"] or "error"))
+        return self.capture_state()
+
+    def _read_stderr(self, proc, cap):
+        for line in proc.stderr:
+            line = line.rstrip("\r\n")
+            live = parse_live_line(line)
+            if live:
+                cap["live"] = live
+            elif line:
+                cap["log"] = (cap["log"] + [line])[-40:]
+
+    def _reap(self, proc, cap):
+        out = proc.stdout.read()
+        code = proc.wait()
+        result = {}
+        for line in out.splitlines():
+            m = RESULT_RE.match(line)
+            if m:
+                for kv in m.group(1).split():
+                    k, _, v = kv.partition("=")
+                    try:
+                        result[k] = float(v) if "." in v else int(v)
+                    except ValueError:
+                        result[k] = v
+        msg = None
+        if code == 1:
+            msg = "; ".join(cap["log"][-3:]) or "pktrec-cap exited with an error"
+        elif code == 2:
+            msg = "frames were dropped: the capture is not lossless"
+        elif code < 0:
+            msg = f"pktrec-cap killed by signal {-code}"
+        with self.lock:
+            self.last = {"name": cap["name"], "file": cap["file"], "exit_code": code,
+                         "lossless": code == 0, "result": result, "message": msg,
+                         "summary": out.strip().splitlines()[-12:], "log": cap["log"][-10:],
+                         "finished": time.time()}
+            if self.proc is proc:
+                self.proc = None
+                self.cap = None
+
+    def stop(self, wait=15.0):
+        with self.lock:
+            proc, cap = self.proc, self.cap
+            if proc is None:
+                raise ApiError(409, "no capture is running")
+            cap["stopping"] = True
+            try:
+                proc.send_signal(signal.SIGTERM)  # pktrec-cap stops cleanly (FILL, header)
+            except ProcessLookupError:
+                pass
+        t_end = time.monotonic() + wait
+        while time.monotonic() < t_end and self.proc is proc:
+            time.sleep(0.05)
+        return self.capture_state()
+
+    def capture_state(self):
+        with self.lock:
+            cap, last = self.cap, self.last
+            if cap is None:
+                return {"state": "idle", "last": last}
+            st = {"state": "stopping" if cap["stopping"] else "running",
+                  "name": cap["name"], "ports": cap["ports"], "snaplen": cap["snaplen"],
+                  "duration_s": cap["duration_s"], "size_bytes": cap["size_bytes"],
+                  "started": iso_ns(int(cap["started"] * 1e9)),
+                  "elapsed_s": time.monotonic() - cap["t0"], "live": cap["live"],
+                  "log": cap["log"][-5:], "last": last}
+        try:
+            st["file_bytes"] = os.path.getsize(cap["file"])
+        except OSError:
+            st["file_bytes"] = None
+        return st
+
+    def shutdown(self):
+        with self.lock:
+            proc = self.proc
+        if proc:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    # ---- captures ----
+    def active_name(self):
+        with self.lock:
+            return self.cap["name"] if self.cap else None
+
+    def captures(self):
+        out = []
+        with self.lock:
+            cap = dict(self.cap) if self.cap else {}
+        active = cap.get("name")
+        try:
+            names = sorted(os.listdir(self.cap_dir))
+        except OSError:
+            return out
+        for fn in names:
+            if not fn.endswith(".cap") or not NAME_RE.match(fn[:-4]):
+                continue
+            path = os.path.join(self.cap_dir, fn)
+            try:
+                st = os.stat(path)
+                with open(path, "rb") as f:
+                    raw = f.read(HDR_SIZE)
+            except OSError:
+                continue
+            e = {"name": fn[:-4], "file_bytes": st.st_size, "recording": fn[:-4] == active,
+                 "mtime": iso_ns(int(st.st_mtime * 1e9))}
+            try:
+                h = parse_header(raw)
+                e.update({k: h[k] for k in ("start_time", "duration_s", "ports_captured",
+                                             "drops", "records", "data_bytes", "snaplen",
+                                             "complete", "pair_modes")})
+            except ValueError as ex:
+                if not e["recording"]:           # the header is written at start and stop
+                    e["error"] = str(ex)
+            if e["recording"]:
+                e.update(ports_captured=cap.get("ports"), drops=None, duration_s=None,
+                         start_time=iso_ns(int(cap.get("started", 0) * 1e9)))
+            out.append(e)
+        out.sort(key=lambda e: e.get("start_time") or e["mtime"] or "", reverse=True)
+        return out
+
+    def capture_info(self, name):
+        name, path = self.cap_path(name)
+        if not os.path.isfile(path):
+            raise ApiError(404, f"no capture '{name}'")
+        with open(path, "rb") as f:
+            raw = f.read(HDR_SIZE)
+        try:
+            h = parse_header(raw)
+        except ValueError as e:
+            h = {"error": str(e)}
+        r = self.run(self.cmd_cap + ["info", path])
+        h["name"] = name
+        h["file_bytes"] = os.path.getsize(path)
+        h["recording"] = name == self.active_name()
+        h["info_text"] = r.stdout if r.returncode == 0 else (r.stderr or r.stdout)
+        return h
+
+    def delete(self, name):
+        name, path = self.cap_path(name)
+        if name == self.active_name():
+            raise ApiError(409, "the capture is being recorded; stop it first")
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            raise ApiError(404, f"no capture '{name}'")
+        return {"deleted": name}
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml",
+                ".ico": "image/x-icon"}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "pktrec-web/" + VERSION
+    backend = None
+    static_dir = None
+    quiet = False
+
+    def log_message(self, fmt, *args):
+        if not self.quiet:
+            sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+    # ---- responses ----
+    def send_json(self, code, obj):
+        body = json.dumps(obj, indent=None, separators=(",", ":")).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def send_error_json(self, code, msg):
+        self.send_json(code, {"error": msg})
+
+    def read_json(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 65536:
+            raise ApiError(413, "request body too large")
+        raw = self.rfile.read(n) if n else b""
+        if not raw.strip():
+            return {}
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            raise ApiError(400, "body is not valid JSON")
+        if not isinstance(obj, dict):
+            raise ApiError(400, "body must be a JSON object")
+        return obj
+
+    # ---- dispatch ----
+    def do_GET(self):
+        self.dispatch("GET")
+
+    def do_HEAD(self):
+        self.dispatch("HEAD")
+
+    def do_POST(self):
+        self.dispatch("POST")
+
+    def do_DELETE(self):
+        self.dispatch("DELETE")
+
+    def dispatch(self, method):
+        path = urllib.parse.urlsplit(self.path).path
+        try:
+            if not path.startswith("/api/"):
+                if method not in ("GET", "HEAD"):
+                    raise ApiError(405, "method not allowed")
+                return self.serve_static(path)
+            if method == "POST":
+                body = self.read_json()
+            elif method in ("GET", "HEAD", "DELETE"):
+                body = None
+                # a DELETE may still carry a body; drain it to keep the connection usable
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(min(n, 65536))
+            return self.route(method, path, body)
+        except ApiError as e:
+            self.send_error_json(e.code, e.msg)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:                       # noqa: BLE001 - report, keep serving
+            self.log_error("internal error: %r", e)
+            try:
+                self.send_error_json(500, f"internal error: {e}")
+            except OSError:
+                pass
+
+    def route(self, method, path, body):
+        b = self.backend
+        if path == "/api/status" and method in ("GET", "HEAD"):
+            return self.send_json(200, self.status())
+        if path == "/api/stats" and method in ("GET", "HEAD"):
+            return self.send_json(200, self.stats())
+        if path == "/api/mode":
+            if method != "POST":
+                raise ApiError(405, "use POST")
+            pair, mode = body.get("pair"), body.get("mode")
+            if pair not in (0, 1) or isinstance(pair, bool):
+                raise ApiError(400, "pair must be 0 (P0/P1) or 1 (P2/P3)")
+            if mode not in ("tap", "monitor"):
+                raise ApiError(400, "mode must be 'tap' or 'monitor'")
+            b.set_mode(pair, mode)
+            return self.send_json(200, {"pairs": self.pairs(b.phy_status(0))})
+        if path == "/api/capture/start":
+            if method != "POST":
+                raise ApiError(405, "use POST")
+            return self.send_json(202, b.start(body))
+        if path == "/api/capture/stop":
+            if method != "POST":
+                raise ApiError(405, "use POST")
+            return self.send_json(200, b.stop())
+        if path == "/api/capture":
+            return self.send_json(200, b.capture_state())
+        if path in ("/api/captures", "/api/captures/"):
+            if method not in ("GET", "HEAD"):
+                raise ApiError(405, "use GET")
+            return self.send_json(200, {"captures": b.captures(), "disk": b.disk()})
+        m = re.match(r"^/api/captures/([^/]+?)(\.pcapng|\.cap|/info)?$", path)
+        if m:
+            name, kind = urllib.parse.unquote(m.group(1)), m.group(2)
+            if kind is None and method == "DELETE":
+                return self.send_json(200, b.delete(name))
+            if method not in ("GET", "HEAD"):
+                raise ApiError(405, "method not allowed")
+            if kind == "/info":
+                return self.send_json(200, b.capture_info(name))
+            if kind == ".pcapng":
+                return self.download_pcapng(name)
+            if kind == ".cap":
+                return self.download_raw(name)
+            return self.send_json(200, b.capture_info(name))
+        raise ApiError(404, "no such endpoint")
+
+    # ---- views ----
+    def pairs(self, phy):
+        out = []
+        for i, pp in enumerate(PAIRS):
+            paths = [phy["ports"].get(p, {}).get("path") for p in pp]
+            out.append({"pair": i, "ports": list(pp), "paths": paths,
+                        "mode": pair_mode_from_paths(paths) if all(paths) else None})
+        return out
+
+    def stats(self):
+        b = self.backend
+        hw = b.hw_stats()
+        return {"time": iso_ns(time.time_ns()), "capture": b.capture_state(),
+                "counters": hw, "disk": b.disk()}
+
+    def status(self):
+        b = self.backend
+        hw = b.hw_stats()
+        phy = b.phy_status()
+        ports = []
+        for n in range(NUM_PORTS):
+            p = dict(phy["ports"].get(n, {}))
+            c = hw.get("ports", {}).get(n, {})
+            if not p:                               # pktrec-phy unavailable: shell state
+                lk = c.get("link")
+                p = {"link": bool(lk and lk not in ("down", "?")),
+                     "speed": lk if lk not in (None, "down", "?") else None}
+            p["port"] = n
+            p["counters"] = c
+            ports.append(p)
+        return {
+            "version": dict(b.version, capture_block=hw.get("cap_version")),
+            "time": {"system": iso_ns(time.time_ns()), "timebase_ns": hw.get("timebase_ns"),
+                     "timebase": hw.get("timebase"), "tb_status": hw.get("tb_status")},
+            "ports": ports, "pairs": self.pairs(phy),
+            "capture": b.capture_state(), "disk": b.disk(),
+            "errors": {"pktrec-phy": phy.get("error"), "pktrec-cap": hw.get("error")},
+        }
+
+    # ---- downloads ----
+    def _check_download(self, name):
+        name, path = self.backend.cap_path(name)
+        if not os.path.isfile(path):
+            raise ApiError(404, f"no capture '{name}'")
+        if name == self.backend.active_name():
+            raise ApiError(409, "the capture is still being recorded")
+        return name, path
+
+    def _start_chunked(self, ctype, fname):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    def _chunk(self, data):
+        self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+
+    def download_pcapng(self, name):
+        name, path = self._check_download(name)
+        try:
+            proc = subprocess.Popen(self.backend.cmd_export + [path, "-o", "-"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    stdin=subprocess.DEVNULL)
+        except OSError as e:
+            raise ApiError(500, f"cannot run pktrec-export: {e}")
+        errbuf = []
+        t = threading.Thread(target=lambda: errbuf.append(proc.stderr.read()), daemon=True)
+        t.start()
+        ok = False
+        try:
+            first = proc.stdout.read1(CHUNK)
+            if not first:
+                code = proc.wait()
+                t.join(2)
+                raise ApiError(500, f"pktrec-export failed (exit {code}): " +
+                               (errbuf[0] if errbuf else b"").decode(errors="replace")
+                               .strip()[-300:])
+            self._start_chunked("application/x-pcapng", name + ".pcapng")
+            if self.command == "HEAD":
+                self.wfile.write(b"0\r\n\r\n")
+                ok = True
+                return
+            data = first
+            while data:
+                self._chunk(data)
+                data = proc.stdout.read1(CHUNK)
+            code = proc.wait()
+            if code == 1:
+                # error mid-stream: end without the terminating chunk, so the client
+                # sees an incomplete transfer instead of a silently short file
+                self.log_error("pktrec-export %s: exit 1 mid-stream", name)
+                self.close_connection = True
+                return
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            ok = True
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            proc.stdout.close()
+            if not ok:
+                self.close_connection = True
+
+    def download_raw(self, name):
+        name, path = self._check_download(name)
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}.cap"')
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(path, "rb") as f:
+            shutil.copyfileobj(f, self.wfile, CHUNK)
+
+    def serve_static(self, path):
+        if path in ("", "/"):
+            path = "/index.html"
+        rel = os.path.normpath(urllib.parse.unquote(path)).lstrip("/")
+        full = os.path.join(self.static_dir, rel)
+        if rel.startswith("..") or not os.path.isfile(full):
+            raise ApiError(404, "not found")
+        ctype = STATIC_TYPES.get(os.path.splitext(full)[1], "application/octet-stream")
+        with open(full, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, handler, bind_dev=None):
+        self.bind_dev = bind_dev
+        super().__init__(addr, handler)
+
+    def server_bind(self):
+        if self.bind_dev:
+            # listen on the interface, whatever address DHCP gives it (needs root)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                                   self.bind_dev.encode())
+        super().server_bind()
+
+
+def main():
+    here = os.path.dirname(os.path.realpath(__file__))
+    ap = argparse.ArgumentParser(prog="pktrec-web", description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="API:" + __doc__.split("API", 1)[1].split("\n\n")[0][1:])
+    ap.add_argument("--interface", default="end0",
+                    help="serve on this interface only (SO_BINDTODEVICE, follows DHCP "
+                         "address changes; default end0 = the ZCU106 GEM)")
+    ap.add_argument("--bind", help="bind to this address instead of --interface "
+                                   "(e.g. 0.0.0.0 or 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--rec-dir", default="/mnt/rec",
+                    help="SSD mount point; captures go to <rec-dir>/captures")
+    ap.add_argument("--mount-check", dest="mount_check", action="store_true", default=None,
+                    help="refuse captures unless --rec-dir is a mount point (default, "
+                         "except with --mock)")
+    ap.add_argument("--no-mount-check", dest="mount_check", action="store_false")
+    ap.add_argument("--static-dir", help="UI files (default: ./static next to the script, "
+                                         "else /usr/share/pktrec-web/static)")
+    ap.add_argument("--pktrec-cap", default="pktrec-cap")
+    ap.add_argument("--pktrec-phy", default="pktrec-phy")
+    ap.add_argument("--pktrec-export", default="pktrec-export")
+    ap.add_argument("--mock", action="store_true",
+                    help="fake pktrec-cap/pktrec-phy with mock_tools.py (host test); "
+                         "pktrec-export is still run (give a host build)")
+    ap.add_argument("--banner", action="store_true",
+                    help="print 'pktrec web UI: http://<ip>:<port>/' once --interface has an "
+                         "IPv4 address (boot banner), then exit")
+    ap.add_argument("--wait", type=float, default=120,
+                    help="seconds to wait for the interface address (--banner, --bind "
+                         "fallback; default 120)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="no request log")
+    a = ap.parse_args()
+
+    if a.banner:
+        ip = wait_iface_ipv4(a.interface, a.wait)
+        if ip:
+            print(f"pktrec web UI: http://{ip}:{a.port}/", flush=True)
+            return 0
+        print(f"pktrec web UI: {a.interface} has no IPv4 address yet "
+              f"(port {a.port}; see 'ip addr show {a.interface}')", flush=True)
+        return 1
+
+    if a.mount_check is None:
+        a.mount_check = not a.mock
+    if a.static_dir is None:
+        a.static_dir = os.path.join(here, "static")
+        if not os.path.isdir(a.static_dir):
+            a.static_dir = "/usr/share/pktrec-web/static"
+    if a.mock:
+        os.environ.setdefault("PKTREC_MOCK_STATE", os.path.join(a.rec_dir, ".mock-state"))
+        os.makedirs(os.environ["PKTREC_MOCK_STATE"], exist_ok=True)
+
+    backend = Backend(a)
+    Handler.backend = backend
+    Handler.static_dir = a.static_dir
+    Handler.quiet = a.quiet
+
+    if a.bind:
+        srv, where = Server((a.bind, a.port), Handler), f"{a.bind}:{a.port}"
+    else:
+        try:
+            srv = Server(("0.0.0.0", a.port), Handler, bind_dev=a.interface)
+            ip = iface_ipv4(a.interface)
+            where = f"{a.interface} ({ip or 'no address yet'}):{a.port}"
+        except PermissionError:
+            # not root: bind to the interface's current address instead
+            ip = wait_iface_ipv4(a.interface, a.wait)
+            if not ip:
+                sys.exit(f"pktrec-web: {a.interface} has no IPv4 address")
+            srv, where = Server((ip, a.port), Handler), f"{ip}:{a.port}"
+        except OSError as e:
+            if e.errno == errno.ENODEV:
+                sys.exit(f"pktrec-web: no interface {a.interface} (use --interface/--bind)")
+            raise
+    print(f"pktrec-web {VERSION}: serving on {where}{' [MOCK]' if a.mock else ''}, "
+          f"captures in {backend.cap_dir}", flush=True)
+
+    def on_term(signum, frame):
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, on_term)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        backend.shutdown()          # a running capture is stopped cleanly
+        srv.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
