@@ -21,16 +21,21 @@
 #   user_data_sink             playback sink (checker)
 #   axi_dma_0 / axi_smc_dma    recorder AXI DMA (SG, S2MM + MM2S) -> S_AXI_HP2_FPD
 #   concat_interrupts          pl_ps_irq0
+#   eth_ports                  Ethernet FMC Max (OP080) on HPC0: 4-port 1G SGMII
+#                              MAC/PCS/GTH (pktrec_eth_ports, Taxi) + the M0 bring-up
+#                              datapath (pktrec_m0_path: per-port idle/loopback/forward)
 #
 # Names that software depends on (do not rename without updating
 # Yocto/bsp/zcu106/.../system-user.dtsi): fdrec_core/fdrec_core_0 (DT label
-# fdrec_core_fdrec_core_0) and axi_dma_0.
+# fdrec_core_fdrec_core_0), axi_dma_0, eth_ports/pktrec_eth_ports_0 and
+# eth_ports/pktrec_m0_path_0 (DT labels eth_ports_pktrec_eth_ports_0 and
+# eth_ports_pktrec_m0_path_0, bound to generic-uio for sw/pktrec-tools).
 #
-# Reserved for the Ethernet FMC Max (OP080) port subsystem on HPC0 (added later):
-#   - HPC0 LA/HA pins, GTH quads 226/227 and the HPC0 GBTCLKs (nothing here uses them)
-#   - PS ports S_AXI_HP1_FPD, S_AXI_HP3_FPD, S_AXI_HPC0/1_FPD (all free)
-#   - periph_intercon_0: append master ports after the recorder's (see add_periph_slave)
-#   - pl_ps_irq0: append inputs at In8 and up (see add_irq)
+# Ethernet FMC Max (OP080) on HPC0 (hierarchy eth_ports): GTH quad 226
+# (GTHE4_CHANNEL_X0Y12..X0Y15, refclk GBTCLK0_M2C V8/V7), MDIO, PHY resets, PHY
+# GPIO_0/1 and PG pins (src/constraints/zcu106.xdc). Still free for later
+# milestones: PS ports S_AXI_HP1_FPD, S_AXI_HP3_FPD, S_AXI_HPC0/1_FPD;
+# pl_ps_irq0 inputs In8 and up (see add_irq).
 #
 # Address map (PS view) and interrupts are kept identical to the FPGA Drive
 # Recorder's zcu106_hpc0 target so that its driver, DT binding and docs apply:
@@ -38,6 +43,8 @@
 #   xdma_0 S_AXI_LITE (RP config) 0x04_0000_0000  512M
 #   axi_dma_0 S_AXI_LITE          0x04_2000_0000   64K
 #   fdrec_core_0 s_axi            0x04_2001_0000    4K
+#   eth_ports/pktrec_m0_path_0    0x04_2002_0000    4K   (M0 path registers)
+#   eth_ports/pktrec_eth_ports_0  0x04_2008_0000  512K   (MAC/PCS/MDIO regs + GT APB)
 #   pl_ps_irq0[0..2]  xdma_0 interrupt_out, MSI 0-31, MSI 32-63  (GIC SPI 89..91)
 #   pl_ps_irq0[3..5]  reserved, tied low                         (GIC SPI 92..94)
 #   pl_ps_irq0[6]     axi_dma_0 s2mm_introut                     (GIC SPI 95)
@@ -504,6 +511,117 @@ add_irq axi_dma_0/s2mm_introut 6
 add_irq axi_dma_0/mm2s_introut 7
 
 # ------------------------------------------------------------------------------
+# Ethernet FMC Max (OP080) on HPC0: hierarchy eth_ports
+# ------------------------------------------------------------------------------
+#
+#  GBTCLK0 125 MHz --> pktrec_eth_ports_0 (Taxi taxi_eth_mac_1g_basex_us, CNT 4,
+#  DP0..DP3 <-->       GTH quad 226, SGMII to the four DP83867s, MDIO master,
+#                      PHY resets, AXI-Lite regs + GT APB)
+#                        | m_axis_rx_n (rx_clk_n)      ^ s_axis_tx_n (tx_clk_n)
+#                        v                             |
+#                      pktrec_m0_path_0 (8 async frame FIFOs: per TX port n a LOOP
+#                      FIFO from RX n and a FWD FIFO from RX n^1; PATH_CTRL selects;
+#                      counters; PHY GPIO_0/1 + PG levels and edge counters;
+#                      placeholder timestamp counters -> tx/rx_ptp_ts_n)
+#
+# ctrl_clk = pl_clk0 (100 MHz) for both s_axi ports, the MDIO master and the Taxi
+# transceiver reset/DRP logic. The GT wizard IP declares a 62.5 MHz free-running
+# clock; Taxi's sequencers count fixed cycles, so 100 MHz only shortens their waits
+# (Taxi's own ZCU106 example runs them at 125 MHz). The only consequence is the
+# OOC Timing 38-316 period-mismatch warning. No extra MMCM is used.
+#
+# pktrec_eth_ports parameters: low-latency (buffer-bypass) GT variant, 64-bit MAC
+# timestamps (48.16 ns), TX padding OFF (frames are forwarded unmodified, runts
+# included), GTs run from reset (GCTRL.xcvr_rst = 0).
+#
+# The module-reference RX streams have no TREADY: pktrec_m0_path always accepts
+# (its frame FIFOs drop whole frames when full).
+
+create_bd_cell -type hier eth_ports
+create_bd_cell -type module -reference pktrec_eth_ports eth_ports/pktrec_eth_ports_0
+set_property -dict [list CONFIG.CFG_LOW_LATENCY {1} \
+  CONFIG.PTP_TS_EN {1} \
+  CONFIG.PTP_TS_W {64} \
+  CONFIG.PTP_TS_FMT_TOD {0} \
+  CONFIG.DEFAULT_TX_PAD_EN {0} \
+  CONFIG.XCVR_RST_DEFAULT {0}] [get_bd_cells eth_ports/pktrec_eth_ports_0]
+create_bd_cell -type module -reference pktrec_m0_path eth_ports/pktrec_m0_path_0
+set_property -dict [list CONFIG.PTP_TS_W {64} CONFIG.FIFO_DEPTH {4096}] \
+  [get_bd_cells eth_ports/pktrec_m0_path_0]
+
+set ep eth_ports/pktrec_eth_ports_0
+set mp eth_ports/pktrec_m0_path_0
+
+# Hierarchy pins
+create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 eth_ports/gt_ref_clk
+create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:gt_rtl:1.0 eth_ports/gt
+create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 eth_ports/S_AXI_ETH
+create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 eth_ports/S_AXI_M0
+create_bd_pin -dir I -type clk eth_ports/ctrl_clk
+create_bd_pin -dir I -type rst eth_ports/ctrl_aresetn
+create_bd_pin -dir O eth_ports/mdc
+create_bd_pin -dir IO eth_ports/mdio
+create_bd_pin -dir O -from 3 -to 0 eth_ports/phy_reset_n
+create_bd_pin -dir I -from 3 -to 0 eth_ports/phy_gpio0
+create_bd_pin -dir I -from 3 -to 0 eth_ports/phy_gpio1
+create_bd_pin -dir I eth_ports/pg_1v0
+create_bd_pin -dir I eth_ports/pg_2v5
+
+connect_bd_intf_net [get_bd_intf_pins eth_ports/gt_ref_clk] [get_bd_intf_pins $ep/gt_ref_clk]
+connect_bd_intf_net [get_bd_intf_pins $ep/gt] [get_bd_intf_pins eth_ports/gt]
+connect_bd_intf_net [get_bd_intf_pins eth_ports/S_AXI_ETH] [get_bd_intf_pins $ep/s_axi]
+connect_bd_intf_net [get_bd_intf_pins eth_ports/S_AXI_M0] [get_bd_intf_pins $mp/s_axi]
+connect_bd_net [get_bd_pins eth_ports/ctrl_clk] [get_bd_pins $ep/ctrl_clk] [get_bd_pins $mp/ctrl_clk]
+connect_bd_net [get_bd_pins eth_ports/ctrl_aresetn] [get_bd_pins $ep/ctrl_aresetn] [get_bd_pins $mp/ctrl_aresetn]
+connect_bd_net [get_bd_pins $ep/mdc] [get_bd_pins eth_ports/mdc]
+connect_bd_net [get_bd_pins $ep/mdio] [get_bd_pins eth_ports/mdio]
+connect_bd_net [get_bd_pins $ep/phy_reset_n] [get_bd_pins eth_ports/phy_reset_n]
+foreach p {phy_gpio0 phy_gpio1 pg_1v0 pg_2v5} {
+  connect_bd_net [get_bd_pins eth_ports/$p] [get_bd_pins $mp/$p]
+}
+
+# MAC <-> M0 path, per port
+for {set n 0} {$n < 4} {incr n} {
+  foreach p [list rx_clk_$n rx_aresetn_$n tx_clk_$n tx_aresetn_$n] {
+    connect_bd_net [get_bd_pins $ep/$p] [get_bd_pins $mp/$p]
+  }
+  connect_bd_intf_net [get_bd_intf_pins $ep/m_axis_rx_$n] [get_bd_intf_pins $mp/s_axis_rx_$n]
+  connect_bd_intf_net [get_bd_intf_pins $mp/m_axis_tx_$n] [get_bd_intf_pins $ep/s_axis_tx_$n]
+  connect_bd_net [get_bd_pins $mp/tx_ptp_ts_$n] [get_bd_pins $ep/tx_ptp_ts_$n]
+  connect_bd_net [get_bd_pins $mp/rx_ptp_ts_$n] [get_bd_pins $ep/rx_ptp_ts_$n]
+}
+foreach p {rx_stat_pkt_good rx_stat_pkt_bad tx_stat_pkt_good tx_stat_err_underflow link_up} {
+  connect_bd_net [get_bd_pins $ep/$p] [get_bd_pins $mp/$p]
+}
+
+# External ports (names match src/constraints/zcu106.xdc)
+create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 gt_ref_clk
+set_property CONFIG.FREQ_HZ {125000000} [get_bd_intf_ports gt_ref_clk]
+connect_bd_intf_net [get_bd_intf_ports gt_ref_clk] [get_bd_intf_pins eth_ports/gt_ref_clk]
+create_bd_intf_port -mode Master -vlnv xilinx.com:interface:gt_rtl:1.0 gt
+connect_bd_intf_net [get_bd_intf_pins eth_ports/gt] [get_bd_intf_ports gt]
+create_bd_port -dir O mdc
+connect_bd_net [get_bd_pins eth_ports/mdc] [get_bd_ports mdc]
+create_bd_port -dir IO mdio
+connect_bd_net [get_bd_pins eth_ports/mdio] [get_bd_ports mdio]
+create_bd_port -dir O -from 3 -to 0 phy_reset_n
+connect_bd_net [get_bd_pins eth_ports/phy_reset_n] [get_bd_ports phy_reset_n]
+foreach p {phy_gpio0 phy_gpio1} {
+  create_bd_port -dir I -from 3 -to 0 $p
+  connect_bd_net [get_bd_ports $p] [get_bd_pins eth_ports/$p]
+}
+foreach p {pg_1v0 pg_2v5} {
+  create_bd_port -dir I $p
+  connect_bd_net [get_bd_ports $p] [get_bd_pins eth_ports/$p]
+}
+
+# Control clock / reset and the two AXI-Lite slaves (pl_clk0, same as the crossbar)
+connect_bd_net [get_bd_pins $ps/pl_clk0] [get_bd_pins eth_ports/ctrl_clk]
+connect_bd_net [get_bd_pins rst_pl_clk0/peripheral_aresetn] [get_bd_pins eth_ports/ctrl_aresetn]
+add_periph_slave eth_ports/S_AXI_ETH $ps/pl_clk0 rst_pl_clk0/peripheral_aresetn
+add_periph_slave eth_ports/S_AXI_M0 $ps/pl_clk0 rst_pl_clk0/peripheral_aresetn
+
+# ------------------------------------------------------------------------------
 # Address map
 # ------------------------------------------------------------------------------
 
@@ -511,6 +629,8 @@ assign_ps_addr pcie_ssd1/xdma_0/S_AXI_B    0x00A0000000 256M
 assign_ps_addr pcie_ssd1/xdma_0/S_AXI_LITE 0x0400000000 512M
 assign_ps_addr axi_dma_0/S_AXI_LITE        0x0420000000 64K
 assign_ps_addr fdrec_core/fdrec_core_0/s_axi 0x0420010000 4K
+assign_ps_addr eth_ports/pktrec_m0_path_0/s_axi   0x0420020000 4K
+assign_ps_addr eth_ports/pktrec_eth_ports_0/s_axi 0x0420080000 512K
 # Everything else: the masters' (PCIe M_AXI_B, DMA SG/S2MM/MM2S) view of PS DDR
 assign_bd_address
 

@@ -240,6 +240,17 @@ if {[llength $hdr_files] > 0} {
 }
 update_compile_order -fileset sources_1
 
+# Ethernet FMC Max (OP080) port subsystem: the Taxi 1G SGMII MAC/PCS/GT library
+# (submodules/taxi, used unmodified), its GT wizard IPs and its implementation-only
+# CDC constraint scripts. Must run before the block design: the eth_ports module
+# references (pktrec_eth_ports, pktrec_m0_path) instantiate Taxi modules and the
+# GT IPs. See scripts/taxi_sources.tcl.
+set taxi_dir       [file normalize "$origin_dir/../submodules/taxi"]
+set pktrec_hdl_dir [file normalize "$origin_dir/src/hdl"]
+set pktrec_gt_ll   1
+source [file normalize "$origin_dir/scripts/taxi_sources.tcl"]
+update_compile_order -fileset sources_1
+
 # Create the GT LOC dictionary that is used by the block design script
 source $origin_dir/src/bd/gt_locs.tcl
 
