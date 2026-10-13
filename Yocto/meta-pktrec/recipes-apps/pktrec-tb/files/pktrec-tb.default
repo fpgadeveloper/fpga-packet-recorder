@@ -1,0 +1,5 @@
+# pktrec-tb.service options ('pktrec-tb daemon --help'), e.g.
+#   --lock-threshold 5000 --lock-time 60     stricter lock criterion
+#   --no-set                                  never TB_SET (slew only)
+#   -v                                        log every sample to the journal
+PKTREC_TB_ARGS=

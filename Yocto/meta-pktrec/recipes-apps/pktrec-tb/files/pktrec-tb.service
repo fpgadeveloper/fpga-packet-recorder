@@ -1,0 +1,19 @@
+# FPGA Packet Recorder: discipline the capture timebase (64-bit ns PHC on
+# dp_clk) to CLOCK_REALTIME, which systemd-timesyncd keeps on NTP through the
+# PS Ethernet port. TB_SET at start-up, then frequency (INC) trim + small ADJ
+# steps; never a TB_SET or TB_ADJ while a capture runs. State for pktrec-web /
+# pktrec-cap in /run/pktrec/tb.json. Options: /etc/default/pktrec-tb.
+[Unit]
+Description=Packet recorder timebase discipline to CLOCK_REALTIME (pktrec-tb)
+After=systemd-udev-settle.service pktrec-phy-watch.service pktrec-calibration.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/pktrec-tb
+ExecStart=/usr/bin/python3 -u /usr/bin/pktrec-tb daemon $PKTREC_TB_ARGS
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

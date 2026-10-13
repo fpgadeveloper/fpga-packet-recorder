@@ -1,0 +1,19 @@
+# FPGA Packet Recorder: apply the persistent calibration at boot. The capture
+# block's registers (timebase INC, MAC_OFFSET, SFD windows, filter and per-port
+# RX/TX offsets) reset on every bitstream load; this writes the values of
+# /etc/pktrec/calibration.conf ('pktrec-tb save-calibration' writes that file).
+# Result: /run/pktrec/calibration.json (shown by 'pktrec-tb status' and the web UI).
+[Unit]
+Description=Apply the packet recorder calibration (/etc/pktrec/calibration.conf)
+After=systemd-udev-settle.service pktrec-phy-watch.service
+Wants=systemd-udev-settle.service
+Before=pktrec-tb.service pktrec-web.service
+ConditionPathExists=/etc/pktrec/calibration.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /usr/bin/pktrec-tb apply-calibration
+
+[Install]
+WantedBy=multi-user.target

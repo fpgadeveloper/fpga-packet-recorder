@@ -3,4 +3,4 @@
 # SPDX-License-Identifier: MIT
 
 # FPGA Packet Recorder additions to the EDF disk image.
-IMAGE_INSTALL:append = " pktrec-tools pktrec-apps pktrec-test pktrec-web"
+IMAGE_INSTALL:append = " pktrec-tools pktrec-apps pktrec-test pktrec-web pktrec-tb"
