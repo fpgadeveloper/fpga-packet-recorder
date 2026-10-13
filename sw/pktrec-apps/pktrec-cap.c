@@ -71,7 +71,6 @@ const char *prog_name = "pktrec-cap";
 #define DEF_TIMEOUT     10.0    /* s with writes in flight and none completing */
 #define IDLE_TIMEOUT    5.0     /* s to wait for STATUS.IDLE at stop */
 #define FILL_TIMEOUT    10.0    /* s to collect the tail with FILL on */
-#define TB_LOCK_TIMEOUT 0.2     /* s for the timebase copies to re-lock */
 #define HDR_SIZE        PKTREC_FILE_HEADER_SIZE
 #define UD_POLL         ((uint64_t)-1)
 #define ALL_PORTS       ((1u << PKTREC_NUM_PORTS) - 1)
@@ -787,25 +786,24 @@ static void snapshot_counters(struct rec *r)
 	r->hdr->stop_time_ns = realtime_ns();
 }
 
-/* Set the timebase to CLOCK_REALTIME and wait for the RX copies to re-lock */
+/*
+ * Set the timebase to CLOCK_REALTIME. Register map 1.1: SET applies on the next
+ * dp_clk cycle and the MAC clock domains follow at once (cycle-count copies, no
+ * lock); TB_STATUS only says which MAC clock domains are out of reset, so a
+ * port without link is reported, not treated as an error.
+ */
 static int tb_set_realtime(struct rec *r)
 {
 	uint64_t t = realtime_ns();
-	uint32_t want = r->o.ports;     /* RX copy n locked: TB_STATUS bit n */
-	double t0;
+	uint32_t st;
 
 	wr(&r->hw.cap, PKTREC_CAP_TB_SET_LO, (uint32_t)t);
 	wr(&r->hw.cap, PKTREC_CAP_TB_SET_HI, (uint32_t)(t >> 32));
 	wr(&r->hw.cap, PKTREC_CAP_TB_CTRL, PKTREC_CAP_TB_CTRL_SET);
-	t0 = now_s();
-	while ((rd(&r->hw.cap, PKTREC_CAP_TB_STATUS) & want) != want) {
-		if (now_s() - t0 > TB_LOCK_TIMEOUT) {
-			err_msg("timebase copies not locked after %.0f ms (TB_STATUS 0x%02x)",
-				TB_LOCK_TIMEOUT * 1e3, rd(&r->hw.cap, PKTREC_CAP_TB_STATUS));
-			return -1;
-		}
-		usleep(1000);
-	}
+	st = rd(&r->hw.cap, PKTREC_CAP_TB_STATUS);
+	if ((st & r->o.ports) != r->o.ports)
+		fprintf(stderr, "pktrec-cap: note: RX clock domain of port(s) 0x%x in reset (no link?), TB_STATUS 0x%02x\n",
+			r->o.ports & ~st & 0xF, st);
 	return 0;
 }
 

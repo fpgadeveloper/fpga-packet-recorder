@@ -67,7 +67,8 @@ const char *prog_name = "pktrec-export";
  */
 #define DEF_WINDOW_RECORDS      65536u
 #define DEF_WINDOW_BYTES        (4u << 20)
-#define DEF_MAX_FRAME           9622u   /* jumbo frame incl. FCS + VLAN tags */
+#define DEF_MAX_FRAME           16388u  /* largest cap_len + FCS the hardware emits:
+                                           PKTREC_CAP_PORT_FIFO_BYTES (16384) + 4 */
 #define RD_BUF_SIZE             (8u << 20)
 #define MAX_REC_LEN             (PKTREC_REC_HDR_BYTES + 65536u)
 /* how far a record's timestamp may lie before the newest one seen before a
@@ -753,8 +754,12 @@ static bool hdr_ok(const struct exp *e, const struct pktrec_rec_hdr *h, bool str
 		return false;
 	if (h->port >= PKTREC_NUM_PORTS || !(e->ports & (1u << h->port)))
 		return false;
+	/* The hardware stores at most PORT_FIFO_BYTES per frame (longer frames are
+	 * dropped and counted), but a snaplen-truncated record can describe a
+	 * longer frame, so the limit applies to the untruncated length only. */
 	if (h->cap_len < 1 || (uint32_t)h->cap_len + PKTREC_FCS_BYTES > h->orig_len ||
-	    h->orig_len > e->o.max_frame)
+	    (uint32_t)h->cap_len + PKTREC_FCS_BYTES > e->o.max_frame ||
+	    (!trunc && h->orig_len > e->o.max_frame))
 		return false;
 	if (!!(h->flags & PKTREC_REC_FLAG_TRUNC) != trunc)
 		return false;

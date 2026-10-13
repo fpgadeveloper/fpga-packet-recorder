@@ -148,6 +148,10 @@
 /* pktrec_capture: capture control, counters and timebase (dp_clk domain)    */
 /* ------------------------------------------------------------------------- */
 /*
+ * There is no port-mode register in the capture block: monitor/TAP forwarding
+ * is PKTREC_M0_PATH_CTRL (pktrec_m0_path) in M1; capture always records what
+ * each port RECEIVES.
+ *
  * Datapath (see docs/source/design.md "Capture path"): per port n the MAC RX
  * stream is tapped (in parallel with the TAP forward path), each frame is
  * stored whole in a 16 KB per-port frame FIFO (dropped whole and counted when
@@ -166,6 +170,8 @@
  *   3. PORT_EN / SNAPLEN (only while ENABLE = 0)
  *   4. FDREC_IOC_START without the TPG flag (SOFT_RST + packetizer enable)
  *   5. CTRL = SRC_SEL | ENABLE  -- ports accept frames that START from now on
+ * There is no lock to wait for after TB_SET/TB_ADJ: they apply on the next
+ * dp_clk cycle (see the timebase notes below).
  * Capture stop:
  *   1. CTRL = SRC_SEL           -- frames in progress complete, no new ones
  *   2. poll STATUS.IDLE = 1     -- every accepted frame is now a record that
@@ -175,16 +181,31 @@
  *                                  DMA at up to 4 GB/s
  *   5. keep collecting filled buffers until the total >= BYTES_OUT (the rest of
  *      the last buffer is fill), then FDREC_IOC_STOP (its drain completes at
- *      once because FILL keeps the DMA fed), then CTRL = SRC_SEL (FILL off)
+ *      once because FILL keeps the DMA fed), then CTRL = 0 (or SRC_SEL)
  * The fdrec driver discards buffers that are still queued or uncollected at
- * STOP, so collect up to BYTES_OUT BEFORE calling STOP.
+ * STOP, so collect up to BYTES_OUT BEFORE calling STOP. Writing CTRL = 0 after
+ * FDREC_IOC_STOP is harmless: the packetizer is already disabled and the merge
+ * is idle (IDLE was 1 and ENABLE is 0), so switching the recorder source back
+ * to the TPG loses no record data (at most fill units still sitting in the
+ * packetizer's 2-beat slice; the next FDREC_IOC_START soft-resets it and the
+ * merge restarts on a record boundary anyway). Do NOT change SRC_SEL while a
+ * recording runs.
+ * Frame size limits: the MAC delivers every frame whole (frames longer than
+ * the MAC's RX_MAX_LEN, 1518 incl. FCS by default, arrive with the BAD flag);
+ * the capture stores up to PORT_FIFO_BYTES (16384) bytes per frame -- a frame
+ * longer than the per-port FIFO is dropped whole and counted in FRAMES_DROP.
+ * So cap_len <= PORT_FIFO_BYTES, orig_len <= cap_len + 4 when not truncated
+ * (orig_len saturates at 65535).
  * A recorder SOFT_RST (every FDREC_IOC_START) while the merge is mid-record
  * discards the rest of that record (SRST_ABORTS), so the recorded stream always
  * starts on a record boundary.
  */
 #define PKTREC_CAP_ID              0x000   /* RO 0x504B4350 "PKCP" */
 #define PKTREC_CAP_ID_VALUE        0x504B4350
-#define PKTREC_CAP_VERSION         0x004   /* RO 0x00010000 (record format v1) */
+#define PKTREC_CAP_VERSION         0x004   /* RO 0x00010001: register map 1.1, record format v1
+                                              1.1 vs 1.0: TB_STATUS / STATUS[23:16] = MAC clock
+                                              domain valid (no "locked" anymore), new MAC_OFFSET */
+#define PKTREC_CAP_VERSION_1_1     0x00010001
 #define PKTREC_CAP_CTRL            0x008   /* RW */
 #define   PKTREC_CAP_CTRL_ENABLE         (1u << 0)   /* global capture enable (reset 0);
                                                         sampled at each frame's start */
@@ -201,7 +222,7 @@
 #define   PKTREC_CAP_STATUS_MERGE_BUSY   (1u << 1)   /* merge inside a record */
 #define   PKTREC_CAP_STATUS_PORT_IDLE_SHIFT 8        /* [11:8] per-port idle */
 #define   PKTREC_CAP_STATUS_RX_ACTIVE_SHIFT 12       /* [15:12] port receiving a captured frame */
-#define   PKTREC_CAP_STATUS_TB_LOCKED_SHIFT 16       /* [23:16] = TB_STATUS[7:0] */
+#define   PKTREC_CAP_STATUS_TB_VALID_SHIFT 16        /* [23:16] = TB_STATUS[7:0] */
 #define PKTREC_CAP_PORT_EN         0x010   /* RW [3:0] per-port capture enable (reset 0xF);
                                               change only while CTRL.ENABLE = 0 */
 #define PKTREC_CAP_SNAPLEN         0x014   /* RW [15:0] max bytes stored per frame (FCS
@@ -227,14 +248,20 @@
 /*
  * Timebase (pktrec_timebase): 64-bit ns counter in dp_clk with a 32.32 ns
  * increment per dp_clk cycle (PHC-style; reset INC = 1e9 / DP_CLK_HZ, i.e.
- * 4.0004 ns at 249.975 MHz). Distributed to the 4 RX and 4 TX MAC clock domains
- * with Taxi taxi_ptp_clock_cdc (48.16 ns format; the record header gets the
- * upper 16 ns bits back from the timebase).
+ * 4.0004 ns at 249.975 MHz). A dp_clk cycle counter is carried Gray-coded into
+ * the 4 RX and 4 TX MAC clocks; the MAC latches it at SFD and the record
+ * header converts it back:  ts = TB_NOW - (cycles since SFD) * INC + MAC_OFFSET.
  *   settime:  TB_SET_LO/HI = t, then TB_CTRL = SET
  *   adjtime:  TB_ADJ_LO/HI = signed delta ns, then TB_CTRL = ADJ
  *   adjfine:  TB_INC_FRAC = f, then TB_INC_NS = n (the NS write applies both)
  *   gettime:  read TB_NOW_LO, then TB_NOW_HI (coherent)
- * After SET/ADJ the per-domain copies re-lock (TB_STATUS) within ~100 us.
+ * SET / ADJ / INC take effect on the next dp_clk cycle: nothing to wait for.
+ * Change them before a capture starts (frames that wait in the capture FIFOs
+ * across a SET/ADJ would get timestamps on the wrong side of the step).
+ * Accuracy of a MAC timestamp (M1): 16 ns MAC clock quantisation + <= 8 ns
+ * sampling jitter + a constant PHY/PCS/GT latency (not calibrated in M1);
+ * MAC_OFFSET removes the constant latency of the cycle-counter copy (52 ns,
+ * from simulation).
  */
 #define PKTREC_CAP_TB_CTRL         0x080   /* WO [0] SET, [1] ADJ (reads 0) */
 #define   PKTREC_CAP_TB_CTRL_SET         (1u << 0)
@@ -242,13 +269,16 @@
 #define PKTREC_CAP_TB_INC_FRAC     0x084   /* RW fractional ns of the increment (2^-32) */
 #define PKTREC_CAP_TB_INC_NS       0x088   /* RW [7:0] integer ns; a write applies
                                               {INC_NS, INC_FRAC} atomically */
-#define PKTREC_CAP_TB_STATUS       0x08C   /* RO [3:0] RX n copy locked, [7:4] TX n locked */
+#define PKTREC_CAP_TB_STATUS       0x08C   /* RO [3:0] RX n MAC clock domain out of reset (link
+                                              up / GT RX ready), [7:4] TX n; informational only */
 #define PKTREC_CAP_TB_NOW_LO       0x090   /* RO 64: current time, ns */
 #define PKTREC_CAP_TB_NOW_HI       0x094
 #define PKTREC_CAP_TB_SET_LO       0x098   /* RW 64: value loaded by TB_CTRL.SET */
 #define PKTREC_CAP_TB_SET_HI       0x09C
 #define PKTREC_CAP_TB_ADJ_LO       0x0A0   /* RW 64 (signed): added by TB_CTRL.ADJ */
 #define PKTREC_CAP_TB_ADJ_HI       0x0A4
+#define PKTREC_CAP_MAC_OFFSET      0x0A8   /* RW signed ns added to every MAC timestamp
+                                              (reset 52 = sync latency of the copy) */
 
 /* pktrec_capture: per-port counters at PKTREC_CAP_PORT(n) + offset (64-bit
  * unless noted). Only frames that START while the port is enabled count.
@@ -269,7 +299,7 @@
 #define PKTREC_CAP_P_RECORDS_LO      0x30  /* records handed to the merge */
 #define PKTREC_CAP_P_RECORDS_HI      0x34
 #define PKTREC_CAP_P_FIFO_HWM        0x38  /* RW 32: frame FIFO high-water mark in bytes;
-                                              any write clears it */
+                                              any write clears it; CTRL.CLEAR clears it too */
 #define PKTREC_CAP_P_SEQ_NEXT        0x3C  /* RO [15:0] seq of the next frame */
 
 #endif /* PKTREC_REGS_H */

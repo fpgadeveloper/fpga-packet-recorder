@@ -129,7 +129,7 @@ It refuses to write binary to a terminal unless `--force` is given.
 | `--port <n>` | all captured | Export only these ports (repeatable). |
 | `--window-records <n>` | 65536 | Reorder window: records held. |
 | `--window-bytes <bytes>` | 4M | Reorder window: frame bytes held. |
-| `--max-frame <bytes>` | 9622 | Largest plausible frame, including the FCS. Used by the header checks. |
+| `--max-frame <bytes>` | 16388 | Largest frame the hardware stores, including the FCS (per-port FIFO 16384 B + 4). Used by the header checks; snaplen-truncated records may describe longer frames. |
 | `--raw-ts` | - | Write the raw timebase values instead of wall-clock time. |
 | `--comments` | - | Per-packet comment for records flagged with a MAC timestamp or an SFD mismatch. |
 | `--no-isb` | - | No Interface Statistics Blocks. |
@@ -178,7 +178,7 @@ Every record header is checked against the rules in `include/pktrec_format.h`:
 * the marker nibble is `0xA`,
 * the port is captured,
 * `cap_len` ≥ 1,
-* `cap_len + 4` ≤ `orig_len` ≤ `--max-frame`,
+* `cap_len + 4` ≤ `orig_len`, `cap_len + 4` ≤ `--max-frame` (and `orig_len` ≤ `--max-frame` unless truncated),
 * the truncated flag is set exactly when `cap_len + 4 < orig_len`,
 * `cap_len` ≤ snaplen.
 
