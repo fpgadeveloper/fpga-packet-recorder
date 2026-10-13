@@ -26,7 +26,7 @@ import os
 import struct
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from pcapng_reader import (BT_EPB, BT_IDB, BT_ISB, BT_SHB, BT_SPB, EPB_OPTS, IDB_OPTS,  # noqa: E402
                            ISB_OPTS, SHB_OPTS, STRING_OPTS, PcapngError, parse_options,
                            read_blocks)

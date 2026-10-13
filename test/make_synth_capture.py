@@ -33,7 +33,7 @@ import struct
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from gen_seq import FrameBuilder, mac_bytes  # noqa: E402
 
 HDR_SIZE = 4096

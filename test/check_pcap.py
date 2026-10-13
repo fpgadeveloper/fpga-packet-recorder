@@ -35,7 +35,7 @@ import os
 import struct
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from pcapng_reader import Capture, PcapngError  # noqa: E402
 
 PRSQ_MAGIC = b"PRSQ"
