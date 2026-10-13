@@ -1,0 +1,45 @@
+{
+  "bd_name": "pktrec",
+  "prj_name": "fpga-packet-recorder",
+  "groups": [
+    {
+      "label": "zu",
+      "name": "Zynq UltraScale+"
+    }
+  ],
+  "ips": {
+    "xdma": {
+      "name": "DMA for PCI Express (PCIe) Subsystem IP",
+      "link": "https://www.xilinx.com/products/intellectual-property/pcie-dma.html"
+    },
+    "axi_dma": {
+      "name": "AXI Direct Memory Access IP",
+      "link": "https://www.xilinx.com/products/intellectual-property/axi_dma.html"
+    }
+  },
+  "designs": [
+    {
+      "publish": true,
+      "label": "zcu106",
+      "board": "ZCU106",
+      "link": "https://www.xilinx.com/zcu106",
+      "url": "xilinx.com",
+      "boardname": "zcu106",
+      "ip": "xdma",
+      "lanes": [
+        "X1"
+      ],
+      "ports": "SSD1",
+      "ssd_connector": "HPC1",
+      "eth_connector": "HPC0",
+      "connector": "HPC0 + HPC1",
+      "group": "zu",
+      "petalinux": false,
+      "yocto": true,
+      "baremetal": false,
+      "license": false,
+      "flashsize": "0",
+      "flashintf": "0"
+    }
+  ]
+}
