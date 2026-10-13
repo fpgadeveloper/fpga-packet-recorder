@@ -1,0 +1,17 @@
+FPGA Packet Recorder
+Copyright (C) 2026, Opsero Electronic Design Inc.
+
+The recording datapath and its software were copied from the FPGA Drive
+Recorder reference design, https://github.com/fpgadeveloper/fpga-drive-recorder
+@ 92817d3 (MIT), and keep their fdrec names:
+
+  Vivado/src/hdl/fdrec_*.v, Vivado/src/hdl/README.md
+  Vivado/src/sim/tb_fdrec_*.sv, Vivado/src/sim/README.md
+  Vivado/scripts/sim.tcl
+  include/fdrec_regs.h, include/fdrec_uapi.h, include/fdrec_file.h
+  sw/fdrec-driver/
+  sw/fdrec-apps/
+  Yocto/meta-fdrec/
+
+Third-party components under submodules/ carry their own licenses; see
+submodules/README.md.
