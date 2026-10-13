@@ -641,7 +641,10 @@ static void take_filled(struct rec *r)
 					    HDR_SIZE + r->bytes_submitted);
 		io_uring_sqe_set_data64(sqe, ((uint64_t)f.index << 32) | (uint32_t)len);
 		r->bytes_submitted += len;
-		r->inflight++;
+		/* the stall watchdog measures from the last completion OR, when the
+		 * ring was idle, from the first new submission */
+		if (r->inflight++ == 0)
+			r->t_write = now_s();
 		if (r->inflight > r->max_inflight)
 			r->max_inflight = r->inflight;
 	}
