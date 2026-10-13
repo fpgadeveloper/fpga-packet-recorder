@@ -2,14 +2,17 @@
 #
 # SPDX-License-Identifier: MIT
 
-SUMMARY = "FPGA Packet Recorder apps: pktrec-cap, pktrec-export"
+SUMMARY = "FPGA Packet Recorder apps: pktrec-cap, pktrec-export, pktrec-replay"
 DESCRIPTION = "pktrec-cap configures the capture block (ports, snaplen, \
 timebase) and records the hardware record stream to a file on NVMe through \
 the fdrec driver (zero-copy, io_uring + O_DIRECT), with live per-port \
 statistics and the capture metadata in a 4 KB file header; it also reads the \
 capture counters (stats) and prints file headers (info). pktrec-export \
 converts a capture file to pcapng, streaming (file or stdout), in timestamp \
-order with one interface per port and per-port drop statistics."
+order with one interface per port and per-port drop statistics. \
+pktrec-replay plays the frames of one capture interface back out of a port \
+(original timing, scaled, fixed gap or back to back), scheduled by the \
+replay block in the FPGA; the Makefile installs all three to ${bindir}."
 HOMEPAGE = "https://github.com/fpgadeveloper/fpga-packet-recorder"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
