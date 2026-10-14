@@ -408,7 +408,7 @@ wire                ifg_clr_tgl;    // ctrl_clk toggle: clear max fill / counter
 wire [11:0]         eff_path;       // TX source in use per port (sel, 3 bits, ctrl_clk)
 wire [7:0]          flush_tgl;      // [2n+k] frame flushed from FIFO 2n+k (tx_clk[n])
 // generator / checker configuration (ctrl_clk) and status (into ctrl_clk)
-localparam GCFG_W = 3 + 14 + 14 + 16 + 32 + 48 + 48 + 16 + 32 + 32;   // 255
+localparam GCFG_W = 3 + 14 + 14 + 16 + 32 + 48 + 48 + 16 + 32 + 32 + 17;   // 272 (+ VLAN, 1.4)
 localparam CCFG_W = 2 + 16;
 localparam GST_W  = 2 + 64 + 64;
 localparam CST_W  = 4 * 32 + 64;
@@ -559,6 +559,7 @@ for (n = 0; n < 4; n = n + 1) begin : g_port
         .len(gcfg[3 +: 14]), .len_mask(gcfg[17 +: 14]), .ifg(gcfg[31 +: 16]),
         .count(gcfg[47 +: 32]), .dst(gcfg[79 +: 48]), .src(gcfg[127 +: 48]),
         .etype(gcfg[175 +: 16]), .stream(gcfg[191 +: 32]), .seq_first(gcfg[223 +: 32]),
+        .vlan_tci(gcfg[255 +: 16]), .vlan_en(gcfg[271]),
         .m_tdata(g_tdata), .m_tkeep(g_tkeep), .m_tvalid(g_tvalid), .m_tready(g_tready),
         .m_tlast(g_tlast), .running(g_running), .done(g_done), .frames(g_frames), .bytes(g_bytes)
     );

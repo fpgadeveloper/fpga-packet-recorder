@@ -23,6 +23,10 @@
 //      never cuts a frame (tvalid continuous within a frame)
 //   5. checker: in-order stream -> LOST 0 / ERRORS 0 / FRAMES = sent; frames
 //      removed -> LOST = removed; a duplicate -> ERRORS 1; bad frames -> BAD
+//   6. 802.1Q tag (GEN_VLAN, m0 map 1.4): PRSQ 1518 B + tag = 1522 B on the wire
+//      (VID 100, as gen_seq.py --vlan 100 --size 1522) and PRSQ 62 B (the minimum
+//      with a tag), raw format with a tag; the checker counts tagged frames like
+//      untagged ones (LOST / ERRORS 0), also mixed with untagged frames
 //
 // Prints PASS / FAIL and calls $finish (sim.tcl contract).
 
@@ -47,6 +51,8 @@ module tb_pktrec_gen;
   reg [47:0] dst = 48'h0011_2233_4455, src = 48'h0200_0000_0002;
   reg [15:0] etype = 16'h88B5;
   reg [31:0] stream = 32'd7, seq_first = 32'd1000;
+  reg        vlan_en = 0;
+  reg [15:0] vlan_tci = 16'd100;
   wire [15:0] tdata;
   wire [1:0]  tkeep;
   wire        tvalid, tlast, running, done;
@@ -56,7 +62,7 @@ module tb_pktrec_gen;
   pktrec_gen dut (
     .clk(clk), .rst(rst), .enable(enable), .allow(1'b1), .fmt_raw(fmt_raw), .rand_len(rand_len),
     .len(len), .len_mask(len_mask), .ifg(ifg), .count(count), .dst(dst), .src(src),
-    .etype(etype), .stream(stream), .seq_first(seq_first),
+    .etype(etype), .stream(stream), .seq_first(seq_first), .vlan_en(vlan_en), .vlan_tci(vlan_tci),
     .m_tdata(tdata), .m_tkeep(tkeep), .m_tvalid(tvalid), .m_tready(tready), .m_tlast(tlast),
     .running(running), .done(done), .frames(frames), .bytes(bytes)
   );
@@ -105,11 +111,14 @@ module tb_pktrec_gen;
     frame_t f;
     for (int i = 5; i >= 0; i--) f.push_back(dst[8*i +: 8]);
     for (int i = 5; i >= 0; i--) f.push_back(src[8*i +: 8]);
+    if (vlan_en) begin
+      f.push_back(8'h81); f.push_back(8'h00); f.push_back(vlan_tci[15:8]); f.push_back(vlan_tci[7:0]);
+    end
     if (raw) begin
       f.push_back(etype[15:8]); f.push_back(etype[7:0]);
       for (int i = 3; i >= 0; i--) f.push_back(seq[8*i +: 8]);
     end else begin
-      int tot = l - 14, ulen = l - 34;
+      int tot = l - (vlan_en ? 18 : 14), ulen = tot - 20;
       int s = 0;
       byte unsigned ip[20];
       ip = '{8'h45, 8'h00, tot[15:8], tot[7:0], 0, 0, 8'h40, 8'h00, 64, 17, 0, 0,
@@ -236,6 +245,47 @@ module tb_pktrec_gen;
     // re-enable clears
     c_en <= 0; repeat (3) @(posedge clk); c_en <= 1; repeat (3) @(posedge clk);
     if (c_frames != 0 || c_lost != 0) fail("checker not cleared by ENABLE 0->1");
+
+    $display("test 6: 802.1Q tag");
+    c_en <= 0;
+    vlan_en = 1; vlan_tci = 16'd100;
+    fmt_raw = 0; rand_len = 0; len = 1518; ifg = 12; count = 8; seq_first = 77;
+    run(8);
+    check_frames(0, 8, 77, 1518, 1518, (1518 + 24 + 1) / 2, "test 6 PRSQ 1522 B tagged");
+    if (got_q.size() > 0) begin
+      // gen_seq.py offsets: tag at 12, IPv4 at 18, UDP at 38, "PRSQ" at 46, seq at 54
+      frame_t g = got_q[0];
+      if (g[12] != 8'h81 || g[13] != 8'h00 || g[14] != 8'h00 || g[15] != 8'd100 ||
+          g[16] != 8'h08 || g[17] != 8'h00 || g[46] != "P" || g[49] != "Q" || g[61] != 8'd77)
+        fail("test 6: tagged PRSQ layout");
+      $display("  %0d B + FCS = %0d B on the wire", g.size(), g.size() + 4);
+    end
+    saved = got_q;
+    len = 62; count = 4; seq_first = 85;
+    run(4);
+    check_frames(0, 4, 85, 62, 62, 0, "test 6 PRSQ 62 B tagged");
+    foreach (got_q[i]) saved.push_back(got_q[i]);
+    fmt_raw = 1; len = 100; count = 4; seq_first = 9;
+    run(4);
+    check_frames(1, 4, 9, 100, 100, 0, "test 6 raw tagged");
+    // checker: tagged PRSQ seq 77..88 with seq 80 replaced by an untagged frame
+    vlan_en = 0;
+    c_raw <= 0; c_en <= 0; repeat (3) @(posedge clk); c_en <= 1; repeat (3) @(posedge clk);
+    for (int i = 0; i < 12; i++) begin
+      if (i == 3) feed(ref_frame(0, 200, 80), 0);
+      else feed(saved[i], 0);
+    end
+    repeat (10) @(posedge clk);
+    if (c_frames != 12 || c_lost != 0 || c_errors != 0 || c_last != 88)
+      fail($sformatf("test 6 checker PRSQ: frames %0d lost %0d errors %0d last %0d (12/0/0/88)",
+                     c_frames, c_lost, c_errors, c_last));
+    // raw checker on tagged frames
+    c_raw <= 1; c_en <= 0; repeat (3) @(posedge clk); c_en <= 1; repeat (3) @(posedge clk);
+    foreach (got_q[i]) if (i != 1) feed(got_q[i], 0);
+    repeat (10) @(posedge clk);
+    if (c_frames != 3 || c_lost != 1 || c_errors != 0 || c_last != 12)
+      fail($sformatf("test 6 checker raw: frames %0d lost %0d errors %0d last %0d (3/1/0/12)",
+                     c_frames, c_lost, c_errors, c_last));
 
     if (errors == 0) $display("tb_pktrec_gen: PASS");
     else $display("tb_pktrec_gen: FAIL (%0d errors)", errors);

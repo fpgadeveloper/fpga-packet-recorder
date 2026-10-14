@@ -30,6 +30,7 @@ module pktrec_eth_ports #(
     parameter XCVR_RST_DEFAULT   = 0,
     parameter DEFAULT_TX_PAD_EN  = 1,
     parameter EXT_TX_IFG         = 0,       // 1: MAC TX IFG from tx_ifg (M3 dynamic IFG), 0: TX_IFG register
+    parameter MAX_FRAME_LEN      = 1522,    // TX/RX_MAX_LEN reset (bytes incl. FCS): 1518 + one 802.1Q tag
     parameter C_S_AXI_ADDR_WIDTH = 19,
     parameter SIM                = 0
 )(
@@ -338,6 +339,7 @@ pktrec_eth_ports_core #(
     .XCVR_RST_DEFAULT(XCVR_RST_DEFAULT),
     .DEFAULT_TX_PAD_EN(DEFAULT_TX_PAD_EN),
     .EXT_TX_IFG(EXT_TX_IFG),
+    .MAX_FRAME_LEN(MAX_FRAME_LEN),
     .AXIL_ADDR_W(C_S_AXI_ADDR_WIDTH)
 ) core_inst (
     .gt_ref_clk_p(gt_ref_clk_clk_p),

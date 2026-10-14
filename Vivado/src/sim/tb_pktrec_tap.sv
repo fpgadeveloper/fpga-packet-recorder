@@ -21,7 +21,7 @@
 // local TX clock (QPLL). P2/P3 are not used (clocks stopped).
 //
 // Tests:
-//   1. Registers: VERSION 1.3, IFG_CTRL / IFG_THRESH reset values, PAIR_MODE RW,
+//   1. Registers: VERSION 1.4, IFG_CTRL / IFG_THRESH reset values, PAIR_MODE RW,
 //      EFF_PATH follows PATH_CTRL.
 //   2. Bad-frame forwarding: frames sent error-terminated (TX tuser -> /V/ over the
 //      FCS) and frames with a bit error on the line (bad FCS) arrive at P0/P1, are
@@ -50,6 +50,12 @@
 //      committed to a FIFO is either delivered or counted in FLUSH (frames that
 //      were in the FIFO when the port left that source) or DROP_*; nothing is lost
 //      silently. After the last switch back to FWD, forwarding is lossless.
+//   6. Full-size VLAN-tagged frames: 1522 B on the wire (1518 + 802.1Q tag, the
+//      shell's default MAX_FRAME_LEN) both ways at 100 %: every frame received good
+//      (RX_GOOD, no RX_BAD) and forwarded intact and good (TX_GOOD, far end good).
+//      Oversize: 1523 B and 1600 B frames are received whole but flagged bad (RX_BAD;
+//      the capture sees the same BAD flag) and leave our TX cut at the limit and
+//      error-terminated (far end bad, TX_GOOD 0, nothing dropped or stuck).
 //   Store-and-forward latency (first /S/ on the far device's wire to first /S/
 //   on our TX wire, MAC/PCS only, no GT/PHY) is printed per frame size.
 //
@@ -62,13 +68,23 @@ package tb_tap_pkg;
   bit          bad_of  [2][int unsigned];    // sent error-terminated (TX tuser)
   bit          fcs_of  [2][int unsigned];    // bit error injected on the line
   realtime     sof_of  [2][int unsigned];    // time of the source /S/
+  bit          vlan_of [2][int unsigned];    // bytes 12..15 = 802.1Q tag, VID 100
+  // expected byte b (>= 5) of frame sq
+  function automatic byte unsigned pbyte(input int unsigned sq, input int b, input bit vlan);
+    byte unsigned tag [4] = '{8'h81, 8'h00, 8'h00, 8'd100};
+    if (vlan && b >= 12 && b < 16) return tag[b - 12];
+    return 8'(sq + b);
+  endfunction
 endpackage
 
 // -----------------------------------------------------------------------------
 // One direction: far device (source) -> our RX MAC; our TX MAC -> far device
 // (checker). LANE = source port.
 // -----------------------------------------------------------------------------
-module tb_tap_lane #(parameter int LANE = 0) (
+module tb_tap_lane #(
+  parameter int LANE = 0,
+  parameter int DUT_MAX_FRAME = 2048   // our MACs' RX/TX max frame incl. FCS (cfg = this - 1)
+) (
   input  logic        src_clk,
   input  logic        src_rst,
   input  logic        dst_clk,
@@ -99,12 +115,14 @@ module tb_tap_lane #(parameter int LANE = 0) (
   int unsigned quota = 0;         // or: send this many more frames (100 % utilisation)
   int unsigned bad_every = 0, bad_phase = 0;
   int unsigned fcs_every = 0, fcs_phase = 0;
+  bit          vlan = 0;          // frames carry an 802.1Q tag (VID 100) at bytes 12..15
 
   // ---- results ----
   int unsigned n_src = 0;                      // frames sent by the source
   int unsigned n_rx = 0, n_rx_bad = 0;         // frames at the far receiver
   int unsigned n_lost [2] = '{0, 0};           // seq gaps per source lane
   int unsigned n_err = 0;                      // content / length / flag / order errors
+  int unsigned n_ovs = 0;                      // oversize frames (> DUT_MAX_FRAME) seen
   int unsigned n_foreign = 0;                  // frames of the other lane (LOOP)
   longint      last_seq [2] = '{-1, -1};
   int unsigned n_fcs_inj = 0;
@@ -117,7 +135,7 @@ module tb_tap_lane #(parameter int LANE = 0) (
   function automatic byte unsigned fbyte(input int unsigned sq, input int b);
     if (b < 4) return 8'(sq >> (8 * (3 - b)));
     if (b == 4) return 8'(LANE);
-    return 8'(sq + b);
+    return pbyte(sq, b, vlan_of[LANE].exists(sq) && vlan_of[LANE][sq]);
   endfunction
 
   // ---------------------------------------------------------------------------
@@ -149,6 +167,7 @@ module tb_tap_lane #(parameter int LANE = 0) (
         len_of[LANE][seq] = len;
         bad_of[LANE][seq] = (bad_every != 0) && (seq % bad_every == bad_phase);
         fcs_of[LANE][seq] = (fcs_every != 0) && (seq % fcs_every == fcs_phase);
+        vlan_of[LANE][seq] = vlan;
         nb = (len + 1) / 2;
       end
       if (active) begin
@@ -189,7 +208,7 @@ module tb_tap_lane #(parameter int LANE = 0) (
     .encoded_tx_data_valid(), .tx_gbx_req_sync(1'b0), .tx_gbx_req_stall(1'b0), .tx_gbx_sync(),
     .tx_an_cfg(16'd0), .tx_an_cfg_valid(1'b0), .tx_an_cfg_ready(),
     .ptp_ts(64'd0),
-    .cfg_tx_max_pkt_len(16'd2047), .cfg_tx_ifg(8'd12), .cfg_tx_enable(1'b1),
+    .cfg_tx_max_pkt_len(16'd4095), .cfg_tx_ifg(8'd12), .cfg_tx_enable(1'b1),
     .cfg_tx_sgmii_en(1'b1), .cfg_tx_sgmii_speed(2'b10),
     .tx_start_packet(src_sop), .stat_tx_byte(), .stat_tx_pkt_len(), .stat_tx_pkt_ucast(),
     .stat_tx_pkt_mcast(), .stat_tx_pkt_bcast(), .stat_tx_pkt_vlan(), .stat_tx_pkt_good(),
@@ -241,7 +260,7 @@ module tb_tap_lane #(parameter int LANE = 0) (
     .m_axis_rx(rx_if),
     .rx_an_cfg(), .rx_an_cfg_valid(), .rx_an_ability_match(), .rx_an_ack_match(), .rx_an_idle_match(),
     .ptp_ts(64'd0),
-    .cfg_rx_max_pkt_len(16'd2047), .cfg_rx_enable(1'b1), .cfg_rx_sgmii_en(1'b1), .cfg_rx_sgmii_speed(2'b10),
+    .cfg_rx_max_pkt_len(16'(DUT_MAX_FRAME - 1)), .cfg_rx_enable(1'b1), .cfg_rx_sgmii_en(1'b1), .cfg_rx_sgmii_speed(2'b10),
     .rx_start_packet(), .stat_rx_byte(), .stat_rx_pkt_len(), .stat_rx_pkt_fragment(), .stat_rx_pkt_jabber(),
     .stat_rx_pkt_ucast(), .stat_rx_pkt_mcast(), .stat_rx_pkt_bcast(), .stat_rx_pkt_vlan(),
     .stat_rx_pkt_good(rx_stat_good), .stat_rx_pkt_bad(rx_stat_bad), .stat_rx_err_oversize(),
@@ -275,7 +294,7 @@ module tb_tap_lane #(parameter int LANE = 0) (
     .encoded_tx_data_valid(), .tx_gbx_req_sync(1'b0), .tx_gbx_req_stall(1'b0), .tx_gbx_sync(),
     .tx_an_cfg(16'd0), .tx_an_cfg_valid(1'b0), .tx_an_cfg_ready(),
     .ptp_ts(64'd0),
-    .cfg_tx_max_pkt_len(16'd2047), .cfg_tx_ifg(tx_ifg), .cfg_tx_enable(1'b1),
+    .cfg_tx_max_pkt_len(16'(DUT_MAX_FRAME - 1)), .cfg_tx_ifg(tx_ifg), .cfg_tx_enable(1'b1),
     .cfg_tx_sgmii_en(1'b1), .cfg_tx_sgmii_speed(2'b10),
     .tx_start_packet(dst_sop), .stat_tx_byte(), .stat_tx_pkt_len(), .stat_tx_pkt_ucast(),
     .stat_tx_pkt_mcast(), .stat_tx_pkt_bcast(), .stat_tx_pkt_vlan(), .stat_tx_pkt_good(tx_stat_good),
@@ -311,7 +330,7 @@ module tb_tap_lane #(parameter int LANE = 0) (
     .m_axis_rx(far_if),
     .rx_an_cfg(), .rx_an_cfg_valid(), .rx_an_ability_match(), .rx_an_ack_match(), .rx_an_idle_match(),
     .ptp_ts(64'd0),
-    .cfg_rx_max_pkt_len(16'd2047), .cfg_rx_enable(1'b1), .cfg_rx_sgmii_en(1'b1), .cfg_rx_sgmii_speed(2'b10),
+    .cfg_rx_max_pkt_len(16'd4095), .cfg_rx_enable(1'b1), .cfg_rx_sgmii_en(1'b1), .cfg_rx_sgmii_speed(2'b10),
     .rx_start_packet(), .stat_rx_byte(), .stat_rx_pkt_len(), .stat_rx_pkt_fragment(), .stat_rx_pkt_jabber(),
     .stat_rx_pkt_ucast(), .stat_rx_pkt_mcast(), .stat_rx_pkt_bcast(), .stat_rx_pkt_vlan(),
     .stat_rx_pkt_good(), .stat_rx_pkt_bad(), .stat_rx_err_oversize(),
@@ -340,7 +359,7 @@ module tb_tap_lane #(parameter int LANE = 0) (
 
   task automatic check(input bit bad);
     int unsigned sq, ln, exp_len;
-    bit exp_bad;
+    bit exp_bad, ovs;
     realtime lat;
     n_rx++;
     if (bad) n_rx_bad++;
@@ -353,15 +372,22 @@ module tb_tap_lane #(parameter int LANE = 0) (
     if (ln != LANE) n_foreign++;
     if (!len_of[ln].exists(sq)) begin err($sformatf("unknown seq %0d of lane %0d", sq, ln)); return; end
     exp_len = len_of[ln][sq];
-    exp_bad = bad_of[ln][sq] || fcs_of[ln][sq];
+    // longer than our MACs' limit (incl. FCS): our RX flags it bad (delivered whole),
+    // our TX cuts it at the limit and ends it error-terminated
+    ovs = exp_len + 4 > DUT_MAX_FRAME;
+    if (ovs) n_ovs++;
+    exp_bad = bad_of[ln][sq] || fcs_of[ln][sq] || ovs;
     // each receiver that meets /V/ over the FCS ends the frame 6 bytes early: sent
     // error-terminated = 2 such hops, bit error on the line = 1 (our TX)
     if (bad_of[ln][sq]) exp_len -= 12;
     else if (fcs_of[ln][sq]) exp_len -= 6;
-    if (got.size() != exp_len) err($sformatf("seq %0d: %0d bytes, expected %0d", sq, got.size(), exp_len));
+    if (ovs) begin
+      if (got.size() >= DUT_MAX_FRAME - 4)
+        err($sformatf("seq %0d: oversize frame arrived with %0d bytes (limit %0d incl. FCS)", sq, got.size(), DUT_MAX_FRAME));
+    end else if (got.size() != exp_len) err($sformatf("seq %0d: %0d bytes, expected %0d", sq, got.size(), exp_len));
     if (bad != exp_bad) err($sformatf("seq %0d: bad flag %0d, expected %0d", sq, bad, exp_bad));
     for (int b = 5; b < got.size(); b++)
-      if (got[b] != 8'(sq + b) && !(fcs_of[ln][sq] && b == 33)) begin
+      if (got[b] != pbyte(sq, b, vlan_of[ln][sq]) && !(fcs_of[ln][sq] && b == 33)) begin
         err($sformatf("seq %0d: byte %0d corrupt", sq, b)); break;
       end
     if (longint'(sq) <= last_seq[ln]) err($sformatf("seq %0d after %0d (order)", sq, last_seq[ln]));
@@ -383,6 +409,9 @@ module tb_pktrec_tap;
   localparam [11:0] R_ID = 12'h000, R_VERSION = 12'h004, R_PATH_CTRL = 12'h008,
                     R_CNT_CTRL = 12'h00C, R_PAIR_MODE = 12'h018, R_EFF_PATH = 12'h01C;
   localparam [11:0] P_BASE = 12'h100, P_STRIDE = 12'h040;
+  // our MACs' max frame length incl. FCS = the reset value of the shell's TX/RX_MAX_LEN
+  // (pktrec_eth_ports MAX_FRAME_LEN; the shell itself is not simulated here)
+  localparam int ETH_MAX_FRAME = 1522;
   localparam [11:0] P_RX_GOOD = 12'h00, P_RX_BAD = 12'h04, P_TX_GOOD = 12'h08,
                     P_TX_UNF = 12'h0C, P_DROP_LOOP = 12'h10, P_DROP_FWD = 12'h14,
                     P_IFG_CTRL = 12'h20, P_IFG_THRESH = 12'h24, P_FWD_FILL = 12'h28,
@@ -477,13 +506,13 @@ module tb_pktrec_tap;
   );
 
   // lane 0: P0 RX -> P1 TX; lane 1: P1 RX -> P0 TX
-  tb_tap_lane #(.LANE(0)) lane0 (
+  tb_tap_lane #(.LANE(0), .DUT_MAX_FRAME(ETH_MAX_FRAME)) lane0 (
     .src_clk(rx_clk[0]), .src_rst(!rx_aresetn[0]), .dst_clk(tx_clk[1]), .dst_rst(!tx_aresetn[1]),
     .rx_tdata(rx_tdata[0]), .rx_tkeep(rx_tkeep[0]), .rx_tvalid(rx_tvalid[0]), .rx_tlast(rx_tlast[0]),
     .rx_tbad(rx_tbad[0]), .rx_stat_good(rx_sgood[0]), .rx_stat_bad(rx_sbad[0]),
     .tx_tdata(tx_tdata[1]), .tx_tkeep(tx_tkeep[1]), .tx_tvalid(tx_tvalid[1]), .tx_tready(tx_tready[1]),
     .tx_tlast(tx_tlast[1]), .tx_tuser(tx_tuser[1][0]), .tx_ifg(tx_ifg[15:8]), .tx_stat_good(tx_sgood[1]));
-  tb_tap_lane #(.LANE(1)) lane1 (
+  tb_tap_lane #(.LANE(1), .DUT_MAX_FRAME(ETH_MAX_FRAME)) lane1 (
     .src_clk(rx_clk[1]), .src_rst(!rx_aresetn[1]), .dst_clk(tx_clk[0]), .dst_rst(!tx_aresetn[0]),
     .rx_tdata(rx_tdata[1]), .rx_tkeep(rx_tkeep[1]), .rx_tvalid(rx_tvalid[1]), .rx_tlast(rx_tlast[1]),
     .rx_tbad(rx_tbad[1]), .rx_stat_good(rx_sgood[1]), .rx_stat_bad(rx_sbad[1]),
@@ -607,6 +636,7 @@ module tb_pktrec_tap;
   function automatic void reset_lane_stats();
     lane0.n_rx = 0; lane0.n_rx_bad = 0; lane0.n_err = 0; lane0.n_lost = '{0, 0}; lane0.n_foreign = 0;
     lane1.n_rx = 0; lane1.n_rx_bad = 0; lane1.n_err = 0; lane1.n_lost = '{0, 0}; lane1.n_foreign = 0;
+    lane0.n_ovs = 0; lane1.n_ovs = 0;
     for (int i = 0; i < 32; i++) begin lane0.gap_hist[i] = 0; lane1.gap_hist[i] = 0; end
   endfunction
 
@@ -633,7 +663,7 @@ module tb_pktrec_tap;
 
     // ---- 1. registers ----
     expect_reg(R_ID, 32'h504B4D30, "ID");
-    expect_reg(R_VERSION, 32'h00010003, "VERSION");
+    expect_reg(R_VERSION, 32'h00010004, "VERSION");
     for (int p = 0; p < 4; p++) begin
       expect_reg(preg(p, P_IFG_CTRL), 32'h00080C01, "IFG_CTRL reset");
       expect_reg(preg(p, P_IFG_THRESH), 32'h08000C00, "IFG_THRESH reset");
@@ -803,6 +833,51 @@ module tb_pktrec_tap;
     if (lane0.n_foreign + lane1.n_foreign == 0) fail("mode switching: LOOP phase delivered nothing");
     if (drops != fifo_drops[0] + fifo_drops[1] + fifo_drops[2] + fifo_drops[3]) fail("DROP counters != FIFO drops");
     $display("INFO: mode switching done");
+
+    // ---- 6. 1522-byte VLAN-tagged frames, then oversize ----
+    set_ppm(0, 50); set_ppm(1, -50);
+    axi_write(R_PATH_CTRL, 32'h0A);
+    #1000;
+    drain();
+    clear_counters(); reset_lane_stats();
+    lane0.vlan = 1; lane1.vlan = 1;
+    lane0.len = ETH_MAX_FRAME - 4; lane1.len = ETH_MAX_FRAME - 4;
+    run_frames(3, 100);
+    drain();
+    $display("INFO: %0d B tagged: delivered %0d/%0d of 100/100, far-end bad %0d/%0d, errors %0d/%0d",
+             ETH_MAX_FRAME, lane0.n_rx, lane1.n_rx, lane0.n_rx_bad, lane1.n_rx_bad, lane0.n_err, lane1.n_err);
+    if (lane0.n_rx != 100 || lane1.n_rx != 100 || lane0.n_rx_bad != 0 || lane1.n_rx_bad != 0 ||
+        lane0.n_err != 0 || lane1.n_err != 0 || lane0.n_lost[0] != 0 || lane1.n_lost[1] != 0)
+      fail("1522-byte tagged frames not forwarded intact and good");
+    for (int p = 0; p < 2; p++) begin
+      expect_reg(preg(p, P_RX_GOOD), 100, $sformatf("P%0d RX_GOOD (1522 B)", p));
+      expect_reg(preg(p, P_RX_BAD), 0, $sformatf("P%0d RX_BAD (1522 B)", p));
+      expect_reg(preg(p, P_TX_GOOD), 100, $sformatf("P%0d TX_GOOD (1522 B)", p));
+      expect_reg(preg(p, P_DROP_FWD), 0, $sformatf("P%0d DROP_FWD (1522 B)", p));
+    end
+    clear_counters(); reset_lane_stats();
+    lane0.len = ETH_MAX_FRAME - 3;            // 1523 B
+    run_frames(1, 10);
+    drain();
+    lane0.len = 1596;                         // 1600 B
+    run_frames(1, 10);
+    drain();
+    $display("INFO: oversize 1523/1600 B: delivered %0d of 20, far-end bad %0d, oversize %0d, errors %0d",
+             lane0.n_rx, lane0.n_rx_bad, lane0.n_ovs, lane0.n_err);
+    if (lane0.n_rx != 20 || lane0.n_rx_bad != 20 || lane0.n_ovs != 20 || lane0.n_err != 0)
+      fail("oversize frames: expected 20 delivered, all bad and cut at the limit");
+    expect_reg(preg(0, P_RX_BAD), 20, "P0 RX_BAD (oversize)");
+    expect_reg(preg(0, P_RX_GOOD), 0, "P0 RX_GOOD (oversize)");
+    expect_reg(preg(1, P_TX_GOOD), 0, "P1 TX_GOOD (oversize leaves error-terminated)");
+    expect_reg(preg(1, P_DROP_FWD), 0, "P1 DROP_FWD (oversize)");
+    // and back to a good 1522-byte frame afterwards
+    reset_lane_stats();
+    lane0.len = ETH_MAX_FRAME - 4;
+    run_frames(1, 5);
+    drain();
+    if (lane0.n_rx != 5 || lane0.n_rx_bad != 0 || lane0.n_err != 0) fail("1522 B after oversize frames");
+    lane0.vlan = 0; lane1.vlan = 0;
+    $display("INFO: VLAN / oversize done");
 
     if (errors == 0) $display("PASS: tb_pktrec_tap");
     else $display("FAIL: tb_pktrec_tap, %0d error(s)", errors);

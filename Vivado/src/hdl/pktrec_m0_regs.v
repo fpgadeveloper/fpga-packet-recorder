@@ -6,9 +6,10 @@
 // same map is in include/pktrec_regs.h, keep both in sync):
 //
 //   0x000 ID         RO  0x504B4D30 ("PKM0")
-//   0x004 VERSION    RO  0x00010003 (1.1: generator + checker; 1.2: TAP mode - pair
+//   0x004 VERSION    RO  0x00010004 (1.1: generator + checker; 1.2: TAP mode - pair
 //                        mode, effective path, dynamic IFG, FIFO fill, FLUSH;
-//                        1.3: REPLAY path - PATH_RPL, EFF_PATH[11:8])
+//                        1.3: REPLAY path - PATH_RPL, EFF_PATH[11:8];
+//                        1.4: generator 802.1Q tag GEN_VLAN, checker skips a tag)
 //   0x008 PATH_CTRL  RW  [2n+1:2n] TX source of port n: 0 IDLE, 1 LOOP (own RX),
 //                        2 FWD (pair partner's RX: P0<->P1, P2<->P3), 3 GEN. Reset 0.
 //   0x00C CNT_CTRL   WO  [0] 1 = clear every counter and IO_STICKY (reads 0)
@@ -42,6 +43,8 @@
 //                        The fill counts the frame being received too (about one frame
 //                        while forwarding at 100 %), so IFG_LO must exceed the largest
 //                        frame, else the reduced gap lasts until the traffic pauses
+//                        (2048 suits the shell's 1522-byte MAC limit; raise both
+//                        thresholds with RX/TX_MAX_LEN for jumbo frames)
 //   +0x28 FWD_FILL   RO  [15:0] FWD FIFO fill now (bytes) [31:16] max since clear
 //   +0x2C IFG_STATUS RO  [0] reduced gap active [15:8] gap in use (bytes)
 //   +0x30 IFG_RED_CYC_LO / +0x34 _HI  RO  tx_clk cycles (16 ns) spent with the reduced
@@ -60,6 +63,7 @@
 //   +0x14 GEN_COUNT (0 = endless)  +0x18/1C GEN_DST_LO/HI  +0x20/24 GEN_SRC_LO/HI
 //   +0x28 GEN_ETYPE (0x88B5)  +0x2C GEN_STREAM (n)  +0x30 GEN_SEQ_FIRST
 //   +0x34/38 GEN_FRAMES_LO/HI  +0x3C/40 GEN_BYTES_LO/HI (LO read latches HI)
+//   +0x44 GEN_VLAN (1.4) [15:0] TCI (PCP/DEI/VID) [16] EN: insert an 802.1Q tag (reset 0)
 //   +0x48 CHK_CTRL [0] ENABLE (0->1 clears) [1] FORMAT [31:16] ETYPE (0x88B5)
 //   +0x4C CHK_FRAMES +0x50 CHK_LOST +0x54 CHK_ERRORS +0x58 CHK_BAD
 //   +0x5C/60 CHK_LAST_SEQ_LO/HI
@@ -82,7 +86,7 @@ module pktrec_m0_regs #(
     input  wire [3:0]  link_up,
     output wire [7:0]  path_mode,
     output wire [3:0]  path_rpl,
-    output wire [4*255-1:0] gen_cfg,     // per port, see pktrec_m0_path GCFG_W
+    output wire [4*272-1:0] gen_cfg,     // per port, see pktrec_m0_path GCFG_W
     output wire [4*18-1:0]  chk_cfg,
     input  wire [4*130-1:0] gen_st,      // {bytes, frames, done, running}
     input  wire [4*192-1:0] chk_st,      // {last_seq, bad, errors, lost, frames}
@@ -112,7 +116,7 @@ module pktrec_m0_regs #(
 );
 
 localparam [31:0] REG_ID      = 32'h504B4D30;
-localparam [31:0] REG_VERSION = 32'h00010003;
+localparam [31:0] REG_VERSION = 32'h00010004;
 
 assign s_axi_bresp = 2'b00;
 assign s_axi_rresp = 2'b00;
@@ -147,6 +151,7 @@ reg [47:0] g_src   [0:3];
 reg [15:0] g_etype [0:3];
 reg [31:0] g_strm  [0:3];
 reg [31:0] g_seq0  [0:3];
+reg [16:0] g_vlan  [0:3];       // {EN, TCI}
 reg [17:0] c_ctrl  [0:3];
 reg [31:0] hi_lat  [0:3];       // HI latch of the last 64-bit LO read, per port
 reg [3:0]  pair_mode_reg = 4'd0;
@@ -157,7 +162,7 @@ reg [31:0] flush_cnt [0:3];
 reg [3:0]  g_bad = 4'd0;        // GEN_CTRL[3]: generator frames sent as bad (TX tuser)
 genvar gp;
 generate for (gp = 0; gp < 4; gp = gp + 1) begin : g_cfg
-    assign gen_cfg[255*gp +: 255] = {g_seq0[gp], g_strm[gp], g_etype[gp], g_src[gp], g_dst[gp],
+    assign gen_cfg[272*gp +: 272] = {g_vlan[gp], g_seq0[gp], g_strm[gp], g_etype[gp], g_src[gp], g_dst[gp],
                                      g_count[gp], g_ifg[gp], g_mask[gp], g_len[gp], g_ctrl[gp]};
     assign chk_cfg[18*gp +: 18] = c_ctrl[gp];
     assign ifg_cfg[50*gp +: 50] = {g_bad[gp], i_thr[gp][31:16], i_thr[gp][15:0], i_ctrl[gp][23:16],
@@ -168,7 +173,7 @@ initial begin
     for (p = 0; p < 4; p = p + 1) begin
         g_ctrl[p] = 3'd0; g_len[p] = 14'd60; g_mask[p] = 14'd0; g_ifg[p] = 16'd12;
         g_count[p] = 32'd0; g_dst[p] = 48'hFFFF_FFFF_FFFF; g_src[p] = 48'h0200_0000_0000 + p;
-        g_etype[p] = 16'h88B5; g_strm[p] = p; g_seq0[p] = 32'd0; c_ctrl[p] = {16'h88B5, 2'b00};
+        g_etype[p] = 16'h88B5; g_strm[p] = p; g_seq0[p] = 32'd0; g_vlan[p] = 17'd0; c_ctrl[p] = {16'h88B5, 2'b00};
         hi_lat[p] = 32'd0;
         i_ctrl[p] = {8'd8, 8'd12, 7'd0, 1'b1}; i_thr[p] = {16'd2048, 16'd3072};
         i_hi_lat[p] = 16'd0; flush_cnt[p] = 32'd0;
@@ -196,6 +201,7 @@ function [31:0] gword;
             5'd12: gword = g_seq0[rp];
             5'd13: gword = gen_st[130*rp + 2 +: 32];      // FRAMES_LO
             5'd15: gword = gen_st[130*rp + 66 +: 32];     // BYTES_LO
+            5'd17: gword = {15'd0, g_vlan[rp]};
             5'd18: gword = {c_ctrl[rp][17:2], 14'd0, c_ctrl[rp][1:0]};
             5'd19: gword = chk_st[192*rp +: 32];
             5'd20: gword = chk_st[192*rp + 32 +: 32];
@@ -310,6 +316,7 @@ always @(posedge clk) begin
                     5'd10: g_etype[wa[8:7]] <= s_axi_wdata[15:0];
                     5'd11: g_strm[wa[8:7]]  <= s_axi_wdata;
                     5'd12: g_seq0[wa[8:7]]  <= s_axi_wdata;
+                    5'd17: g_vlan[wa[8:7]]  <= s_axi_wdata[16:0];
                     5'd18: c_ctrl[wa[8:7]]  <= {s_axi_wdata[31:16], s_axi_wdata[1:0]};
                     default: ;
                 endcase

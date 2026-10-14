@@ -17,7 +17,7 @@
 // puts on the wire.
 //
 // Tests:
-//   1. Registers: ID / VERSION / reset values; m0 VERSION 1.3, PATH_RPL, EFF_PATH.
+//   1. Registers: ID / VERSION / reset values; m0 VERSION 1.4, PATH_RPL, EFF_PATH.
 //   2. SEL = 0: the playback stream passes through to the fdrec_check port
 //      untouched (fdplay unchanged); the replay block sees nothing.
 //   3. TIMED 1x, 150 frames of 60..1514 bytes, records of another port mixed in
@@ -559,7 +559,7 @@ module tb_pktrec_replay;
     rexp(R_STORE, 32'd8192, "STORE_BEATS");
     rexp(R_MAXCAP, 32'd16384, "MAX_CAP");
     mrd(M_VERSION, d);
-    if (d !== 32'h00010003) fail($sformatf("m0 VERSION 0x%08x", d));
+    if (d !== 32'h00010004) fail($sformatf("m0 VERSION 0x%08x", d));
     mwr(M_RPL, 32'h4);                       // P2 = replay
     mwr(M_PATH_CTRL, 32'h0);
     repeat (40) @(posedge ctrl_clk);

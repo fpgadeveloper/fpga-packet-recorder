@@ -16,7 +16,7 @@
 //
 // s_axi map (byte offsets; 0x0_0000..0x3_FFFF local, 0x4_0000..0x7_FFFF transceiver APB)
 //   0x000 ID           RO  0x504B5245 ("PKRE")
-//   0x004 VERSION      RO  0x00010000
+//   0x004 VERSION      RO  0x00010001 (1.1: TX/RX_MAX_LEN reset from MAX_FRAME_LEN, 1522)
 //   0x008 GCTRL        RW  [0] xcvr_rst (1 = hold all GTs/QPLL in reset; reset value
 //                          XCVR_RST_DEFAULT)  [11:8] phy_reset_n[3:0] (reset value 4'hF)
 //   0x00C GSTATUS      RO  [0] gtpowergood [1] qpll0 lock [2] qpll1 lock
@@ -40,8 +40,14 @@
 //                          [3] tx underflow [4] an interrupt
 //   +0x10 TX_IFG       RW  [7:0] (12); not used when EXT_TX_IFG = 1 (the MAC then takes
 //                          tx_ifg_ext, the dynamic IFG of pktrec_m0_path, M3)
-//   +0x14 TX_MAX_LEN   RW  [15:0] max frame length incl. FCS, minus 1 (1517)
-//   +0x18 RX_MAX_LEN   RW  [15:0] max frame length incl. FCS, minus 1 (1517)
+//   +0x14 TX_MAX_LEN   RW  [15:0] max frame length incl. FCS, minus 1 (MAX_FRAME_LEN - 1 =
+//                          1521): longer frames are cut and sent error-terminated
+//   +0x18 RX_MAX_LEN   RW  [15:0] max frame length incl. FCS, minus 1 (MAX_FRAME_LEN - 1 =
+//                          1521): longer frames are delivered in full but flagged bad
+//                          (tuser[0], RX_BAD / STICKY[2]); Taxi has no VLAN allowance of
+//                          its own, so the reset value 1522 covers one 802.1Q tag.
+//                          Raise both (up to 16383) for jumbo frames; keep the m0 path's
+//                          IFG_LO above the largest frame (pktrec-phy maxlen does both)
 //   +0x1C TX_MIN_LEN   RW  [7:0] min frame length excl. FCS, minus 1 (59; used when tx_pad_en)
 //   0x4_0000 + n * 0x1_0000: Taxi GT control registers of lane n (16-bit APB, 32-bit
 //   accesses; see taxi_eth_phy_25g_us_gt_apb). One AXI transaction at a time.
@@ -68,6 +74,7 @@ module pktrec_eth_ports_core #(
     parameter logic        XCVR_RST_DEFAULT  = 1'b0,
     parameter logic        DEFAULT_TX_PAD_EN = 1'b1,
     parameter logic        EXT_TX_IFG        = 1'b0,
+    parameter int          MAX_FRAME_LEN     = 1522,   // TX/RX_MAX_LEN reset, bytes incl. FCS
     parameter int          AXIL_ADDR_W       = 19
 )(
     // GT reference clock (125 MHz) and serial lanes
@@ -164,7 +171,7 @@ module pktrec_eth_ports_core #(
 localparam int CNT = 4;
 localparam int APB_ADDR_W = 18;
 localparam logic [31:0] REG_ID      = 32'h504B5245;
-localparam logic [31:0] REG_VERSION = 32'h00010000;
+localparam logic [31:0] REG_VERSION = 32'h00010001;
 
 // ============================================================================
 // Registers (ctrl_clk)
@@ -178,14 +185,15 @@ logic [15:0] rx_max_len_reg [CNT];
 logic [7:0]  tx_min_len_reg [CNT];
 logic [4:0]  sticky_reg     [CNT];
 
+localparam logic [15:0] MAX_LEN_DEFAULT = 16'(MAX_FRAME_LEN - 1);
 localparam logic [9:0] PCTRL_DEFAULT = {1'b0, 1'b0, 1'b0, 1'b1, 1'b1, 1'b0, 1'b1, DEFAULT_TX_PAD_EN, 1'b1, 1'b1};
 
 initial begin
     for (int i = 0; i < CNT; i++) begin
         pctrl_reg[i] = PCTRL_DEFAULT;
         tx_ifg_reg[i] = 8'd12;
-        tx_max_len_reg[i] = 16'd1517;
-        rx_max_len_reg[i] = 16'd1517;
+        tx_max_len_reg[i] = MAX_LEN_DEFAULT;
+        rx_max_len_reg[i] = MAX_LEN_DEFAULT;
         tx_min_len_reg[i] = 8'd59;
         sticky_reg[i] = '0;
     end
@@ -967,8 +975,8 @@ always_ff @(posedge ctrl_clk) begin
         for (int i = 0; i < CNT; i++) begin
             pctrl_reg[i] <= PCTRL_DEFAULT;
             tx_ifg_reg[i] <= 8'd12;
-            tx_max_len_reg[i] <= 16'd1517;
-            rx_max_len_reg[i] <= 16'd1517;
+            tx_max_len_reg[i] <= MAX_LEN_DEFAULT;
+            rx_max_len_reg[i] <= MAX_LEN_DEFAULT;
             tx_min_len_reg[i] <= 8'd59;
             sticky_reg[i] <= '0;
             evt_last_reg[i] <= evt_tgl_ctrl[i];

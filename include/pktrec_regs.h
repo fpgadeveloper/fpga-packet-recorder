@@ -56,7 +56,8 @@
 /* ------------------------------------------------------------------------- */
 #define PKTREC_ETH_ID              0x000   /* RO 0x504B5245 "PKRE" */
 #define PKTREC_ETH_ID_VALUE        0x504B5245
-#define PKTREC_ETH_VERSION         0x004   /* RO 0x00010000 */
+#define PKTREC_ETH_VERSION         0x004   /* RO 0x00010001 (1.1: TX/RX_MAX_LEN reset 1521) */
+#define PKTREC_ETH_VERSION_1_1     0x00010001
 #define PKTREC_ETH_GCTRL           0x008   /* RW */
 #define   PKTREC_ETH_GCTRL_XCVR_RST      (1u << 0)   /* hold all GTs + QPLL in reset (reset 0) */
 #define   PKTREC_ETH_GCTRL_PHY_RSTN_SHIFT 8          /* [11:8] PHY RESET_N pins (reset 0xF = released) */
@@ -118,8 +119,11 @@
 #define PKTREC_ETH_P_STICKY        0x0C    /* W1C [0] link down [1] bad FCS [2] bad frame
                                               [3] TX underflow [4] AN interrupt */
 #define PKTREC_ETH_P_TX_IFG        0x10    /* RW [7:0] (12) */
-#define PKTREC_ETH_P_TX_MAX_LEN    0x14    /* RW [15:0] incl. FCS, minus 1 (1517) */
-#define PKTREC_ETH_P_RX_MAX_LEN    0x18    /* RW [15:0] incl. FCS, minus 1 (1517) */
+#define PKTREC_ETH_P_TX_MAX_LEN    0x14    /* RW [15:0] incl. FCS, minus 1 (1521); longer
+                                              frames are cut, sent error-terminated */
+#define PKTREC_ETH_P_RX_MAX_LEN    0x18    /* RW [15:0] incl. FCS, minus 1 (1521); longer
+                                              frames arrive whole with the BAD flag */
+#define PKTREC_ETH_MAX_FRAME_DEFAULT 1522  /* 1518 + one 802.1Q tag (1.0 bitstreams: 1518) */
 #define PKTREC_ETH_P_TX_MIN_LEN    0x1C    /* RW [7:0] excl. FCS, minus 1 (59) */
 
 /* Taxi GT control registers of lane n (16-bit APB, 32-bit accesses) */
@@ -130,12 +134,13 @@
 /* ------------------------------------------------------------------------- */
 #define PKTREC_M0_ID               0x000   /* RO 0x504B4D30 "PKM0" */
 #define PKTREC_M0_ID_VALUE         0x504B4D30
-#define PKTREC_M0_VERSION          0x004   /* RO 0x00010002 (1.1: traffic generator + checker;
+#define PKTREC_M0_VERSION          0x004   /* RO 0x00010004 (1.1: traffic generator + checker;
                                               1.2: TAP mode - PAIR_MODE, EFF_PATH, dynamic
                                               IFG, FWD FIFO 16 KB + fill, FLUSH, GEN BAD) */
 #define PKTREC_M0_VERSION_1_1      0x00010001
 #define PKTREC_M0_VERSION_1_2      0x00010002
 #define PKTREC_M0_VERSION_1_3      0x00010003   /* 1.3 (M6): PATH_RPL, EFF_PATH[11:8] */
+#define PKTREC_M0_VERSION_1_4      0x00010004   /* 1.4: GEN_VLAN, checker skips a tag */
 #define PKTREC_M0_PATH_CTRL        0x008   /* RW [2n+1:2n] TX source of port n (reset 0) */
 #define   PKTREC_M0_PATH_IDLE            0u          /* nothing is sent */
 #define   PKTREC_M0_PATH_LOOP            1u          /* own RX (RX n -> TX n) */
@@ -182,7 +187,10 @@
  * MAC's inter-frame gap is IFG_NOM, or IFG_MIN while the reduced gap is active:
  * it starts when the FWD FIFO fill (bytes, counting the frame being received)
  * exceeds IFG_HI and ends when it falls below IFG_LO. Keep IFG_LO above the
- * largest frame. The shell's TX_IFG register is not used (EXT_TX_IFG = 1). */
+ * largest frame: the reset 2048 leaves >= 500 B of margin over the 1522-byte
+ * MAC limit; raise IFG_LO / IFG_HI together with PKTREC_ETH_P_RX/TX_MAX_LEN for
+ * longer frames (pktrec-phy maxlen does this). The shell's TX_IFG register is
+ * not used (EXT_TX_IFG = 1). */
 #define PKTREC_M0_P_IFG_CTRL       0x20    /* RW [0] DYN_EN (1), [15:8] IFG_NOM (12),
                                               [23:16] IFG_MIN (8), bytes */
 #define   PKTREC_M0_IFG_DYN_EN           (1u << 0)
@@ -216,8 +224,10 @@
  *   FORMAT 1 (raw):  dst / src / GEN_ETYPE / sequence u32 BE / zeros
  * Rate: one frame start at most every ceil((LEN + 4 + 8 + GEN_IFG) / 2) tx_clk
  * cycles (16 ns); GEN_IFG = 12 is line rate. Frames longer than the MAC's
- * TX_MAX_LEN (1518 incl. FCS by default) are cut by the MAC: raise
- * PKTREC_ETH_P_TX_MAX_LEN for jumbo frames.
+ * TX_MAX_LEN (1522 incl. FCS by default; 1518 in eth map 1.0) are cut by the
+ * MAC: raise PKTREC_ETH_P_TX_MAX_LEN for jumbo frames.
+ * GEN_VLAN.EN (1.4) inserts an 802.1Q tag after the source MAC in either format
+ * (as gen_seq.py --vlan); the checker recognises one tag in received frames.
  * The checker counts in-order / lost / duplicate sequence numbers of received
  * generator frames (CHK_CTRL.FORMAT / ETYPE select the format; one stream per
  * port); CHK_CTRL.ENABLE 0 -> 1 clears its counters.
@@ -246,6 +256,8 @@
 #define PKTREC_M0_GEN_FRAMES_HI    0x38
 #define PKTREC_M0_GEN_BYTES_LO     0x3C    /* RO 64: wire bytes incl. FCS (no preamble/IFG) */
 #define PKTREC_M0_GEN_BYTES_HI     0x40
+#define PKTREC_M0_GEN_VLAN         0x44    /* RW (1.4) [15:0] TCI, [16] EN (reset 0) */
+#define   PKTREC_M0_GEN_VLAN_EN          (1u << 16)
 #define PKTREC_M0_CHK_CTRL         0x48    /* RW [0] ENABLE, [1] FORMAT raw, [31:16] ETYPE */
 #define PKTREC_M0_CHK_FRAMES       0x4C    /* RO good generator frames received */
 #define PKTREC_M0_CHK_LOST         0x50    /* RO sum of sequence gaps */
@@ -301,7 +313,7 @@
  * merge restarts on a record boundary anyway). Do NOT change SRC_SEL while a
  * recording runs.
  * Frame size limits: the MAC delivers every frame whole (frames longer than
- * the MAC's RX_MAX_LEN, 1518 incl. FCS by default, arrive with the BAD flag);
+ * the MAC's RX_MAX_LEN, 1522 incl. FCS by default, arrive with the BAD flag);
  * the capture stores up to PORT_FIFO_BYTES (16384) bytes per frame -- a frame
  * longer than the per-port FIFO is dropped whole and counted in FRAMES_DROP.
  * So cap_len <= PORT_FIFO_BYTES, orig_len <= cap_len + 4 when not truncated

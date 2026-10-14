@@ -12,6 +12,10 @@
 //       "PRSQ" | stream id (u32 BE) | sequence number (u64 BE) | zero fill
 //   FORMAT 1 "raw" -- dst MAC | src MAC | ETYPE (default 0x88B5, IEEE local
 //       experimental) | sequence number (u32 BE, payload offset 0) | zero fill
+//   VLAN (m0 map 1.4): with VLAN_EN an 802.1Q tag (0x8100 + VLAN_TCI) follows the
+//     source MAC in either format; everything after it is unchanged (shifted by 4
+//     bytes; IPv4 tot_len = LEN - 18, UDP len = LEN - 38), as gen_seq.py --vlan.
+//     PRSQ needs LEN >= 62 with the tag (the sequence number ends at byte 62).
 // The sequence number starts at SEQ_FIRST on every start and increments per
 // frame. RAND_LEN: LEN + (16-bit LFSR & LEN_MASK) per frame (clamped to 16383).
 //
@@ -44,6 +48,8 @@ module pktrec_gen (
     input  wire logic [47:0]  dst,
     input  wire logic [47:0]  src,
     input  wire logic [15:0]  etype,
+    input  wire logic         vlan_en,
+    input  wire logic [15:0]  vlan_tci,
     input  wire logic [31:0]  stream,
     input  wire logic [31:0]  seq_first,
 
@@ -87,21 +93,25 @@ logic [16:0] wait_cnt = '0;
 wire [14:0] len_r   = 15'(len) + (rand_len ? 15'(lfsr[13:0] & len_mask) : 15'd0);
 wire [13:0] len_c0  = (len_r > 15'd16383) ? 14'd16383 : len_r[13:0];
 wire [13:0] len_c   = (len_c0 < 14'd60) ? 14'd60 : len_c0;
-wire [15:0] tot_len = 16'(nlen) - 16'd14;
+wire [15:0] hdr_len = vlan_en ? 16'd18 : 16'd14;     // Ethernet header incl. tag
+wire [15:0] tot_len = 16'(nlen) - hdr_len;
 wire [19:0] cs1     = CSUM_C + 20'(tot_len);
 wire [16:0] cs2     = 17'(cs1[15:0]) + 17'(cs1[19:16]);
 wire [15:0] cs3     = cs2[15:0] + 16'(cs2[16]);
 
 // ---- frame bytes ----
-wire [15:0] c_tot  = 16'(clen) - 16'd14;
-wire [15:0] c_udp  = 16'(clen) - 16'd34;
+wire [15:0] c_tot  = 16'(clen) - hdr_len;
+wire [15:0] c_udp  = 16'(clen) - hdr_len - 16'd20;
+// beat in the untagged layout: with the tag, beats 6/7 carry it and the rest moves by 2
+wire        tag_beat = vlan_en && (beat == 13'd6 || beat == 13'd7);
+wire [12:0] ob = (vlan_en && beat >= 13'd8) ? beat - 13'd2 : beat;
 function automatic [15:0] be(input [15:0] v);   // big-endian on the wire: {2nd byte, 1st byte}
     return {v[7:0], v[15:8]};
 endfunction
 logic [15:0] word;
 always_comb begin
     word = 16'h0000;
-    case (beat)
+    case (ob)
         13'd0: word = be(dst[47:32]);
         13'd1: word = be(dst[31:16]);
         13'd2: word = be(dst[15:0]);
@@ -112,13 +122,13 @@ always_comb begin
         default: ;
     endcase
     if (fmt_raw) begin
-        case (beat)
+        case (ob)
             13'd7: word = be(seq[31:16]);
             13'd8: word = be(seq[15:0]);
             default: ;
         endcase
     end else begin
-        case (beat)
+        case (ob)
             13'd7:  word = be(16'h4500);
             13'd8:  word = be(c_tot);
             13'd9:  word = be(16'h0000);
@@ -144,6 +154,7 @@ always_comb begin
             default: ;
         endcase
     end
+    if (tag_beat) word = be(beat[0] ? vlan_tci : 16'h8100);
 end
 
 wire last_beat = (beat == nbeats - 13'd1);

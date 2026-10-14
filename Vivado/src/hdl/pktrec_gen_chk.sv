@@ -5,7 +5,9 @@
 //
 // A frame is a generator frame when (FORMAT 0) EtherType 0x0800, IP protocol
 // 17 and "PRSQ" at UDP payload offset 0 (sequence = u64 BE at byte 50), or
-// (FORMAT 1) EtherType = ETYPE (sequence = u32 BE at byte 14). For each good
+// (FORMAT 1) EtherType = ETYPE (sequence = u32 BE at byte 14). One 802.1Q tag
+// (TPID 0x8100) after the source MAC is skipped (m0 map 1.4; generator VLAN_EN,
+// gen_seq.py --vlan): the offsets above then move by 4 bytes. For each good
 // generator frame (MAC bad flag clear):
 //   first frame after ENABLE: LAST_SEQ := seq
 //   seq == LAST_SEQ + 1       : in order
@@ -47,9 +49,14 @@ logic        have = 1'b0;        // LAST_SEQ valid
 logic [63:0] seq = '0;
 logic        long_enough = 1'b0; // the frame reached the sequence number
 logic        eval_q = 1'b0, bad_q = 1'b0;
+logic        vt = 1'b0;          // this frame carries an 802.1Q tag (seen at beat 6)
 
 // bytes of this beat (wire order): b0 = tdata[7:0] = byte 2*beat
 wire [15:0] be_word = {s_tdata[7:0], s_tdata[15:8]};   // big-endian value of bytes 2b, 2b+1
+// tag at beat 6 (not when the raw EtherType itself is 0x8100); beat 7 = TCI is skipped
+wire        tag6 = (beat == 13'd6) && be_word == 16'h8100 && !(fmt_raw && etype == 16'h8100);
+wire        skip = tag6 || (vt && beat == 13'd7);
+wire [12:0] ob   = (vt && beat >= 13'd8) ? beat - 13'd2 : beat;   // beat in the untagged layout
 
 always_ff @(posedge clk) begin
     en_d <= enable;
@@ -57,8 +64,11 @@ always_ff @(posedge clk) begin
         beat <= s_tlast ? 13'd0 : beat + 13'd1;
         if (beat == 13'd0) ok <= 1'b1;
         if (beat == 13'd0) long_enough <= 1'b0;
-        if (!fmt_raw) begin
-            case (beat)
+        if (beat == 13'd0) vt <= 1'b0;
+        if (tag6) vt <= 1'b1;
+        if (skip) ;
+        else if (!fmt_raw) begin
+            case (ob)
                 13'd6:  if (be_word != 16'h0800) ok <= 1'b0;
                 13'd11: if (s_tdata[15:8] != 8'd17) ok <= 1'b0;
                 13'd21: if (be_word != 16'h5052) ok <= 1'b0;
@@ -70,7 +80,7 @@ always_ff @(posedge clk) begin
                 default: ;
             endcase
         end else begin
-            case (beat)
+            case (ob)
                 13'd6: if (be_word != etype) ok <= 1'b0;
                 13'd7: begin seq[63:32] <= '0; seq[31:16] <= be_word; end
                 13'd8: begin seq[15:0] <= be_word; long_enough <= 1'b1; end
