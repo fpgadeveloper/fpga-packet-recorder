@@ -99,6 +99,9 @@ class Stats:
         return f"min {self.min} ns, mean {self.mean:.1f} ns, max {self.max} ns, stdev {sd:.1f} ns"
 
 
+WILD_JUMP = 1 << 32                 # larger sequence jumps are corrupt numbers
+
+
 class SeqSet:
     """Set of sequence numbers as a growable bitmap (1 bit per number), so a
     line-rate capture of 10^8 frames needs ~12 MB, not a Python set."""
@@ -165,6 +168,7 @@ class Stream:
         self.gap = Stats()
         self.prev_ts = None
         self.bad_fcs = 0
+        self.wild = 0              # sequence numbers > WILD_JUMP away (not tracked)
 
     def unwrap(self, raw):
         if self.bits >= 64:
@@ -180,6 +184,11 @@ class Stream:
         self.count += 1
         if bad_fcs:
             self.bad_fcs += 1
+        if self.maxseq is not None and abs(seq - self.maxseq) > WILD_JUMP:
+            # a corrupted sequence number (typically a bad-FCS frame): tracking it
+            # would grow the bitmap to 2^60 bits (MemoryError, bench C M5 export)
+            self.wild += 1
+            return
         if self.first is None:
             self.first = seq
         if self.seen.add(seq):
@@ -331,6 +340,11 @@ def main():
               f"missing {miss}, duplicates {s.dups}, out of order {s.reorders}, "
               f"unexpected {extra}, bad FCS {s.bad_fcs}")
         print(f"      interval: {s.gap}")
+        if s.wild:
+            print(f"      {s.wild} frames with a sequence number > 2^32 away from the stream "
+                  f"(corrupt; not tracked)")
+            if s.wild > s.bad_fcs:
+                fails.append(f"{ifname} {key}: {s.wild} implausible sequence numbers")
         if miss:
             fails.append(f"{ifname} {key}: {miss} frames missing")
         if s.dups:
