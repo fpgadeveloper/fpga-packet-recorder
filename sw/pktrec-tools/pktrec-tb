@@ -8,7 +8,7 @@ The capture block (include/pktrec_regs.h PKTREC_CAP_*, 0x4_2003_0000) holds one
 ns, TB_INC_NS/TB_INC_FRAC) on every dp_clk cycle (249.975 MHz), and software can
 SET it, ADJ (add a signed step to) it and read it (TB_NOW). Every capture record
 and every PHY SFD timestamp comes from it. pktrec-tb keeps it on CLOCK_REALTIME
-(which systemd-timesyncd keeps on NTP through the PS Ethernet port) so that
+(which chronyd keeps on NTP through the PS Ethernet port) so that
 timestamps are absolute wall-clock times, and it loads and saves the persistent
 calibration (timebase frequency, MAC_OFFSET, SFD windows and per-port offsets).
 
@@ -24,9 +24,16 @@ Commands:
   apply-calibration [--file F] [--dry-run] [--force] [--no-timebase]
                            write /etc/pktrec/calibration.conf to the registers
                            (pktrec-calibration.service, at boot)
-  save-calibration [--file F | --stdout] [--defaults]
+  save-calibration [--file F | --stdout] [--defaults] [--min-locked MIN]
+                   [--max-ppm-delta PPM] [--force-timebase]
                            write the current register values (or the design
-                           defaults) as a calibration file
+                           defaults) as a calibration file. The timebase ppm is
+                           the daemon's frequency estimate, stored only when the
+                           daemon has been locked for >= --min-locked (10) minutes
+                           and the estimate moved < --max-ppm-delta (0.2) ppm over
+                           that time; otherwise the file's existing ppm is kept
+                           (and that is said). The SFD RX offsets are stored
+                           without the watch's per-link-up 0x0055 correction.
   show-calibration [--file F] [--json]
                            registers vs the calibration file, key by key
 
@@ -34,9 +41,11 @@ Daemon (controller, see docs/source/software.md "Timebase discipline"):
   every --interval s (1): read TB_NOW between two CLOCK_REALTIME reads --samples
   times (7) and keep the pair with the shortest read latency:
       offset = TB_NOW - (t1 + t2) / 2         (> 0: the timebase is ahead)
-  start-up: TB_SET (+ one ADJ for the residual), then --estimate s (8) of free
-  running to estimate the frequency error (least-squares slope), INC corrected,
-  TB_SET again; then a PI controller on the frequency:
+  start-up: TB_SET (+ one ADJ for the residual). If the calibration set the
+  frequency (INC != nominal, pktrec-calibration.service), the controller starts
+  from it (seeded integrator) and tracks at once. Otherwise (or --estimate-always)
+  --estimate s (8) of free running estimate the frequency error (least-squares
+  slope), INC corrected, TB_SET again. Then a PI controller on the frequency:
       freq_ppb = I - kp * offset / dt,   I += -ki * offset / dt
   (kp 0.2, ki 0.02; |freq| <= --max-ppm 200, with anti-windup), written as
   INC = nominal * (1 + freq_ppb * 1e-9), nominal = 2^32 * 1e9 / DP_CLK_HZ.
@@ -51,6 +60,16 @@ Daemon (controller, see docs/source/software.md "Timebase discipline"):
   (ignored once that process is gone) or tb-hold (until removed).
   locked = |offset| < --lock-threshold (10 us) for --lock-time (30 s); lost
   after 3 samples with |offset| > 5 x the threshold, or after a SET / step.
+  While locked, the frequency estimate (integrator) of the last --stable-window
+  s (600) is kept as min / max / mean in the state file: save-calibration uses it.
+
+  The timebase follows CLOCK_REALTIME, so its frequency follows the kernel's:
+  the trim converges to (system clock frequency correction) + (timebase
+  oscillator vs PS crystal, ~0.06 ppm on the bench). The kernel's correction
+  (adjtimex freq + tick, set by chronyd) is logged next to the trim in the
+  minute summary and in 'status'; an untrained kernel (right after the first
+  boot, before chronyd has a drift file) makes both wrong by the PS crystal's
+  error (bench: -11.7 ppm) for a few minutes.
 
 All commands that touch the hardware map the capture block through generic-uio
 (the Regs helper of pktrec-phy, imported from the same directory) or /dev/mem
@@ -363,17 +382,46 @@ def measure(hw, clock, samples=7):
     return best                                    # (offset_ns, latency_ns, realtime_ns)
 
 
-def ntp_synced():
-    """True/False from adjtimex (STA_UNSYNC -> TIME_ERROR), else None."""
+def kernel_clock():
+    """Read-only adjtimex(): the kernel's NTP state and frequency correction of
+    CLOCK_REALTIME vs the raw clock (set by chronyd / timesyncd), or None.
+    freq_ppm = timex.freq / 2^16 (PLL / FLL frequency), tick_ppm = the tick length
+    offset (chronyd uses it for corrections beyond +-500 ppm), total = both."""
     try:
         import ctypes
+        c_long, c_int = ctypes.c_long, ctypes.c_int
+
+        class Timex(ctypes.Structure):          # struct timex, LP64 (aarch64 / x86_64)
+            _fields_ = [("modes", ctypes.c_uint), ("offset", c_long), ("freq", c_long),
+                        ("maxerror", c_long), ("esterror", c_long), ("status", c_int),
+                        ("constant", c_long), ("precision", c_long), ("tolerance", c_long),
+                        ("time_sec", c_long), ("time_usec", c_long), ("tick", c_long),
+                        ("ppsfreq", c_long), ("jitter", c_long), ("shift", c_int),
+                        ("stabil", c_long), ("jitcnt", c_long), ("calcnt", c_long),
+                        ("errcnt", c_long), ("stbcnt", c_long), ("tai", c_int),
+                        ("pad", c_int * 11)]
         libc = ctypes.CDLL(None, use_errno=True)
-        buf = ctypes.create_string_buffer(256)    # struct timex, modes = 0 (read only)
-        r = libc.adjtimex(buf)
-        if r >= 0:
-            return r != 5                          # TIME_ERROR
+        tx = Timex()                               # modes = 0: read only
+        r = libc.adjtimex(ctypes.byref(tx))
+        if r < 0:
+            return None
     except (ImportError, OSError, AttributeError):
-        pass
+        return None
+    hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    nominal_tick = round(1e6 / hz)
+    freq_ppm = tx.freq / 65536.0
+    tick_ppm = (tx.tick - nominal_tick) / nominal_tick * 1e6 if tx.tick else 0.0
+    return {"synced": r != 5,                      # TIME_ERROR = STA_UNSYNC
+            "freq_ppm": round(freq_ppm, 4), "tick_ppm": round(tick_ppm, 4),
+            "total_ppm": round(freq_ppm + tick_ppm, 4), "status": tx.status,
+            "maxerror_us": tx.maxerror, "esterror_us": tx.esterror}
+
+
+def ntp_synced():
+    """True/False from adjtimex (STA_UNSYNC -> TIME_ERROR), else None."""
+    k = kernel_clock()
+    if k is not None:
+        return k["synced"]
     if os.path.isdir("/run/systemd/timesync"):
         return os.path.exists("/run/systemd/timesync/synchronized")
     return None
@@ -457,11 +505,16 @@ class Daemon:
             "interval_s": o.interval, "lock_threshold_ns": o.lock_threshold,
             "lock_time_s": o.lock_time, "max_ppm": o.max_ppm,
             "max_adj_ns": o.max_adj, "step_threshold_ns": o.step_threshold,
-            "source": hw.src, "message": None,
+            "source": hw.src, "message": None, "seeded_from_calibration": None,
+            "kernel_freq_ppm": None, "kernel_esterror_us": None,
+            "stable_window_s": getattr(o, "stable_window", 600.0),
+            "freq_est_window_s": 0.0, "freq_est_min_ppb": None, "freq_est_max_ppb": None,
+            "freq_est_mean_ppb": None,
         }
         self.good = 0.0             # seconds with |offset| < lock threshold
         self.bad = 0                # consecutive samples beyond the unlock threshold
         self.hist = []              # (mono, offset) of the last lock_time seconds
+        self.fhist = []             # (mono, freq_est_ppb) while locked, last stable_window s
         self.est = []               # (mono, offset) while estimating the frequency
         self.prev = None            # (mono, offset, adj applied after it)
         self.inc_written = None
@@ -506,6 +559,9 @@ class Daemon:
         self.good = 0.0
         self.bad = 0
         self.hist = []
+        self.fhist = []
+        self.st.update(freq_est_window_s=0.0, freq_est_min_ppb=None, freq_est_max_ppb=None,
+                       freq_est_mean_ppb=None)
 
     # ---- start-up ----
     def startup(self):
@@ -518,9 +574,18 @@ class Daemon:
         self.servo.reset(f0)
         self.inc_written = None
         self.write_freq(f0)
+        # A calibrated INC (pktrec-calibration.service ran before us) seeds the
+        # controller: no start-up estimate against a possibly untrained system clock,
+        # whose 8-s slope would replace it (bench 2026-10-13: +11.67 ppm calibration
+        # -> -0.05 ppm after the estimate, because CLOCK_REALTIME itself ran -11.7 ppm).
+        seeded = abs(f0) >= 1.0 and not getattr(self.o, "estimate_always", False)
+        self.st["seeded_from_calibration"] = seeded
         self.log(f"start: dp_clk {self.hw.dp_clk_hz} Hz, INC from calibration "
-                 f"{f0 / 1e3:+.3f} ppm, interval {self.o.interval} s, kp {self.o.kp} ki {self.o.ki}, "
-                 f"lock < {fmt_ns(self.o.lock_threshold)} for {self.o.lock_time} s")
+                 f"{f0 / 1e3:+.3f} ppm" + (" (seeds the controller, no start-up estimate)"
+                                           if seeded else "") +
+                 f", interval {self.o.interval} s, kp {self.o.kp} ki {self.o.ki}, "
+                 f"lock < {fmt_ns(self.o.lock_threshold)} for {self.o.lock_time} s"
+                 + self.kernel_note())
         x, _, _ = measure(self.hw, self.clock, self.o.samples)
         if self.hw.capture_running():
             self.log(f"a capture is running: no TB_SET at start-up (offset {fmt_ns(x)})")
@@ -531,7 +596,18 @@ class Daemon:
         else:
             self.do_set("start-up")
             self.st["state"] = "estimating"
+        if seeded and self.st["state"] == "estimating":
+            self.st["state"] = "tracking"
         self.est = []
+
+    def kernel_note(self):
+        k = kernel_clock()
+        if k is None:
+            return ""
+        self.st["kernel_freq_ppm"] = k["total_ppm"]
+        self.st["kernel_esterror_us"] = k["esterror_us"]
+        return (f"; kernel clock correction {k['total_ppm']:+.3f} ppm "
+                f"({'NTP synced' if k['synced'] else 'NTP not synced'})")
 
     # ---- one control step ----
     def step(self):
@@ -542,7 +618,11 @@ class Daemon:
         cap = hw.capture_running() or held
         self.st["steps_held"] = held
         if mono - self.ntp_t > 10:
-            self.st["ntp_synced"] = ntp_synced()
+            k = kernel_clock()
+            self.st["ntp_synced"] = k["synced"] if k else ntp_synced()
+            if k:
+                self.st["kernel_freq_ppm"] = k["total_ppm"]
+                self.st["kernel_esterror_us"] = k["esterror_us"]
             self.ntp_t = mono
         self.st.update(offset_ns=int(x), latency_ns=int(lat), capture_running=cap,
                        measured_ns=t_rt)
@@ -576,6 +656,9 @@ class Daemon:
                 self.st["state"] = "estimating"
                 self.est = []
 
+        if self.st["state"] == "estimating" and self.st.get("seeded_from_calibration"):
+            self.st["state"] = "tracking"          # seeded: no estimate (startup())
+            self.prev = None
         if self.st["state"] == "estimating":
             self.est.append((mono, x))
             span = self.est[-1][0] - self.est[0][0]
@@ -639,6 +722,13 @@ class Daemon:
                      f"frequency trim {self.servo.i / 1e3:+.3f} ppm")
         elif self.st["locked"] and self.bad >= 3:
             self.unlock(f"|offset| {fmt_ns(x)} > {fmt_ns(5 * o.lock_threshold)} for 3 samples")
+        if self.st["locked"]:
+            win = getattr(o, "stable_window", 600.0)
+            self.fhist = [(m, v) for m, v in self.fhist if mono - m <= win] + [(mono, self.servo.i)]
+            fv = [v for _, v in self.fhist]
+            self.st.update(freq_est_window_s=round(mono - self.fhist[0][0], 1),
+                           freq_est_min_ppb=round(min(fv), 3), freq_est_max_ppb=round(max(fv), 3),
+                           freq_est_mean_ppb=round(sum(fv) / len(fv), 3))
         return self.finish(mono)
 
     def finish(self, mono):
@@ -659,11 +749,14 @@ class Daemon:
                   file=self.out, flush=True)
         elif mono >= self.next_summary and st["state"] == "tracking":
             self.next_summary = mono + self.o.summary
+            kf = st.get("kernel_freq_ppm")
             print(f"pktrec-tb: {'locked' if st['locked'] else 'tracking'}, offset "
                   f"{fmt_ns(st['offset_ns'])} (rms {fmt_ns(st['offset_rms_30s_ns'])}, max "
                   f"{fmt_ns(st['offset_abs_max_30s_ns'])} over {self.o.lock_time} s), trim "
-                  f"{(st['freq_ppb'] or 0) / 1e3:+.3f} ppm, NTP "
-                  f"{ {True: 'synced', False: 'NOT synced', None: '?'}[st['ntp_synced']] }",
+                  f"{(st['freq_ppb'] or 0) / 1e3:+.3f} ppm (estimate "
+                  f"{(st['freq_est_ppb'] or 0) / 1e3:+.3f}), kernel clock correction "
+                  + (f"{kf:+.3f} ppm" if kf is not None else "?")
+                  + f", NTP {({True: 'synced', False: 'NOT synced', None: '?'})[st['ntp_synced']]}",
                   file=self.out, flush=True)
         return st
 
@@ -708,6 +801,9 @@ CAL_HEADER = """\
 # pktrec-web.service. Write it from the board's current registers with
 # 'pktrec-tb save-calibration' once the bench calibration (docs: software.md,
 # "Calibration") has set them; check with 'pktrec-tb show-calibration'.
+# save-calibration takes [timebase] ppm from the pktrec-tb daemon only after it
+# has been locked >= 10 min with a stable estimate (else it keeps this file's
+# value), and [portN] rx_offset_ns without pktrec-phy watch's 0x0055 correction.
 # A missing key leaves that register at its bitstream reset value (the design
 # defaults below). The values hold for one bitstream build: re-calibrate after
 # every bitstream change (the SFD sampler's clock phase moves between builds).
@@ -758,13 +854,37 @@ tx_offset_ns = {tx}
 """
 
 
-def cal_from_regs(hw):
+def skew_corrections(hw, path=None):
+    """{port: (register, base, correction)} for the RX_OFFSETs that pktrec-phy watch
+    currently corrects for a non-zero DP83867 0x0055 (state file phy-watch.json);
+    only entries whose register still holds the value watch wrote."""
+    path = path or os.path.join(RUN_DIR, "phy-watch.json")
+    try:
+        with open(path) as f:
+            sk = json.load(f).get("skew") or []
+    except (OSError, ValueError, AttributeError):
+        return {}
+    out = {}
+    for n, p in enumerate(sk[:NUM_PORTS]):
+        if not isinstance(p, dict) or not p.get("corr"):
+            continue
+        r = s32(hw.rd(SFD_PORT_BASE + n * SFD_PORT_STRIDE + SFD_P_RX_OFFSET))
+        if r == p.get("written") and p.get("base") is not None:
+            out[n] = (r, p["base"], p["corr"])
+    return out
+
+
+def cal_from_regs(hw, skew=None):
+    """Calibration values from the registers; RX offsets with a live 0x0055
+    correction (skew_corrections) are taken as their calibration base."""
     v = {}
     for sec, key, off, kind, _ in CAL_REGS:
         if sec != "capture" and not hw.has_sfd:
             continue
         r = hw.rd(off)
         v[(sec, key)] = (r & SFD_MATCH_EN) if kind == "en" else (r & 0xFF if kind == "u8" else s32(r))
+    for n, (_, base, _) in (skew or {}).items():
+        v[(f"port{n}", "rx_offset_ns")] = base
     v[("timebase", "ppm")] = round(inc_to_ppb(hw.inc_raw(), hw.dp_clk_hz) / 1e3, 6)
     return v
 
@@ -901,6 +1021,7 @@ def status_doc(hw, clock, samples=15):
         "nominal_inc_ns": nominal_inc_raw(hw.dp_clk_hz) / 2 ** 32, "dp_clk_hz": hw.dp_clk_hz,
         "freq_ppb": round(ppb, 3), "ppm": round(ppb / 1e3, 6), "tb_status": f"0x{hw.tb_status():02x}",
         "capture_running": hw.capture_running(), "ntp_synced": ntp_synced(),
+        "kernel_clock": kernel_clock(),
         "cap_version": f"0x{hw.version:08x}", "source": hw.src,
         "daemon": None, "locked": False, "calibration": calibration_info(),
     }
@@ -908,7 +1029,9 @@ def status_doc(hw, clock, samples=15):
         doc["daemon"] = {k: d.get(k) for k in (
             "fresh", "state", "locked", "locked_since", "offset_ns", "offset_rms_30s_ns",
             "offset_abs_max_30s_ns", "freq_ppb", "freq_est_ppb", "last_set", "last_set_reason",
-            "sets", "adj_steps", "steps_detected", "updated", "age_s", "pid", "message")}
+            "sets", "adj_steps", "steps_detected", "updated", "age_s", "pid", "message",
+            "seeded_from_calibration", "kernel_freq_ppm", "freq_est_window_s", "freq_est_min_ppb",
+            "freq_est_max_ppb", "freq_est_mean_ppb")}
         doc["locked"] = bool(st_daemon.get("fresh") and st_daemon.get("locked"))
     return doc
 
@@ -938,7 +1061,10 @@ def cmd_status(a):
           f"{doc['latency_ns']} ns)")
     print(f"INC           {doc['inc_raw']} = {doc['inc_ns']:.9f} ns/cycle, nominal "
           f"{doc['nominal_inc_ns']:.9f} (dp_clk {doc['dp_clk_hz']} Hz): {doc['ppm']:+.3f} ppm")
-    print(f"system clock  NTP synchronised: {yn[doc['ntp_synced']]}")
+    k = doc.get("kernel_clock")
+    print(f"system clock  NTP synchronised: {yn[doc['ntp_synced']]}" +
+          (f"; kernel frequency correction {k['total_ppm']:+.3f} ppm, estimated error "
+           f"{k['esterror_us']} us" if k else ""))
     print(f"capture       {'RUNNING' if doc['capture_running'] else 'idle'}, TB_STATUS "
           f"{doc['tb_status']}, capture map {doc['cap_version']} ({doc['source']})")
     d = doc["daemon"]
@@ -1056,16 +1182,72 @@ def cmd_apply(a):
     return 1 if errs else 0
 
 
+def timebase_save_verdict(st, now_ns, min_locked_s, max_delta_ppb):
+    """-> (ppb or None, reason): the daemon's frequency estimate when it is good
+    enough to persist, else None and why not."""
+    if not st or not st.get("fresh"):
+        return None, "the pktrec-tb daemon is not running"
+    if not st.get("locked") or not st.get("locked_since_ns"):
+        return None, "the pktrec-tb daemon is not locked"
+    locked_s = (now_ns - st["locked_since_ns"]) / 1e9
+    if locked_s < min_locked_s:
+        return None, (f"the daemon has been locked for {locked_s / 60:.1f} min only "
+                      f"(needs {min_locked_s / 60:.0f} min)")
+    span = st.get("freq_est_window_s") or 0.0
+    need = min(min_locked_s, st.get("stable_window_s") or min_locked_s) - 3 * (st.get("interval_s") or 1)
+    lo, hi = st.get("freq_est_min_ppb"), st.get("freq_est_max_ppb")
+    if lo is None or hi is None or span < need:
+        return None, f"the daemon's frequency history covers {span:.0f} s only (needs {need:.0f} s)"
+    if hi - lo >= max_delta_ppb:
+        return None, (f"the frequency estimate moved {(hi - lo) / 1e3:.3f} ppm over the last "
+                      f"{span:.0f} s (limit {max_delta_ppb / 1e3:.3f} ppm): not stable yet")
+    ppb = st.get("freq_est_mean_ppb")
+    if ppb is None:
+        ppb = st.get("freq_est_ppb")
+    return ppb, (f"daemon locked {locked_s / 60:.1f} min, estimate within {(hi - lo) / 1e3:.3f} ppm "
+                 f"over {span:.0f} s")
+
+
 def cmd_save(a):
     if a.defaults:
         v, origin, dp = cal_defaults(), "design defaults (register reset values)", DP_CLK_HZ_DEFAULT
     else:
         hw = open_hw(a)
-        v, dp = cal_from_regs(hw), hw.dp_clk_hz
+        skew = skew_corrections(hw)
+        v, dp = cal_from_regs(hw, skew), hw.dp_clk_hz
+        for n, (r, base, corr) in sorted(skew.items()):
+            print(f"pktrec-tb: port{n}.rx_offset_ns: saving the calibration base {base} ns "
+                  f"(register {r} ns includes pktrec-phy watch's 0x0055 correction {corr:+d} ns)",
+                  file=sys.stderr)
+        live = v[("timebase", "ppm")]
         st = read_state()
-        if st and st.get("fresh") and st.get("locked") and st.get("freq_est_ppb") is not None:
-            # the daemon's frequency estimate, not the momentary P-term-loaded INC
-            v[("timebase", "ppm")] = round(st["freq_est_ppb"] / 1e3, 6)
+        ppb, why = timebase_save_verdict(st, time.time_ns(), a.min_locked * 60.0,
+                                         a.max_ppm_delta * 1e3)
+        if ppb is not None:
+            # the daemon's (window-averaged) frequency estimate, not the momentary
+            # P-term-loaded INC
+            v[("timebase", "ppm")] = round(ppb / 1e3, 6)
+            print(f"pktrec-tb: timebase.ppm = {ppb / 1e3:+.6f} ({why})", file=sys.stderr)
+        elif a.force_timebase:
+            if st and st.get("fresh") and st.get("freq_est_ppb") is not None:
+                v[("timebase", "ppm")] = round(st["freq_est_ppb"] / 1e3, 6)
+            print(f"pktrec-tb: warning: {why}; --force-timebase: saving timebase.ppm = "
+                  f"{v[('timebase', 'ppm')]:+.6f}", file=sys.stderr)
+        else:
+            old = None
+            try:
+                fv, _ = parse_cal(a.file)
+                old = tb_ppb_from_cal(fv, dp)
+            except (OSError, configparser.Error):
+                pass
+            if old is not None:
+                v[("timebase", "ppm")] = round(old / 1e3, 6)
+                keep = f"keeping the file's timebase.ppm = {old / 1e3:+.6f}"
+            else:
+                v[("timebase", "ppm")] = 0.0
+                keep = "the file has no timebase value: writing the design default 0"
+            print(f"pktrec-tb: timebase.ppm NOT updated: {why}; {keep} (the live INC is "
+                  f"{live:+.6f} ppm; --force-timebase stores it anyway)", file=sys.stderr)
         origin = (f"saved {iso_ns(time.time_ns())} on {socket.gethostname()} by "
                   f"'pktrec-tb save-calibration', capture map 0x{hw.version:08x}")
     text = render_cal(v, origin, dp)
@@ -1091,7 +1273,8 @@ def cmd_save(a):
 
 def cmd_show(a):
     hw = open_hw(a)
-    cur = cal_from_regs(hw)
+    skew = skew_corrections(hw)
+    cur = cal_from_regs(hw, skew)
     try:
         filev, errs = parse_cal(a.file)
     except (OSError, configparser.Error) as e:
@@ -1106,6 +1289,8 @@ def cmd_show(a):
              "default": dflt.get((s, k))} for s, k in keys]
     if a.json:
         print(json.dumps({"file": a.file, "errors": errs, "keys": rows,
+                          "rx_skew_corrections": {f"port{n}": {"register": r, "base": b, "corr": c}
+                                                  for n, (r, b, c) in skew.items()},
                           "calibration": calibration_info(a.file)}, indent=1))
         return 0
     print(f"{'key':26} {'register':>12} {'file':>12} {'default':>10}")
@@ -1113,6 +1298,9 @@ def cmd_show(a):
         mark = "" if r["file"] is None or r["file"] == r["register"] else "   <- differs"
         if r["key"] == "timebase.ppm" and r["file"] is not None and r["register"] is not None:
             mark = "   (daemon trims it)" if abs(r["file"] - r["register"]) > 1e-3 else ""
+        for n, (reg, base, corr) in skew.items():
+            if r["key"] == f"port{n}.rx_offset_ns":
+                mark += f"   (base; register {reg} = base {corr:+d} ns 0x0055 correction)"
         print(f"{r['key']:26} {str(r['register']):>12} {str(r['file'] if r['file'] is not None else '-'):>12}"
               f" {str(r['default']):>10}{mark}")
     for e in errs:
@@ -1147,7 +1335,13 @@ def main():
     p.add_argument("--ki", type=float, default=0.02)
     p.add_argument("--max-ppm", type=float, default=200.0, help="frequency bound (200)")
     p.add_argument("--estimate", type=float, default=8.0,
-                   help="seconds of frequency estimation at start-up (8)")
+                   help="seconds of frequency estimation at start-up (8); skipped when the "
+                        "calibration set the INC (see --estimate-always)")
+    p.add_argument("--estimate-always", action="store_true",
+                   help="estimate the frequency at start-up even when the calibration set it")
+    p.add_argument("--stable-window", type=float, default=600.0,
+                   help="seconds of frequency-estimate history kept while locked, for "
+                        "save-calibration (600)")
     p.add_argument("--lock-threshold", type=float, default=10000.0, help="ns (10000)")
     p.add_argument("--lock-time", type=float, default=30.0, help="seconds (30)")
     p.add_argument("--adj-threshold", type=float, default=20000.0,
@@ -1171,6 +1365,14 @@ def main():
     p.add_argument("--stdout", action="store_true")
     p.add_argument("--defaults", action="store_true",
                    help="the design defaults instead of the registers (no hardware)")
+    p.add_argument("--min-locked", type=float, default=10.0,
+                   help="minutes the daemon must have been locked before its frequency "
+                        "estimate is saved (10)")
+    p.add_argument("--max-ppm-delta", type=float, default=0.2,
+                   help="largest change of the frequency estimate over that time, ppm (0.2)")
+    p.add_argument("--force-timebase", action="store_true",
+                   help="save the timebase ppm even when the daemon is not locked/stable "
+                        "(the daemon's estimate if it runs, else the live INC)")
     p = sub.add_parser("show-calibration", help="registers vs the calibration file")
     p.add_argument("--file", default=CAL_FILE)
     p.add_argument("--json", action="store_true")

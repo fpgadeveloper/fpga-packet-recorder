@@ -11,8 +11,11 @@
    a capture runs; a 2 s system-clock step (idle) -> one TB_SET and re-lock; a
    5 ms step during a capture -> slewed (<= 200 ppm), never stepped; an INC
    written by someone else is adopted.
+   A calibrated INC seeds the controller: no start-up estimate, tracking at once.
 2. Calibration file: defaults render/parse round trip, apply -> registers ->
-   save round trip, invalid files rejected, wide-window warning.
+   save round trip, invalid files rejected, wide-window warning; save-calibration
+   stores the daemon's frequency only after >= 10 min locked with a stable
+   estimate; RX offsets with a live 0x0055 correction are saved as their base.
 3. CLI end to end with --sim (real time, a few seconds): status --json, set,
    trim, save/apply/show-calibration, daemon --duration -> /run state file.
 Exit 0 when every check passed.
@@ -219,6 +222,53 @@ def test_controller(tb):
           f"after the capture: set, estimated {d.st['freq_est_ppb'] / 1e3:+.3f} ppm, locked")
 
 
+def test_seeded(tb):
+    print("start-up with a calibrated INC (+10.4 ppm for a -10.4 ppm oscillator): seeded")
+    clock = VClock()
+    hw = tb.SimHw(-10.4, clock=clock, noise_ns=1000.0, persist=False, seed=11)
+    hw.set_inc_raw(tb.ppb_to_inc(10.4e3, hw.dp_clk_hz))
+    d = tb.Daemon(hw, clock, opts(), out=Quiet(), state_path=None)
+    d.startup()
+    check(d.st["seeded_from_calibration"] and d.st["state"] == "tracking",
+          "seeded_from_calibration, state tracking right after start-up")
+    t0 = clock.monotonic()
+    lock_t = None
+    while clock.monotonic() - t0 < 120:
+        st = d.step()
+        if st["locked"] and lock_t is None:
+            lock_t = clock.monotonic() - t0
+        clock.sleep(1.0)
+    check(lock_t is not None and lock_t < 45, f"locked after {lock_t and round(lock_t)} s (< 45 s)")
+    check(len([e for e in hw.log if e[1] == "set"]) == 1, "one TB_SET (no second one after an estimate)")
+    check(abs(d.st["freq_est_ppb"] / 1e3 - 10.4) < 0.3,
+          f"estimate stays at the calibration: {d.st['freq_est_ppb'] / 1e3:+.3f} ppm")
+
+    print("save-calibration verdict (>= 10 min locked, estimate stable within 0.2 ppm)")
+    o = opts()
+    o.stable_window = 600.0
+    clock = VClock()
+    # 300 ns rms read jitter (the bench measured 40-60 ns rms offsets; 1 us makes the
+    # integrator wander +-0.1 ppm, right at the 0.2 ppm stability limit)
+    hw = tb.SimHw(-10.4, clock=clock, noise_ns=300.0, persist=False, seed=12)
+    hw.set_inc_raw(tb.ppb_to_inc(10.4e3, hw.dp_clk_hz))
+    d = tb.Daemon(hw, clock, o, out=Quiet(), state_path=None)
+    d.startup()
+    run_for(d, clock, 300)
+    st = dict(d.st, fresh=True)
+    ppb, why = tb.timebase_save_verdict(st, clock.realtime_ns(), 600, 200)
+    check(ppb is None and "locked for" in why, f"after 5 min: refused ({why})")
+    run_for(d, clock, 420)
+    st = dict(d.st, fresh=True)
+    ppb, why = tb.timebase_save_verdict(st, clock.realtime_ns(), 600, 200)
+    check(ppb is not None and abs(ppb / 1e3 - 10.4) < 0.3, f"after 12 min: {(ppb or 0) / 1e3:+.3f} ppm ({why})")
+    check(st["freq_est_window_s"] >= 590, f"history window {st['freq_est_window_s']} s")
+    st2 = dict(st, freq_est_max_ppb=st["freq_est_min_ppb"] + 500)
+    ppb, why = tb.timebase_save_verdict(st2, clock.realtime_ns(), 600, 200)
+    check(ppb is None and "not stable" in why, f"estimate moving 0.5 ppm: refused ({why})")
+    ppb, why = tb.timebase_save_verdict(dict(st, fresh=False), clock.realtime_ns(), 600, 200)
+    check(ppb is None and "not running" in why, "daemon not running: refused")
+
+
 def test_calibration(tb):
     print("calibration file")
     dflt = tb.cal_defaults()
@@ -258,6 +308,20 @@ def test_calibration(tb):
         applied, warns, errs2 = tb.apply_cal(hw, v)
         check(len(warns) == 1 and "wide" in warns[0], "window >= 672 ns warned")
         check(len(errs2) == 1 and "timebase.ppm" not in applied, "500 ppm refused")
+        # 0x0055: pktrec-phy watch corrects port2 by -8 ns: the base is saved
+        old = tb.RUN_DIR
+        tb.RUN_DIR = td
+        hw.wr(tb.SFD_PORT_BASE + 2 * tb.SFD_PORT_STRIDE + tb.SFD_P_RX_OFFSET, -242)
+        with open(os.path.join(td, "phy-watch.json"), "w") as fh:
+            json.dump({"skew": [{"port": n, "base": -234, "corr": -8 if n == 2 else 0,
+                                 "written": -242 if n == 2 else -234} for n in range(4)]}, fh)
+        sk = tb.skew_corrections(hw)
+        v = tb.cal_from_regs(hw, sk)
+        check(sk == {2: (-242, -234, -8)} and v[("port2", "rx_offset_ns")] == -234,
+              "RX_OFFSET with a live 0x0055 correction (-242) saved as its base (-234)")
+        hw.wr(tb.SFD_PORT_BASE + 2 * tb.SFD_PORT_STRIDE + tb.SFD_P_RX_OFFSET, -250)
+        check(tb.skew_corrections(hw) == {}, "register changed since: no correction assumed")
+        tb.RUN_DIR = old
 
 
 def run(args, env, check_rc=0):
@@ -292,7 +356,21 @@ def test_cli():
         cal = env["PKTREC_CAL_FILE"]
         check(r.returncode == 0 and os.path.isfile(cal), "save-calibration writes the file")
         txt = open(cal).read() if os.path.isfile(cal) else ""
-        check("ppm = 10.4000" in txt and "mac_offset_ns = 52" in txt, "saved values")
+        check("NOT updated" in r.stderr and "not running" in r.stderr and "ppm = 0.000000" in txt,
+              "no locked daemon: timebase.ppm not taken from the live INC (file had none: 0)")
+        r = run(sim + ["trim", "--ppm", "3.3"], env)
+        with open(cal) as fh:
+            txt0 = fh.read()
+        with open(cal, "w") as fh:
+            fh.write(txt0.replace("ppm = 0.000000", "ppm = 9.9"))
+        r = run(sim + ["save-calibration"], env)
+        txt = open(cal).read()
+        check("keeping the file's timebase.ppm = +9.900000" in r.stderr and "ppm = 9.900000" in txt,
+              "existing file value kept and reported")
+        r = run(sim + ["trim", "--ppm", "10.4"], env)
+        r = run(sim + ["save-calibration", "--force-timebase"], env)
+        txt = open(cal).read()
+        check("ppm = 10.4000" in txt and "mac_offset_ns = 52" in txt, "--force-timebase: live INC saved")
         r = run(sim + ["trim", "--ppm", "0"], env)
         r = run(sim + ["apply-calibration"], env)
         st = os.path.join(env["PKTREC_RUN_DIR"], "calibration.json")
@@ -308,7 +386,9 @@ def test_cli():
         stf = os.path.join(env["PKTREC_RUN_DIR"], "tb.json")
         js = json.load(open(stf)) if os.path.isfile(stf) else {}
         check(r.returncode == 0 and js.get("state") == "stopped" and js.get("sets", 0) >= 1 and
-              "frequency estimate" in r.stdout, "daemon --duration 12: ran, estimated, stopped")
+              "seeds the controller" in r.stdout and js.get("seeded_from_calibration"),
+              "daemon --duration 12: ran seeded from the calibration (no estimate), stopped")
+        check("kernel clock correction" in r.stdout, "kernel clock correction logged")
         check(abs(js.get("offset_ns", 1e9)) < 50000, f"daemon final offset {js.get('offset_ns')} ns")
         r = run(["save-calibration", "--defaults", "--stdout"], env)
         check(r.returncode == 0 and "rx_window_max_ns = 700" in r.stdout, "save --defaults --stdout")
@@ -321,6 +401,7 @@ def main():
     VERBOSE = ap.parse_args().verbose
     tb = load_tool()
     test_controller(tb)
+    test_seeded(tb)
     test_calibration(tb)
     test_cli()
     print(f"\n{'ALL PASSED' if not FAILS else str(len(FAILS)) + ' FAILED'}")

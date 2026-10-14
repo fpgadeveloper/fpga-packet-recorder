@@ -2,4 +2,6 @@
 #   --lock-threshold 5000 --lock-time 60     stricter lock criterion
 #   --no-set                                  never TB_SET (slew only)
 #   -v                                        log every sample to the journal
+#   --estimate-always                         estimate the frequency at start-up even
+#                                             when the calibration set it (default: seed)
 PKTREC_TB_ARGS=

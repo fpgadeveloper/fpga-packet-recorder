@@ -1,5 +1,5 @@
 # FPGA Packet Recorder: discipline the capture timebase (64-bit ns PHC on
-# dp_clk) to CLOCK_REALTIME, which systemd-timesyncd keeps on NTP through the
+# dp_clk) to CLOCK_REALTIME, which chronyd keeps on NTP through the
 # PS Ethernet port. TB_SET at start-up, then frequency (INC) trim + small ADJ
 # steps; never a TB_SET or TB_ADJ while a capture runs. State for pktrec-web /
 # pktrec-cap in /run/pktrec/tb.json. Options: /etc/default/pktrec-tb.

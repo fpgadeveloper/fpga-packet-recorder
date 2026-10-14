@@ -4,7 +4,7 @@
 
 SUMMARY = "FPGA Packet Recorder timebase discipline and calibration: pktrec-tb"
 DESCRIPTION = "pktrec-tb keeps the capture timebase (64-bit ns counter on \
-dp_clk, shared by all ports) on CLOCK_REALTIME (NTP via systemd-timesyncd) \
+dp_clk, shared by all ports) on CLOCK_REALTIME (NTP via chronyd) \
 with a PI controller on the increment and bounded steps (pktrec-tb.service), \
 and applies the persistent calibration /etc/pktrec/calibration.conf (timebase \
 frequency, MAC_OFFSET, SFD windows and per-port offsets) at boot \
