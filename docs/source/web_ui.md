@@ -56,6 +56,22 @@ the port's frame FIFO.
 You can't change the mode while a capture is running. [Port modes](modes) describes what
 the devices on the ports see in each mode.
 
+**Connectivity figure.** Each pair's card has a small figure of the pair in its current
+mode, redrawn when the mode changes (the page reads the mode every 5 s, so a change made
+with `pktrec-phy mode` on the console shows up too). The two port symbols face down: the
+Ethernet cables from *device A* and *device B* enter their fronts. A port with a solid
+green outline and LED has link; a dashed red outline and a dotted cable mean no link. In
+**TAP** mode a blue line with arrows at both ends joins the back ends of the two ports:
+the inline forwarding path in the fabric. A dashed purple arrow from that path to the SSD
+symbol shows that both directions are recorded. In **monitor** mode there is no blue
+line: the back end of each port points straight at the SSD with a purple arrow, as each
+port only receives and records. The mode name is shown under the figure, a legend under
+that, and hovering over a part of the figure explains it.
+
+**Theme.** The page follows the light or dark setting of your system. The sun/moon button
+in the header switches between light and dark; the browser remembers that choice for this
+board's address (in `localStorage`).
+
 **Timebase.** The line under the pairs shows the state of the timebase discipline
 (`pktrec-tb`, see [Timestamping](timestamping.md#timebase-and-absolute-time)):
 
