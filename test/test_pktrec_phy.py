@@ -49,6 +49,9 @@ run with --i-accept-lan-loop).
    --vlan 100 accepted; maxlen --set 2000 writes RX/TX_MAX_LEN 1999 and raises
    IFG_LO/HI (2526/3550), --set 1522 leaves raised thresholds alone.
 6. sfd config --mac-offset writes MAC_OFFSET.
+7. ifg: --min / --nom < 12 refused without --i-know-the-phy-drops-frames (the bench-D
+   numbers printed, IFG_CTRL unchanged); --enable on over an IFG_MIN < 12 refused;
+   --min 12 / --enable on with min 12 accepted; the override writes and warns.
 Exit 0 when every check passed.
 """
 
@@ -145,9 +148,10 @@ class FakeRegs:
                 self.r[m.ETH_PORT_BASE + n * m.ETH_PORT_STRIDE + m.P_RX_MAX_LEN] = 1521
         elif base == m.M0_BASE:
             self.r[m.M0_ID] = m.M0_ID_VALUE
-            self.r[m.M0_VERSION] = 0x00010004
+            self.r[m.M0_VERSION] = 0x00010006
             for n in range(4):
                 self.r[m.M0_PORT_BASE + n * m.M0_PORT_STRIDE + m.P_IFG_THRESH] = 0x08000C00
+                self.r[m.M0_PORT_BASE + n * m.M0_PORT_STRIDE + m.P_IFG_CTRL] = 0x000C0C00
         elif base == m.CAP_BASE:
             self.r[0] = m.CAP_ID_VALUE
             self.r[4] = 0x00010002
@@ -685,6 +689,29 @@ def test_sfd_config():
     check(m.s32(CAP.rd(0x0A8)) == -418 and "MAC_OFFSET -418" in out, "MAC_OFFSET written and shown")
 
 
+def test_ifg():
+    print("ifg: gaps < 12 B")
+    c = m.M0_PORT_BASE + 1 * m.M0_PORT_STRIDE + m.P_IFG_CTRL
+    out = run(["ifg", "1"])
+    check("dynamic IFG OFF (12 B -> 12 B" in out and "WARNING" not in out, "reset: off, 12/12, no warning")
+    out = run(["ifg", "1", "--min", "8"])
+    check("EXIT" in out and "41 good" in out and "DROP_FWD" in out and BOARD.m0.rd(c) == 0x000C0C00,
+          "--min 8 refused with the bench-D numbers, IFG_CTRL unchanged")
+    out = run(["ifg", "all", "--nom", "11", "--enable", "off"])
+    check("EXIT" in out and BOARD.m0.rd(c) == 0x000C0C00, "--nom 11 refused")
+    out = run(["ifg", "1", "--min", "12", "--enable", "on"])
+    check("EXIT" not in out and BOARD.m0.rd(c) == 0x000C0C01, "--min 12 --enable on accepted")
+    out = run(["ifg", "1", "--min", "8", "--i-know-the-phy-drops-frames"])
+    check("EXIT" not in out and "WARNING" in out and BOARD.m0.rd(c) == 0x00080C01,
+          "override: IFG_MIN 8 written, warning shown")
+    out = run(["ifg", "1", "--enable", "off"])
+    check("EXIT" not in out and BOARD.m0.rd(c) == 0x00080C00, "--enable off with min 8 left is allowed")
+    out = run(["ifg", "1", "--enable", "on"])
+    check("EXIT" in out and BOARD.m0.rd(c) == 0x00080C00, "--enable on over IFG_MIN 8 refused")
+    run(["ifg", "1", "--min", "12"])
+    check(BOARD.m0.rd(c) == 0x000C0C00, "--min 12 restores the default")
+
+
 def main():
     global VERBOSE
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -699,6 +726,7 @@ def main():
     test_skew()
     test_gen()
     test_sfd_config()
+    test_ifg()
     print(f"\n{'ALL PASSED' if not FAILS else str(len(FAILS)) + ' FAILED'}")
     for f in FAILS:
         print("  FAILED: " + f)

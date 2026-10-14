@@ -53,9 +53,16 @@ Commands:
                          of pktrec-phy-watch (its ExecStartPre 'init') or any
                          'pktrec-phy init' clears a test linkdown
   mode status [--json]   PAIR_MODE, PATH_CTRL and the effective path per pair
-  ifg <port|all> [--enable on|off] [--nom B] [--min B] [--hi B] [--lo B] [--json]
-                         dynamic inter-frame gap of the TAP forward path: settings,
-                         FWD FIFO fill (now / max), reduced-gap time and entries, FLUSH
+  ifg <port|all> [--enable on|off] [--nom B] [--min B] [--hi B] [--lo B]
+      [--i-know-the-phy-drops-frames] [--json]
+                         inter-frame gap of the TAP forward path: settings, FWD FIFO
+                         fill (now / max), reduced-gap time and entries, DROP_FWD, FLUSH.
+                         The gap is 12 B (reset; m0 map 1.6: reduced gap off, IFG_MIN
+                         12). A partner faster than the board at sustained 100 %
+                         utilisation fills the 16 KB FWD FIFO; the excess is dropped
+                         whole and counted in DROP_FWD. A gap < 12 B (--min / --nom)
+                         is refused without --i-know-the-phy-drops-frames: the DP83867
+                         loses frames after SGMII gaps < 12 B (bench D, 2026-10-14)
   latency (--pair P | --in A --out B) [--count N] [--timeout S] [--window NS] [--json]
                          TAP forwarding latency per frame, TX SFD(out) - RX SFD(in), from
                          the SFD log FIFOs while paced traffic flows (one frame in flight,
@@ -1404,9 +1411,25 @@ def ifg_doc(b, n):
             "drop_fwd": m.rd(base + 0x14)}
 
 
+# Bench D (2026-10-14, zcu106 + OP080, DP83867 on both ends): MAC gaps below 12 B
+IFG_SAFE_MIN = 12
+IFG_PHY_DROPS = (
+    "the DP83867 loses frames after SGMII inter-frame gaps < 12 B. Bench D 2026-10-14, "
+    "P2 -> P0, generator at line rate: MAC gap 12 B: 15 854 447 sent, all received; "
+    "11 B: 15 995 514 sent, 4 055 good / 37 bad received; 8 B: 16 594 129 sent, 41 good / "
+    "258 bad (PHY FIFO depth 6/8 did not help). In a TAP with the reduced gap on (min "
+    "8/10/11), the far end received 6 403-23 815 of ~15.5 M frames. Reset/default: 12 B, "
+    "reduced gap off; a partner faster than the board at 100 % utilisation then fills "
+    "the 16 KB FWD FIFO and its excess is dropped and counted (DROP_FWD)")
+
+
 def cmd_ifg(b, args):
     b.need_tap()
     ports = range(4) if args.port == "all" else [int(args.port.lstrip("pP"))]
+    for val, what in ((args.min, "--min"), (args.nom, "--nom")):
+        if val is not None and val < IFG_SAFE_MIN and not args.i_know_the_phy_drops_frames:
+            raise SystemExit(f"pktrec-phy: {what} {val} refused: {IFG_PHY_DROPS}. "
+                             "Add --i-know-the-phy-drops-frames for an experiment.")
     for n in ports:
         if not 0 <= n <= 3:
             raise SystemExit("port must be 0..3 or all")
@@ -1425,6 +1448,14 @@ def cmd_ifg(b, args):
             thr = (thr & 0xFFFF) | ((args.lo & 0xFFFF) << 16)
         if (thr >> 16) >= (thr & 0xFFFF):
             raise SystemExit("pktrec-phy: IFG_LO must be below IFG_HI")
+        # also an enable on top of an IFG_MIN < 12 left by an older bitstream / experiment
+        writes = args.enable is not None or args.nom is not None or args.min is not None
+        if writes and not args.i_know_the_phy_drops_frames and \
+                (((ctrl & 1) and (ctrl >> 16) & 0xFF < IFG_SAFE_MIN) or (ctrl >> 8) & 0xFF < IFG_SAFE_MIN):
+            raise SystemExit(f"pktrec-phy: P{n}: the result (dynamic IFG {'on' if ctrl & 1 else 'off'}, "
+                             f"nom {(ctrl >> 8) & 0xFF} B, min {(ctrl >> 16) & 0xFF} B) sends gaps < 12 B, "
+                             f"refused: {IFG_PHY_DROPS}. Add --i-know-the-phy-drops-frames for an "
+                             "experiment, or --min 12.")
         b.m0.wr(base + P_IFG_CTRL, ctrl)
         b.m0.wr(base + P_IFG_THRESH, thr)
     docs = [ifg_doc(b, n) for n in ports]
@@ -1432,6 +1463,9 @@ def cmd_ifg(b, args):
         print(json.dumps({"ports": docs}, indent=1))
         return
     for d in docs:
+        if (d["dyn_en"] and d["ifg_min"] < IFG_SAFE_MIN) or d["ifg_nom"] < IFG_SAFE_MIN:
+            print(f"WARNING: P{d['port']} sends gaps < {IFG_SAFE_MIN} B: the DP83867 loses frames "
+                  f"after them (bench D); 'pktrec-phy ifg {d['port']} --enable off --nom 12 --min 12'")
         print(f"P{d['port']} TX: dynamic IFG {'on' if d['dyn_en'] else 'OFF'} "
               f"({d['ifg_nom']} B -> {d['ifg_min']} B above {d['ifg_hi']} B until below "
               f"{d['ifg_lo']} B FWD fill) | now {'REDUCED' if d['reduced'] else 'normal'} "
@@ -1969,11 +2003,16 @@ def main():
     p.add_argument("--force", action="store_true", help="switch even while a capture runs")
     p.add_argument("--i-accept-lan-loop", action="store_true", help=LAN_HELP)
     p.add_argument("--json", action="store_true")
-    p = sub.add_parser("ifg", help="dynamic inter-frame gap of the TAP forward path (M3)")
+    p = sub.add_parser("ifg", help="inter-frame gap of the TAP forward path (12 B; the reduced "
+                       "gap is off by default and only for experiments)")
     p.add_argument("port", help="0..3 or all")
     p.add_argument("--enable", choices=["on", "off"])
-    p.add_argument("--nom", type=int, help="normal gap, bytes (12)")
-    p.add_argument("--min", type=int, help="reduced gap, bytes (8)")
+    p.add_argument("--nom", type=int, help="normal gap, bytes (12; < 12 needs "
+                   "--i-know-the-phy-drops-frames)")
+    p.add_argument("--min", type=int, help="reduced gap, bytes (12; < 12 needs "
+                   "--i-know-the-phy-drops-frames)")
+    p.add_argument("--i-know-the-phy-drops-frames", action="store_true",
+                   help="allow a gap < 12 B (the DP83867 loses frames after it, bench D)")
     p.add_argument("--hi", type=int, help="FWD fill (bytes) that starts the reduced gap (3072)")
     p.add_argument("--lo", type=int, help="FWD fill (bytes) that ends it (2048; > largest frame)")
     p.add_argument("--json", action="store_true")
