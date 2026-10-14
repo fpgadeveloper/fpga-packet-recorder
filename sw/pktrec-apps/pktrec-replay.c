@@ -1015,14 +1015,68 @@ static int parse_args(int argc, char **argv, struct opts *o)
 
 /* ------------------------------------------------------------------------ */
 
+/* Final summary from the replay block's counters; also printed when the replay
+ * is aborted (SIGINT / SIGTERM) after the block was armed. -> true if lossless. */
+static bool print_summary(struct rp *p, uint32_t mode, bool aborted)
+{
+	uint64_t frames = rd64(&p->rpl, PKTREC_RPL_FRAMES);
+	uint64_t bytes = rd64(&p->rpl, PKTREC_RPL_BYTES);
+	uint64_t recs = rd64(&p->rpl, PKTREC_RPL_RECORDS);
+	uint64_t skip = rd64(&p->rpl, PKTREC_RPL_SKIPPED);
+	uint64_t perr = rd64(&p->rpl, PKTREC_RPL_PARSE_ERRORS);
+	uint64_t under = rd64(&p->rpl, PKTREC_RPL_UNDERRUNS);
+	uint64_t late = rd64(&p->rpl, PKTREC_RPL_LATE);
+	uint64_t lsum = rd64(&p->rpl, PKTREC_RPL_LATE_SUM);
+	uint64_t bad = rd64(&p->rpl, PKTREC_RPL_BAD_SENT);
+	uint32_t maxl = rd(&p->rpl, PKTREC_RPL_MAX_LATE);
+	double mean = frames && mode != PKTREC_RPL_MODE_B2B ? (double)lsum / (double)frames : 0;
+	double el = p->t_start > 0 ? now_s() - p->t_start : 0.0;
+	bool ok = !aborted && !under && !perr && frames + skip == p->sel_records &&
+		  recs == p->sel_records;
+
+	if (p->o.json) {
+		printf("{\"file\":\"%s\",\"iface\":%d,\"port\":%d,\"mode\":\"%s\",\"rate\":%g,"
+		       "\"selected\":%" PRIu64 ",\"records\":%" PRIu64 ",\"frames\":%" PRIu64
+		       ",\"bytes\":%" PRIu64 ",\"skipped\":%" PRIu64 ",\"bad_sent\":%" PRIu64
+		       ",\"parse_errors\":%" PRIu64 ",\"underruns\":%" PRIu64 ",\"late\":%" PRIu64
+		       ",\"late_thresh_ns\":%u,\"max_late_ns\":%u,\"mean_late_ns\":%.2f,"
+		       "\"file_parse_errors\":%" PRIu64 ",\"seconds\":%.3f,\"aborted\":%s,\"ok\":%s}\n",
+		       p->o.input, p->o.iface, p->o.port,
+		       mode == PKTREC_RPL_MODE_B2B ? "topspeed" : mode == PKTREC_RPL_MODE_FIXED ? "gap" : "timed",
+		       p->o.rate, p->sel_records, recs, frames, bytes, skip, bad, perr, under, late,
+		       p->o.late_thresh, maxl, mean, p->file_perr, el, aborted ? "true" : "false",
+		       ok ? "true" : "false");
+	} else {
+		printf("%s P%d of %s out of P%d (%s%s)\n", aborted ? "ABORTED: replay of" : "replayed",
+		       p->o.iface, p->o.input, p->o.port,
+		       mode == PKTREC_RPL_MODE_B2B ? "back to back" :
+		       mode == PKTREC_RPL_MODE_FIXED ? "fixed gap" : "timed",
+		       mode == PKTREC_RPL_MODE_TIMED && p->o.rate != 1.0 ? ", scaled" : "");
+		printf("  selected     %" PRIu64 " records (%" PRIu64 " bytes), %u loop(s)%s\n",
+		       p->sel_records, p->sel_bytes, p->o.loops,
+		       aborted ? " (read from the file before the abort)" : "");
+		printf("  sent         %" PRIu64 " frames, %" PRIu64 " bytes (+ FCS), %" PRIu64
+		       " sent as errored, %" PRIu64 " skipped\n", frames, bytes, bad, skip);
+		printf("  underruns    %" PRIu64 "%s\n", under,
+		       under ? "  ** the stream could not keep up: frames went out late **" : "");
+		if (mode != PKTREC_RPL_MODE_B2B)
+			printf("  lateness     max %u ns, mean %.1f ns, %" PRIu64 " frames > %u ns\n",
+			       maxl, mean, late, p->o.late_thresh);
+		printf("  parse errors %" PRIu64 " (hardware), %" PRIu64 " (file)\n", perr, p->file_perr);
+		printf("  duration     %.3f s\n", el);
+	}
+	return ok;
+}
+
 int main(int argc, char **argv)
 {
 	struct rp rp = { .in = -1, .dev = -1, .cur = -1 };
 	struct rp *p = &rp;
 	struct pktrec_file_header fh;
 	struct stat sb;
-	uint32_t mode, ctrl, ver;
+	uint32_t mode = 0, ctrl, ver;
 	int ret = 1;
+	bool armed = false;
 	unsigned loop;
 
 	if (parse_args(argc, argv, &p->o))
@@ -1139,6 +1193,7 @@ int main(int argc, char **argv)
 	wr(&p->rpl, PKTREC_RPL_EXPECT_HI, 0);
 	usleep(1000);                   /* SEL reaches the egress side */
 	wr(&p->rpl, PKTREC_RPL_CMD, PKTREC_RPL_CMD_ARM);
+	armed = true;
 
 	if (open_device(p) || play_start(p))
 		goto out;
@@ -1246,52 +1301,15 @@ int main(int argc, char **argv)
 		report_progress(p, true);
 
 	/* ---- summary ---- */
-	{
-		uint64_t frames = rd64(&p->rpl, PKTREC_RPL_FRAMES);
-		uint64_t bytes = rd64(&p->rpl, PKTREC_RPL_BYTES);
-		uint64_t recs = rd64(&p->rpl, PKTREC_RPL_RECORDS);
-		uint64_t skip = rd64(&p->rpl, PKTREC_RPL_SKIPPED);
-		uint64_t perr = rd64(&p->rpl, PKTREC_RPL_PARSE_ERRORS);
-		uint64_t under = rd64(&p->rpl, PKTREC_RPL_UNDERRUNS);
-		uint64_t late = rd64(&p->rpl, PKTREC_RPL_LATE);
-		uint64_t lsum = rd64(&p->rpl, PKTREC_RPL_LATE_SUM);
-		uint64_t bad = rd64(&p->rpl, PKTREC_RPL_BAD_SENT);
-		uint32_t maxl = rd(&p->rpl, PKTREC_RPL_MAX_LATE);
-		double mean = frames && mode != PKTREC_RPL_MODE_B2B ? (double)lsum / (double)frames : 0;
-		double el = now_s() - p->t_start;
-		bool ok = !under && !perr && frames + skip == p->sel_records * 1 && recs == p->sel_records;
-
-		if (p->o.json) {
-			printf("{\"file\":\"%s\",\"iface\":%d,\"port\":%d,\"mode\":\"%s\",\"rate\":%g,"
-			       "\"selected\":%" PRIu64 ",\"records\":%" PRIu64 ",\"frames\":%" PRIu64
-			       ",\"bytes\":%" PRIu64 ",\"skipped\":%" PRIu64 ",\"bad_sent\":%" PRIu64
-			       ",\"parse_errors\":%" PRIu64 ",\"underruns\":%" PRIu64 ",\"late\":%" PRIu64
-			       ",\"late_thresh_ns\":%u,\"max_late_ns\":%u,\"mean_late_ns\":%.2f,"
-			       "\"file_parse_errors\":%" PRIu64 ",\"seconds\":%.3f,\"ok\":%s}\n",
-			       p->o.input, p->o.iface, p->o.port,
-			       mode == PKTREC_RPL_MODE_B2B ? "topspeed" : mode == PKTREC_RPL_MODE_FIXED ? "gap" : "timed",
-			       p->o.rate, p->sel_records, recs, frames, bytes, skip, bad, perr, under, late,
-			       p->o.late_thresh, maxl, mean, p->file_perr, el, ok ? "true" : "false");
-		} else {
-			printf("replayed P%d of %s out of P%d (%s%s)\n", p->o.iface, p->o.input, p->o.port,
-			       mode == PKTREC_RPL_MODE_B2B ? "back to back" :
-			       mode == PKTREC_RPL_MODE_FIXED ? "fixed gap" : "timed",
-			       mode == PKTREC_RPL_MODE_TIMED && p->o.rate != 1.0 ? ", scaled" : "");
-			printf("  selected     %" PRIu64 " records (%" PRIu64 " bytes), %u loop(s)\n",
-			       p->sel_records, p->sel_bytes, p->o.loops);
-			printf("  sent         %" PRIu64 " frames, %" PRIu64 " bytes (+ FCS), %" PRIu64
-			       " sent as errored, %" PRIu64 " skipped\n", frames, bytes, bad, skip);
-			printf("  underruns    %" PRIu64 "%s\n", under,
-			       under ? "  ** the stream could not keep up: frames went out late **" : "");
-			if (mode != PKTREC_RPL_MODE_B2B)
-				printf("  lateness     max %u ns, mean %.1f ns, %" PRIu64 " frames > %u ns\n",
-				       maxl, mean, late, p->o.late_thresh);
-			printf("  parse errors %" PRIu64 " (hardware), %" PRIu64 " (file)\n", perr, p->file_perr);
-			printf("  duration     %.3f s\n", el);
-		}
-		ret = ok ? 0 : 2;
-	}
+	ret = print_summary(p, mode, false) ? 0 : 2;
 out:
+	if (armed && g_stop) {
+		/* interrupted: report what was sent before the block is stopped */
+		if (!p->o.quiet)
+			report_progress(p, true);
+		print_summary(p, mode, true);
+		fflush(stdout);
+	}
 	cleanup(p);
 	return ret;
 }
