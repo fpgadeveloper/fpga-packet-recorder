@@ -12,6 +12,9 @@ sequence-numbered traffic. Everything is Python 3 with the standard library only
 | `pcapng_lint.py` | PC or board (`pktrec-pcapng-lint`) | no | Strict structural pcapng validator (stand-in for Wireshark where `tshark` is not installed). |
 | `make_synth_capture.py` | PC | no | Writes a synthetic capture file (the hardware's record format) for testing the exporter without hardware. |
 | `selftest_export.py` | PC | no | Builds `pktrec-export` and runs it with the validators on synthetic captures (clean, damaged, with drops, with too small a reorder window), and compares `pktrec-export --check` with `check_pcap.py`. |
+| `compare_replay.py` | PC | no | Replay timing accuracy: pairs the frames of an original capture and of its replay (both pcapng) by their bytes and reports lost, extra and reordered frames and the inter-frame interval error ([Replay](../docs/source/replay.md)). |
+| `test_pktrec_phy.py` | PC | no | Host test of `pktrec-phy` against a model of the registers, the MDIO master and the four PHYs: P0 guard, link watcher and TAP link propagation, loop-safety rules. No hardware. |
+| `test_pktrec_tb.py` | PC | no | Host test of `pktrec-tb` against a simulated timebase: the discipline controller, the calibration file, the CLI end to end (`--sim`). No hardware. |
 | `pcapng_reader.py` | - | - | The pcapng parser used by the checkers. |
 
 ## Self-test on a PC (no hardware)
@@ -72,12 +75,19 @@ the short form.
 ```
 sudo pktrec-phy chk 3 start
 sudo pktrec-cap --ports 3 --duration 60 /mnt/rec/captures/lr64.cap &
+CAP=$!
 sudo pktrec-phy gen 2 start --size 64 --count 85000000
-wait
+wait $CAP; echo "pktrec-cap exit code: $?"
 sudo pktrec-phy chk 3 status
+sudo pktrec-phy chk 3 stop
 sudo pktrec-phy path 2 idle
 sudo pktrec-export --check --expect 85000000 /mnt/rec/captures/lr64.cap -o /dev/null
+echo "pktrec-export exit code: $?"
 ```
+
+`wait $CAP` returns `pktrec-cap`'s exit code (a bare `wait` always returns 0). Stop the
+checker after reading it: a checker left running counts the next run's sequence numbers,
+which start again at 0, as errors.
 
 The generator frames carry the `gen_seq.py` payload, so `--check` and `check_pcap.py`
 both verify them.

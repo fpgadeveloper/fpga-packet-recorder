@@ -82,14 +82,18 @@ drops. The board's ports are initialised at boot; the SSD is mounted at `/mnt/re
    ```
    sudo pktrec-phy chk 3 start
    sudo pktrec-cap --ports 3 --duration 60 /mnt/rec/captures/lr64.cap &
+   CAP=$!
    sudo pktrec-phy gen 2 start --size 64 --count 85000000
-   wait
+   wait $CAP; echo "pktrec-cap exit code: $?"
    sudo pktrec-phy chk 3 status
+   sudo pktrec-phy chk 3 stop
    sudo pktrec-phy path 2 idle
    sudo pktrec-export --check --expect 85000000 /mnt/rec/captures/lr64.cap -o /dev/null
    ```
    (or export to a pcapng and check it on the PC; see
-   [Checking large captures](#checking-large-captures)).
+   [Checking large captures](#checking-large-captures)). `wait $CAP` returns `pktrec-cap`'s
+   exit code, 0 when no frame was dropped. Stop the checker afterwards: left running, it
+   counts the next run's sequence numbers (which start again at 0) as errors.
 2. From a PC on any port (here P1), with `pktrec-cap --ports 1` running on the board:
    ```
    sudo test/board_pktgen.sh -i <pc-if> -d 02:00:00:00:00:99 -s 64 -c 10000000 -o sent64.json
