@@ -38,6 +38,7 @@
       "yocto": true,
       "baremetal": false,
       "license": false,
+      "ip_license": false,
       "flashsize": "0",
       "flashintf": "0"
     }
