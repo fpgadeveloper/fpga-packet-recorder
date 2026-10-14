@@ -470,8 +470,10 @@ To persist a calibration that you measured (the procedure is in
 3. Run `pktrec-tb save-calibration`. It writes the file from the registers and keeps the
    previous one as `.bak`. The timebase frequency is saved only when the daemon has been
    locked for at least 10 minutes (`--min-locked`) and its frequency estimate moved less than
-   0.2 ppm over that time (`--max-ppm-delta`); the mean estimate is saved. Otherwise the file
-   keeps its previous `ppm` and the command says why (`--force-timebase` saves anyway). The
+   0.5 ppm over that time (`--max-ppm-delta`; with chrony the estimate typically wanders
+   about 0.5 ppm in 10 minutes); the mean estimate is saved. The command prints the measured
+   movement either way. Otherwise the file keeps its previous `ppm` and says why
+   (`--force-timebase` saves anyway). The
    SFD receive offsets are saved without the link watcher's per-link-up `0x0055`
    correction.
 

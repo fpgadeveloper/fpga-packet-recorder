@@ -30,9 +30,10 @@ Commands:
                            defaults) as a calibration file. The timebase ppm is
                            the daemon's frequency estimate, stored only when the
                            daemon has been locked for >= --min-locked (10) minutes
-                           and the estimate moved < --max-ppm-delta (0.2) ppm over
+                           and the estimate moved < --max-ppm-delta (0.5) ppm over
                            that time; otherwise the file's existing ppm is kept
-                           (and that is said). The SFD RX offsets are stored
+                           (and that is said); the measured movement is printed
+                           either way. The SFD RX offsets are stored
                            without the watch's per-link-up 0x0055 correction.
   show-calibration [--file F] [--json]
                            registers vs the calibration file, key by key
@@ -1204,8 +1205,8 @@ def timebase_save_verdict(st, now_ns, min_locked_s, max_delta_ppb):
     ppb = st.get("freq_est_mean_ppb")
     if ppb is None:
         ppb = st.get("freq_est_ppb")
-    return ppb, (f"daemon locked {locked_s / 60:.1f} min, estimate within {(hi - lo) / 1e3:.3f} ppm "
-                 f"over {span:.0f} s")
+    return ppb, (f"daemon locked {locked_s / 60:.1f} min, estimate moved {(hi - lo) / 1e3:.3f} ppm "
+                 f"over the last {span:.0f} s (limit {max_delta_ppb / 1e3:.3f} ppm)")
 
 
 def cmd_save(a):
@@ -1368,8 +1369,11 @@ def main():
     p.add_argument("--min-locked", type=float, default=10.0,
                    help="minutes the daemon must have been locked before its frequency "
                         "estimate is saved (10)")
-    p.add_argument("--max-ppm-delta", type=float, default=0.2,
-                   help="largest change of the frequency estimate over that time, ppm (0.2)")
+    # 0.5 ppm: with chrony disciplining the system clock the estimate wanders
+    # ~0.5 ppm per 10 min (bench, 2026-10-14: 0.56 ppm / 600 s); 0.2 rarely passed
+    p.add_argument("--max-ppm-delta", type=float, default=0.5,
+                   help="largest change of the frequency estimate over the stability window, "
+                        "ppm (0.5)")
     p.add_argument("--force-timebase", action="store_true",
                    help="save the timebase ppm even when the daemon is not locked/stable "
                         "(the daemon's estimate if it runs, else the live INC)")

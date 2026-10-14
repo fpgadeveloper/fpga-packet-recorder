@@ -243,29 +243,40 @@ def test_seeded(tb):
     check(abs(d.st["freq_est_ppb"] / 1e3 - 10.4) < 0.3,
           f"estimate stays at the calibration: {d.st['freq_est_ppb'] / 1e3:+.3f} ppm")
 
-    print("save-calibration verdict (>= 10 min locked, estimate stable within 0.2 ppm)")
+    print("save-calibration verdict (>= 10 min locked, estimate stable within 0.5 ppm)")
     o = opts()
     o.stable_window = 600.0
     clock = VClock()
     # 300 ns rms read jitter (the bench measured 40-60 ns rms offsets; 1 us makes the
-    # integrator wander +-0.1 ppm, right at the 0.2 ppm stability limit)
+    # integrator wander +-0.1 ppm; the limit is 0.5 ppm, the default --max-ppm-delta)
     hw = tb.SimHw(-10.4, clock=clock, noise_ns=300.0, persist=False, seed=12)
     hw.set_inc_raw(tb.ppb_to_inc(10.4e3, hw.dp_clk_hz))
     d = tb.Daemon(hw, clock, o, out=Quiet(), state_path=None)
     d.startup()
     run_for(d, clock, 300)
     st = dict(d.st, fresh=True)
-    ppb, why = tb.timebase_save_verdict(st, clock.realtime_ns(), 600, 200)
+    ppb, why = tb.timebase_save_verdict(st, clock.realtime_ns(), 600, 500)
     check(ppb is None and "locked for" in why, f"after 5 min: refused ({why})")
     run_for(d, clock, 420)
     st = dict(d.st, fresh=True)
-    ppb, why = tb.timebase_save_verdict(st, clock.realtime_ns(), 600, 200)
+    ppb, why = tb.timebase_save_verdict(st, clock.realtime_ns(), 600, 500)
     check(ppb is not None and abs(ppb / 1e3 - 10.4) < 0.3, f"after 12 min: {(ppb or 0) / 1e3:+.3f} ppm ({why})")
+    check(ppb is not None and "moved" in why and "limit 0.500 ppm" in why, f"movement printed on success ({why})")
     check(st["freq_est_window_s"] >= 590, f"history window {st['freq_est_window_s']} s")
-    st2 = dict(st, freq_est_max_ppb=st["freq_est_min_ppb"] + 500)
-    ppb, why = tb.timebase_save_verdict(st2, clock.realtime_ns(), 600, 200)
-    check(ppb is None and "not stable" in why, f"estimate moving 0.5 ppm: refused ({why})")
-    ppb, why = tb.timebase_save_verdict(dict(st, fresh=False), clock.realtime_ns(), 600, 200)
+    # bench C (chrony): 0.561 ppm over 600 s -> refused; 0.45 ppm -> accepted
+    st2 = dict(st, freq_est_max_ppb=st["freq_est_min_ppb"] + 561)
+    ppb, why = tb.timebase_save_verdict(st2, clock.realtime_ns(), 600, 500)
+    check(ppb is None and "not stable" in why and "moved 0.561 ppm" in why,
+          f"estimate moving 0.561 ppm: refused ({why})")
+    st3 = dict(st, freq_est_max_ppb=st["freq_est_min_ppb"] + 450)
+    ppb, why = tb.timebase_save_verdict(st3, clock.realtime_ns(), 600, 500)
+    check(ppb is not None and "moved 0.450 ppm" in why, f"estimate moving 0.45 ppm: accepted ({why})")
+    r = subprocess.run([sys.executable, TOOL, "save-calibration", "--help"], capture_output=True,
+                       text=True, timeout=60)
+    h = " ".join(r.stdout.split())
+    check("ppm (0.5)" in h and "estimate is saved (10)" in h,
+          "save-calibration defaults: --max-ppm-delta 0.5, --min-locked 10")
+    ppb, why = tb.timebase_save_verdict(dict(st, fresh=False), clock.realtime_ns(), 600, 500)
     check(ppb is None and "not running" in why, "daemon not running: refused")
 
 
