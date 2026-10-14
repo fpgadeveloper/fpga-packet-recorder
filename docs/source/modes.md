@@ -133,19 +133,25 @@ Through a TAP it would not: the PHY on the other port keeps its own link up. The
 (`pktrec-phy watch`, run by `pktrec-phy-watch.service`) therefore propagates the copper link
 state for pairs in TAP mode:
 
-* when a port's copper link has been down for 0.5 s (`--debounce`), its partner's PHY is put
-  into MII loopback (DP83867 `BMCR[14]`): the partner's copper link drops, so the device on
-  the partner's side sees link down, while the PHY itself keeps running;
-* when the port's link has been up again for 0.5 s, the loopback is released, the partner
-  restarts auto-negotiation, and its link comes back;
-* a port held in loopback by the watcher never propagates (no ping-pong). A released port gets
+* when a port's copper link has been down for 0.5 s (`--debounce`), the watcher holds its
+  partner's copper link down, so the device on the partner's side sees link down:
+  * P1, P2 and P3 are held by **PHY power-down** (DP83867 `BMCR[11]`): the PHY's line side is
+    off, so nothing can be sent or reflected; MDIO keeps working;
+  * P0 cannot be powered down: on the Ethernet FMC Max, the DP83867 of P0 supplies the clock
+    of the other three PHYs, and powering it down takes down P1, P2 and P3 as well. P0 is held
+    in two ordered steps: first its path is set to idle and the watcher waits until
+    `EFF_PATH` confirms that nothing is forwarded into P0 any more; only then is the PHY put
+    into MII loopback (`BMCR[14]`), which drops its copper link;
+* when the port's link has been up again for 0.5 s, the partner is released: power-down or
+  loopback cleared and auto-negotiation restarted, SGMII status re-triggered, `BMCR` read
+  back, and for P0, last of all, its path set back to forward;
+* a port held by the watcher never propagates (no ping-pong). A released port gets
   6 s (`--grace`) to link before its own link-down counts: if its far device is really gone,
   the device on the other side sees its link come up for up to about 6 s, then go down again;
-* when the pair leaves TAP mode or the watcher stops, every PHY it holds is released.
+* when the pair leaves TAP mode or the watcher stops, every port it holds is released.
 
-The watcher never powers a PHY down: on the Ethernet FMC Max, the DP83867 of P0 supplies the
-clock of the other three PHYs, and powering it down takes down P1, P2 and P3 as well. Every
-action is logged (`journalctl -u pktrec-phy-watch`). `--no-propagate` turns propagation off:
+Every action, with its steps in order, is logged (`journalctl -u pktrec-phy-watch`).
+`--no-propagate` turns propagation off:
 
 ```
 sudo systemctl edit pktrec-phy-watch
@@ -155,8 +161,46 @@ ExecStart=
 ExecStart=/usr/bin/python3 -u /usr/bin/pktrec-phy watch --no-propagate
 ```
 
-Status of the measurements (2026-10-13): putting a DP83867 into MII loopback was verified to
-take its copper link down, so that the device on the other end sees link down; propagation
-from P0 to P1 reacted within 0.9 s and the link and traffic came back after P0's link
-returned. The complete propagation cycle in both directions with the loopback method has not
-been measured yet.
+To test propagation, use pair 1 (P2 and P3), never the pair that carries your network, and
+simulate the link loss with `pktrec-phy test linkdown`, which uses the same safe method as the
+watcher (see [Testing](testing.md#link-state-propagation)).
+
+Status of the measurements: putting a DP83867 into MII loopback was verified to take its
+copper link down, so that the device on the other end sees link down; propagation from P0 to
+P1 reacted within 0.9 s and the link and traffic came back after P0's link returned (bench
+2026-10-13, with the earlier loopback-only method). The power-down hold of P1 to P3 and the
+ordered P0 hold described above have not been measured on hardware yet.
+
+## Loop safety
+
+A loopback on a port that is being forwarded into sends the far device's traffic straight back
+to it. In a TAP between a router and a host, putting the host-side PHY into MII loopback while
+the pair forwards makes every frame from the router return to the router: the router's switch
+then learns the address of every device on the network on the TAP port, and the whole network
+stops working. This has happened on a test bench, when a PHY was forced into loopback by hand
+to simulate a link loss on a pair in TAP mode.
+
+`pktrec-phy` therefore enforces one rule: **a port may be put into a loopback only if no path
+forwards into it** (its own path is idle, confirmed by `EFF_PATH`) **and it is not in a TAP
+pair**. In practice:
+
+* `pktrec-phy mdio <port> 0 <value>` with bit 14 (MII loopback) set, and `pktrec-phy path <n>
+  loop`, are refused on a port that is forwarded into or in a TAP pair; `path <n> loop` is also
+  refused on a port whose PHY is in loopback and on pair 0;
+* `pktrec-phy mode <pair> tap` and `path <n> fwd|gen|replay` are refused into a port whose PHY
+  is in loopback, and the web interface refuses the TAP mode for such a pair;
+* `pktrec-phy gen <n> start` is refused on a port whose PHY is in loopback;
+* `pktrec-phy test linkdown` (simulated link loss) is refused on pair 0.
+
+`--force` never overrides these checks. `--i-accept-lan-loop` does, with a warning; use it only
+when nothing but test equipment is connected to the pair. Pair 0 is treated as the pair that
+carries the network (`PKTREC_LAN_PAIRS`, default `0`). `pktrec-phy safe` prints the loopback,
+power-down, path and pair state of every port and flags any combination that reflects traffic
+(exit status 2):
+
+```
+sudo pktrec-phy safe
+```
+
+The link watcher's own P0 hold is the one place that uses MII loopback on a pair in TAP mode;
+it reaches the safe state first (P0's path idle) and only then sets the loopback.

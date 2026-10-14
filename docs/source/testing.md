@@ -94,10 +94,41 @@ exits with 0, `check_pcap.py` reports PASS (every sequence number once, in order
 match, `isb_ifdrop` = 0), and the pcapng opens in Wireshark without warnings.
 
 For a four-port line-rate test, run generators on all ports. Ports whose far end is a device
-that would answer or forward the test traffic need a sink that absorbs it; to load P0 and P1
-from their own generators without far-end devices, put their PHYs into MII loopback with
-`pktrec-phy mdio p0 0x0 0x4140` (and `p1`), and restore them with `0x1140` afterwards. The
+that would answer or forward the test traffic need a sink that absorbs it. Connect P2 to P3
+with a cable and let their generators load each other. Loading P0 and P1 from their own
+generators through PHY loopback (`pktrec-phy mdio p0 0 0x4140`) is only possible with both
+ports idle (`pktrec-phy mode 0 monitor`), with nothing but test equipment connected to them,
+and with `--i-accept-lan-loop` on `gen`: `pktrec-phy` refuses a generator on a port in
+loopback (see [Loop safety](modes.md#loop-safety)). Never do it on a pair that is cabled into a
+network. Restore the PHYs with `0x1140` afterwards and check with `pktrec-phy safe`. The
 results of these tests are on the [Performance](performance) page.
+
+## Link-state propagation
+
+Run this test on **pair 1 only** (P2 and P3, each cabled to a test device, for example two
+ports of a PC), never on the pair that carries your network:
+
+```
+sudo pktrec-phy mode 1 tap
+sudo pktrec-phy safe                       # SAFE
+sudo pktrec-phy test linkdown 3            # P3: PHY power-down (simulated cable pull)
+journalctl -u pktrec-phy-watch -n 5        # within ~1 s: P2 held by PHY power-down
+sudo pktrec-phy status                     # P2, P3 down (PHY PD); P0, P1 unaffected
+sudo pktrec-phy test linkup 3              # P3 back; ~0.5 s after its link: P2 released
+sudo pktrec-phy test linkdown 2            # the other direction
+sudo pktrec-phy test linkup 2
+sudo pktrec-phy mode 1 monitor
+```
+
+Pass criteria: the device on the partner port sees its link go down within about 1 s and come
+back after the simulated loss ends; the watcher logs one hold and one release per loss; P0 and
+P1 keep their links and keep answering MDIO; `pktrec-phy safe` reports SAFE throughout.
+
+`pktrec-phy test linkdown` uses the same method as the watcher: PHY power-down on P1 to P3 and,
+on P0, path idle followed by MII loopback. It refuses pair 0 unless `--i-accept-lan-loop` is
+given. Do not simulate a link loss by writing MII loopback into a PHY with `pktrec-phy mdio`:
+on a pair in TAP mode this reflects the traffic of the device on the other port back to it (the
+tool refuses it; see [Loop safety](modes.md#loop-safety)).
 
 ## Timestamp calibration
 

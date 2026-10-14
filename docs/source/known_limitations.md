@@ -42,7 +42,14 @@
   bytes and FCS. The original FCS is never captured (`if_fcslen` = 0).
 * **Link-state propagation** takes a few seconds: 0.5 s debounce, then auto-negotiation; a
   partner whose device is gone sees its link come up for up to about 6 s before it is taken
-  down again.
+  down again. P1 to P3 are held down by PHY power-down; P0, whose PHY clocks the other three
+  and must not be powered down, is held by MII loopback after its path has been set idle.
+  This method has not been measured on hardware yet.
+* **Loopback and TAP forwarding are mutually exclusive.** A PHY or path loopback on a port that
+  is forwarded into reflects the far device's traffic back to it; on the pair that carries the
+  network this stops the whole network (it has happened on a test bench). `pktrec-phy` refuses
+  every such combination (see [Loop safety](modes.md#loop-safety)); raw extended-register
+  writes through `mdio <port> 0x0d/0x0e` are not checked.
 
 ## Timestamps
 
