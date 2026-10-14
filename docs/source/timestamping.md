@@ -192,10 +192,9 @@ in register `0x0055`, or stop the link watcher during the calibration: the watch
 −8 ns correction on top of the configured offsets.
 
 ```{note}
-`pktrec-tb save-calibration` also saves the timebase frequency. Run it while the timebase
-discipline has been locked for a while (`pktrec-tb status`), otherwise it may store a
-transient frequency (for example right after the system clock was stepped by NTP). The
-daemon re-learns the frequency at every start anyway.
+`pktrec-tb save-calibration` also saves the timebase frequency, but only once the timebase
+discipline has been locked and stable for 10 minutes; otherwise it keeps the file's previous
+value and says so. The saved frequency is the daemon's starting point at the next boot.
 ```
 
 ## Timebase and absolute time

@@ -341,7 +341,8 @@ pktrec-tb set [--force]
 pktrec-tb trim (--ppm X | --ppb X | --inc 0xNNNNNNNNNN) [--force]
 pktrec-tb daemon [--interval 1] [--lock-threshold 10000] [--lock-time 30] [-v] ...
 pktrec-tb apply-calibration [--file F] [--dry-run] [--force] [--no-timebase]
-pktrec-tb save-calibration [--file F | --stdout] [--defaults]
+pktrec-tb save-calibration [--file F | --stdout] [--defaults] [--min-locked MIN]
+                           [--max-ppm-delta PPM] [--force-timebase]
 pktrec-tb show-calibration [--file F] [--json]
 ```
 
@@ -358,11 +359,13 @@ reads, 7 times, and keeps the pair with the shortest read latency (about 1.5 µs
 
 **Start-up.**
 
-1. Load `INC` from the calibration (the start frequency).
-2. `TB_SET` to `CLOCK_REALTIME`, plus one `TB_ADJ` for the few µs the register writes took.
-3. Let the timebase run free for 8 s and fit a straight line to the offsets. Its slope is
-   the frequency error. Correct `INC`, then `TB_SET` again.
-4. Track.
+1. `TB_SET` to `CLOCK_REALTIME`, plus one `TB_ADJ` for the few µs the register writes took.
+2. If the calibration set the frequency (`INC` differs from nominal), start the controller
+   from it and track at once. Otherwise (or with `--estimate-always`) let the timebase run
+   free for 8 s and fit a straight line to the offsets: its slope is the frequency error.
+   Correct `INC`, then `TB_SET` again.
+3. Track. The kernel's own frequency correction of the system clock is logged next to the
+   trim (`status` shows it): the trim follows it by design.
 
 **Tracking.** A PI controller on the frequency:
 
@@ -463,8 +466,12 @@ To persist a calibration that you measured (the procedure is in
 2. Check them with `pktrec-tb show-calibration`. It lists register, file and default for
    every key.
 3. Run `pktrec-tb save-calibration`. It writes the file from the registers and keeps the
-   previous one as `.bak`. When the daemon is locked, it saves the daemon's frequency
-   estimate rather than the momentary `INC`.
+   previous one as `.bak`. The timebase frequency is saved only when the daemon has been
+   locked for at least 10 minutes (`--min-locked`) and its frequency estimate moved less than
+   0.2 ppm over that time (`--max-ppm-delta`); the mean estimate is saved. Otherwise the file
+   keeps its previous `ppm` and the command says why (`--force-timebase` saves anyway). The
+   SFD receive offsets are saved without the link watcher's per-link-up `0x0055`
+   correction.
 
 `save-calibration --defaults --stdout` prints the design defaults (the register reset
 values). The shipped file holds the values measured on a ZCU106 with an Ethernet FMC Max
