@@ -106,6 +106,7 @@ class World:
         self.violations = []                 # loop-safety invariant broken (see docstring)
         self.allow = False                   # --i-accept-lan-loop cases
         self.reg55_next = {}                 # port -> value 0x0055 takes at its next link-up
+        self.selfcable = False               # P2<->P3 cabled to each other (the bench)
 
     def p0_clock(self):
         return not self.phy[m.PHY_ADDR[0]][0] & 0x0800
@@ -114,6 +115,10 @@ class World:
         bm = self.phy[m.PHY_ADDR[n]][0]
         if bm & 0x4800 or not self.cable[n] or (n and not self.p0_clock()):
             return False
+        if self.selfcable and n in (2, 3):  # the peer PHY is the link partner
+            if self.phy[m.PHY_ADDR[5 - n]][0] & 0x4800:
+                return False
+            return time.monotonic() >= max(self.up_at[n], self.up_at[5 - n])
         return time.monotonic() >= self.up_at[n]
 
     def replug(self, n):
@@ -416,6 +421,32 @@ def test_pair1():
     check(W.path == 0x0A | 0xA0 and not W.violations, "PATH_CTRL 0xaa, no invariant violation")
     run(["mode", "1", "monitor"])
 
+def test_pair1_selfcabled():
+    print("pair 1 cabled to itself (bench P2<->P3): test linkdown/linkup 3 does not latch")
+    run(["mode", "1", "tap"])
+    W.selfcable = True
+    S = {}
+    script = [
+        (1.0, "P3 power-down (test linkdown 3)", lambda: W.phy[m.PHY_ADDR[3]].__setitem__(0, 0x1940)),
+        (2.0, "snapshot down", lambda: S.__setitem__("down", [W.link(n) for n in range(4)])),
+        (2.2, "P3 power-up (test linkup 3)", lambda: (W.phy[m.PHY_ADDR[3]].__setitem__(0, 0x1140),
+                                                     W.renegotiate(3))),
+        (3.6, "snapshot up", lambda: S.__setitem__("up", ([bm(n) for n in range(4)],
+                                                          [W.link(n) for n in range(4)]))),
+    ]
+    try:
+        ev, out = watch_scenario(script, ["--debounce", "0.2", "--grace", "1.0",
+                                          "--no-0055-correction"], 4.0)
+    finally:
+        W.selfcable = False
+    check(S["down"] == [True, True, False, False], "P3 powered down -> P2 and P3 down, pair 0 up")
+    bmcr, links = S["up"]
+    check(not any(b & 0x4800 for b in bmcr) and all(links),
+          f"P3 back -> no re-hold, 4 links up (BMCR {[hex(b) for b in bmcr]})")
+    check(any(e.get("event") == "external_release" for e in ev), "external release logged")
+    run(["mode", "1", "monitor"])
+
+
 def test_restart():
     print("watch restart: holds of a previous instance only")
     run(["mode", "0", "tap"])
@@ -656,6 +687,7 @@ def main():
     test_guard()
     test_propagation()
     test_pair1()
+    test_pair1_selfcabled()
     test_restart()
     test_safety()
     test_skew()

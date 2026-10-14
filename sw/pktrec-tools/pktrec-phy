@@ -990,8 +990,10 @@ class Propagator:
       - a port we just released gets `grace` s (copper auto-negotiation takes
         ~3 s) before its own link-down counts;
       - at start every port gets `grace` s too.
-    If someone else undoes a hold (pktrec-phy init, mdio), we notice and forget it
-    (P0: path 0 fwd restored). When a pair leaves TAP mode, or watch exits, every
+    If someone else undoes a hold (pktrec-phy init, mdio, test linkup), we notice and
+    forget it (P0: path 0 fwd restored) and give both ports of the pair `grace` s:
+    on a pair cabled to itself (bench P2<->P3) the partner is down only because of
+    the hold, and an immediate re-hold would latch both links down for good. When a pair leaves TAP mode, or watch exits, every
     port held here is released.
 
     The held ports are recorded in $PKTREC_RUN_DIR/phy-watch.json, so a restarted
@@ -1069,7 +1071,10 @@ class Propagator:
             for x in (a, c):                    # hold undone by someone else?
                 if self.held[x] and not self.still_held(x):
                     self.held[x] = False
-                    self.grace_until[x] = now + self.grace
+                    # grace for BOTH ports: the partner's link may be down only
+                    # because x was held (a pair cabled to itself, e.g. P2<->P3 and
+                    # 'test linkup'); re-holding x at once would latch both down
+                    self.grace_until[a] = self.grace_until[c] = now + self.grace
                     extra = ""
                     if x == 0 and self.b.path_of(0) == "idle":
                         self.b.set_port_path(0, "fwd")
