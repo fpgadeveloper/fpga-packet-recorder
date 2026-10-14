@@ -99,16 +99,18 @@ indication.
 * After a new bitstream the SFD calibration may be off: check `sudo pktrec-phy sfd status`.
   If `RX_MISMATCH` counts and `RX_HEAD_DELTA` lies outside the receive window, adjust the
   window and re-calibrate (see [Timestamping](timestamping.md#calibration)).
-* Check that the calibration was applied at boot: `pktrec-tb show-calibration` and
+* Check that the calibration was applied at boot: `sudo pktrec-tb show-calibration` and
   `systemctl status pktrec-calibration`.
 * `pktrec-phy init --no-sfd` (or a PHY reset without `init`) leaves the SFD indications off.
 
 ### Timestamps are not wall-clock time / the timebase is not locked
 
-* `pktrec-tb status` shows the discipline. The daemon needs the system clock to be
+* `sudo pktrec-tb status` shows the discipline. The daemon needs the system clock to be
   NTP-synchronised (`timedatectl`): the board needs a route to an NTP server.
-* After boot, locking takes about a minute; after the system clock is stepped by NTP the
-  daemon re-locks.
+* After boot, the NTP client first steps the system clock (typically about a minute after
+  boot); the daemon then sets the timebase again and locks 2 to 3 minutes after that step
+  (3 to 4 minutes after power-on in total). After any later step of the system clock the
+  daemon re-locks the same way.
 * A capture that starts while the daemon is not locked sets the timebase from the system clock
   once (`pktrec-cap info` shows this as `tb discipline`).
 
@@ -135,10 +137,14 @@ it. See [File formats](capture_format.md#pcapng-mapping).
 
 * The output port's pair is in TAP mode, or its partner forwards: `sudo pktrec-phy mode <pair>
   monitor` first.
-* The port has no link, or the replay block is busy: check `pktrec-phy status`; `--force`
+* The port has no link, or the replay block is busy: check `sudo pktrec-phy status`; `--force`
   overrides.
-* `/dev/fdrec0` is busy: a capture (or `fdrec`/`fdplay`) is running. Use `--preload` to replay
-  during a capture (see [Replay](replay.md#replay-and-capture-at-the-same-time)).
+* `/dev/fdrec0` is still busy after 5 s: a capture (or `fdrec`/`fdplay`) is running. Use
+  `--preload` to replay during a capture, and start the replay before the capture (see
+  [Replay](replay.md#replay-and-capture-at-the-same-time)).
+* `needs root (sudo): /dev/uioN: permission denied` (from `pktrec-phy`, `pktrec-tb`,
+  `pktrec-cap` or `pktrec-replay`): the tools that touch the hardware must run as root; put
+  `sudo` in front.
 
 ### Underruns or late frames
 

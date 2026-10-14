@@ -83,8 +83,8 @@ clock output, including through `pktrec-phy mdio`.
 ## pktrec-cap
 
 ```
-pktrec-cap [record] [options] <output-file>
-pktrec-cap stats [--watch <sec>] [--clear] [--json]
+sudo pktrec-cap [record] [options] <output-file>
+sudo pktrec-cap stats [--watch <sec>] [--clear] [--json]
 pktrec-cap info [--records <n>] <capture-file>
 ```
 
@@ -103,7 +103,7 @@ Run it as root (`sudo`). It needs the recorder device, the register maps and 2 M
 | `--tb-state <path>` | `/run/pktrec/tb.json` | The `pktrec-tb` state file read at the start. |
 | `--buffers <n>`, `--buf-size <bytes>`, `--qd <n>` | 32, 8M, 8 | Ring and write queue, as for `fdrec`. |
 | `--timeout <sec>` | `10` | Abort when writes are in flight and none completes for this long (SSD stall). An idle network is not a stall. |
-| `--target`, `--design` | - | Strings stored in the file header. |
+| `--target`, `--design` | - | Strings stored in the file header. `--design` defaults to the line in `/etc/pktrec-release` (`fpga-packet-recorder <git describe>` of the build), which `pktrec-cap info` shows as `design`. |
 | `--devmem` | - | Map the registers through `/dev/mem` instead of `generic-uio`. |
 
 The capture stops on `--duration`, `--size`, `--stop-file`, Ctrl-C or `SIGTERM`. Every
@@ -272,11 +272,11 @@ playback path (io_uring `O_DIRECT` reads of the file, hugepage ring, AXI DMA MM2
 fdrec driver's `PLAY_*` ioctls like `fdplay`) and reports.
 
 ```
-pktrec-replay <capture.cap> --iface P<n> --port <m>
-              [--rate X | --topspeed | --gap NS] [--loop N] [--start-delay MS]
-              [--keep-bad | --bad-as-good] [--late-thresh NS]
-              [--preload [--wait-capture S]] [--force] [--keep-path]
-              [--buffers N] [--buf-size B] [--device D] [--devmem] [--json] [-q] [--dry-run]
+sudo pktrec-replay <capture.cap> --iface P<n> --port <m>
+                   [--rate X | --topspeed | --gap NS] [--loop N] [--start-delay MS]
+                   [--keep-bad | --bad-as-good] [--late-thresh NS]
+                   [--preload [--wait-capture S]] [--force] [--keep-path]
+                   [--buffers N] [--buf-size B] [--device D] [--devmem] [--json] [-q] [--dry-run]
 ```
 
 | Option | Meaning |
@@ -332,13 +332,19 @@ underruns, parse errors or frames missing; 1 = error.
 so a streamed replay cannot run while `pktrec-cap` records. Use `--preload`:
 
 ```
-pktrec-replay /mnt/rec/captures/p3.cap --iface P3 --port 2 --preload --wait-capture 30 &
-pktrec-cap record --ports 3 --duration 5 /mnt/rec/captures/replayed.cap
+sudo pktrec-replay /mnt/rec/captures/p3.cap --iface P3 --port 2 --preload --wait-capture 30 &
+sleep 2
+sudo pktrec-cap record --ports 3 --duration 5 /mnt/rec/captures/replayed.cap
 wait
 pktrec-export /mnt/rec/captures/p3.cap -o p3.pcapng
 pktrec-export /mnt/rec/captures/replayed.cap -o replayed.pcapng
-python3 test/compare_replay.py p3.pcapng --orig-iface P3 replayed.pcapng --replay-iface P3
+python3 test/compare_replay.py p3.pcapng replayed.pcapng
 ```
+
+Start the replay first: it needs the recorder device for a moment to load its frames.
+`pktrec-cap` waits for a `--preload` replay that is still loading, and both programs retry a
+busy recorder device for up to 5 s, so the `sleep` is not strictly needed (see
+[Replay](replay.md)).
 
 `test/compare_replay.py` pairs the frames by their bytes and reports lost, extra and
 reordered frames and the inter-frame interval error (mean, standard deviation, max) of
@@ -359,14 +365,14 @@ PS Ethernet port, so capture timestamps are absolute wall-clock times. It runs a
 `pktrec-tb.service` (enabled), and uses the register access of `pktrec-phy`.
 
 ```
-pktrec-tb status [--json]
-pktrec-tb set [--force]
-pktrec-tb trim (--ppm X | --ppb X | --inc 0xNNNNNNNNNN) [--force]
-pktrec-tb daemon [--interval 1] [--lock-threshold 10000] [--lock-time 30] [-v] ...
-pktrec-tb apply-calibration [--file F] [--dry-run] [--force] [--no-timebase]
-pktrec-tb save-calibration [--file F | --stdout] [--defaults] [--min-locked MIN]
-                           [--max-ppm-delta PPM] [--force-timebase]
-pktrec-tb show-calibration [--file F] [--json]
+sudo pktrec-tb status [--json]
+sudo pktrec-tb set [--force]
+sudo pktrec-tb trim (--ppm X | --ppb X | --inc 0xNNNNNNNNNN) [--force]
+sudo pktrec-tb daemon [--interval 1] [--lock-threshold 10000] [--lock-time 30] [-v] ...
+sudo pktrec-tb apply-calibration [--file F] [--dry-run] [--force] [--no-timebase]
+sudo pktrec-tb save-calibration [--file F | --stdout] [--defaults] [--min-locked MIN]
+                                [--max-ppm-delta PPM] [--force-timebase]
+sudo pktrec-tb show-calibration [--file F] [--json]
 ```
 
 | Command | What it does |
@@ -409,6 +415,11 @@ INC      = nominal * (1 + freq_ppb * 1e-9),   nominal = 2^32 * 1e9 / DP_CLK_HZ
   integrated. An `INC` written by someone else is adopted.
 * **Locked** means |offset| < 10 µs for 30 s. The lock is lost after 3 samples beyond
   50 µs, or after a set or a step.
+* **Time to lock.** After boot the NTP client (chrony) first steps the system clock, typically
+  about a minute after boot. The daemon treats that as a step, sets the timebase again and
+  locks 2 to 3 minutes after it (measured: 2.0 and 3.0 min; 3 to 4 min after power-on).
+  Captures made before that are timestamped from a `TB_SET` at their start (see `pktrec-cap`
+  above) and are just as precise relative to each other.
 
 **Why no steps during a capture.** The record timestamp of a frame is computed when it
 leaves its FIFO:

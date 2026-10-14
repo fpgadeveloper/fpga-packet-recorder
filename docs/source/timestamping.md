@@ -249,6 +249,7 @@ broadcast by a PC through the LAN router to P0 in monitor mode; the PC itself ru
 | Quantity | Result |
 |----------|--------|
 | Lock after chrony's first step of the system clock (−55 s) | 66 s; lost twice more (during chrony's slew right after the step, and once about 11 min after boot), locked continuously after that |
+| Lock after chrony's first step, release image (2026-10-14, two boots: steps −53 s, −44 s) | 2.0 and 3.0 min after the step (about 3.3 min after boot) |
 | Timebase − system clock, 30 min after boot | offset +1.0 µs, rms 46 ns |
 | Capture timestamp minus the PC's send time (40 frames, sd 15 µs) | −1.105 ms after 30 min, −1.195 ms after 35 min, −1.370 ms after 59 min |
 | Records later than the reorder window, timestamps going backwards | 0 |
