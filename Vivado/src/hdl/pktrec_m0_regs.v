@@ -6,10 +6,11 @@
 // same map is in include/pktrec_regs.h, keep both in sync):
 //
 //   0x000 ID         RO  0x504B4D30 ("PKM0")
-//   0x004 VERSION    RO  0x00010004 (1.1: generator + checker; 1.2: TAP mode - pair
+//   0x004 VERSION    RO  0x00010005 (1.1: generator + checker; 1.2: TAP mode - pair
 //                        mode, effective path, dynamic IFG, FIFO fill, FLUSH;
 //                        1.3: REPLAY path - PATH_RPL, EFF_PATH[11:8];
-//                        1.4: generator 802.1Q tag GEN_VLAN, checker skips a tag)
+//                        1.4: generator 802.1Q tag GEN_VLAN, checker skips a tag;
+//                        1.5: checker counts untagged PRSQ frames again)
 //   0x008 PATH_CTRL  RW  [2n+1:2n] TX source of port n: 0 IDLE, 1 LOOP (own RX),
 //                        2 FWD (pair partner's RX: P0<->P1, P2<->P3), 3 GEN. Reset 0.
 //   0x00C CNT_CTRL   WO  [0] 1 = clear every counter and IO_STICKY (reads 0)
@@ -116,7 +117,7 @@ module pktrec_m0_regs #(
 );
 
 localparam [31:0] REG_ID      = 32'h504B4D30;
-localparam [31:0] REG_VERSION = 32'h00010004;
+localparam [31:0] REG_VERSION = 32'h00010005;
 
 assign s_axi_bresp = 2'b00;
 assign s_axi_rresp = 2'b00;

@@ -559,7 +559,7 @@ module tb_pktrec_replay;
     rexp(R_STORE, 32'd8192, "STORE_BEATS");
     rexp(R_MAXCAP, 32'd16384, "MAX_CAP");
     mrd(M_VERSION, d);
-    if (d !== 32'h00010004) fail($sformatf("m0 VERSION 0x%08x", d));
+    if (d !== 32'h00010005) fail($sformatf("m0 VERSION 0x%08x", d));
     mwr(M_RPL, 32'h4);                       // P2 = replay
     mwr(M_PATH_CTRL, 32'h0);
     repeat (40) @(posedge ctrl_clk);

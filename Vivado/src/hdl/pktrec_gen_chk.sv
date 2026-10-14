@@ -7,7 +7,13 @@
 // 17 and "PRSQ" at UDP payload offset 0 (sequence = u64 BE at byte 50), or
 // (FORMAT 1) EtherType = ETYPE (sequence = u32 BE at byte 14). One 802.1Q tag
 // (TPID 0x8100) after the source MAC is skipped (m0 map 1.4; generator VLAN_EN,
-// gen_seq.py --vlan): the offsets above then move by 4 bytes. For each good
+// gen_seq.py --vlan): the offsets above then move by 4 bytes. The offsets are
+// matched against a registered "untagged-layout" beat counter (ob) that holds
+// on the two tag beats (m0 map 1.5). Map 1.4 derived ob combinationally
+// (vt && beat >= 8 ? beat - 2 : beat): correct in RTL simulation, but the
+// synthesized checker never reached the sequence number of an untagged frame
+// (0 untagged PRSQ frames counted on hardware; scripts/sim_netlist.tcl). For
+// each good
 // generator frame (MAC bad flag clear):
 //   first frame after ENABLE: LAST_SEQ := seq
 //   seq == LAST_SEQ + 1       : in order
@@ -50,18 +56,19 @@ logic [63:0] seq = '0;
 logic        long_enough = 1'b0; // the frame reached the sequence number
 logic        eval_q = 1'b0, bad_q = 1'b0;
 logic        vt = 1'b0;          // this frame carries an 802.1Q tag (seen at beat 6)
+logic [12:0] ob = '0;            // beat in the untagged layout (does not advance on skipped tag beats)
 
 // bytes of this beat (wire order): b0 = tdata[7:0] = byte 2*beat
 wire [15:0] be_word = {s_tdata[7:0], s_tdata[15:8]};   // big-endian value of bytes 2b, 2b+1
 // tag at beat 6 (not when the raw EtherType itself is 0x8100); beat 7 = TCI is skipped
 wire        tag6 = (beat == 13'd6) && be_word == 16'h8100 && !(fmt_raw && etype == 16'h8100);
 wire        skip = tag6 || (vt && beat == 13'd7);
-wire [12:0] ob   = (vt && beat >= 13'd8) ? beat - 13'd2 : beat;   // beat in the untagged layout
 
 always_ff @(posedge clk) begin
     en_d <= enable;
     if (s_tvalid) begin
         beat <= s_tlast ? 13'd0 : beat + 13'd1;
+        ob   <= s_tlast ? 13'd0 : skip ? ob : ob + 13'd1;
         if (beat == 13'd0) ok <= 1'b1;
         if (beat == 13'd0) long_enough <= 1'b0;
         if (beat == 13'd0) vt <= 1'b0;
@@ -110,7 +117,7 @@ always_ff @(posedge clk) begin
     if ((enable && !en_d) || rst) begin
         frames <= '0; lost <= '0; errors <= '0; bad <= '0; last_seq <= '0; have <= 1'b0;
     end
-    if (rst) beat <= '0;
+    if (rst) begin beat <= '0; ob <= '0; end
 end
 
 // the last beat's checks land in ok/seq at the same edge; evaluate next cycle

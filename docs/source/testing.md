@@ -49,6 +49,14 @@ vivado -mode batch -notrace -source scripts/sim.tcl -tclargs all
 `FAIL`. The testbenches and what they check are listed in
 [Architecture](design.md#verification).
 
+```
+vivado -mode batch -notrace -source scripts/sim_netlist.tcl
+```
+
+`sim_netlist.tcl` synthesizes the receive checker (`pktrec_gen_chk`) and runs `tb_pktrec_gen`
+on its post-synthesis netlist, which catches logic that simulates correctly as RTL but is
+built differently.
+
 ## Test traffic
 
 At 1 Gb/s, line rate is 1 488 095 frames/s for 64-byte frames (672 ns apart) and 81 274

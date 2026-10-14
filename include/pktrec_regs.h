@@ -134,13 +134,14 @@
 /* ------------------------------------------------------------------------- */
 #define PKTREC_M0_ID               0x000   /* RO 0x504B4D30 "PKM0" */
 #define PKTREC_M0_ID_VALUE         0x504B4D30
-#define PKTREC_M0_VERSION          0x004   /* RO 0x00010004 (1.1: traffic generator + checker;
+#define PKTREC_M0_VERSION          0x004   /* RO 0x00010005 (1.1: traffic generator + checker;
                                               1.2: TAP mode - PAIR_MODE, EFF_PATH, dynamic
                                               IFG, FWD FIFO 16 KB + fill, FLUSH, GEN BAD) */
 #define PKTREC_M0_VERSION_1_1      0x00010001
 #define PKTREC_M0_VERSION_1_2      0x00010002
 #define PKTREC_M0_VERSION_1_3      0x00010003   /* 1.3 (M6): PATH_RPL, EFF_PATH[11:8] */
 #define PKTREC_M0_VERSION_1_4      0x00010004   /* 1.4: GEN_VLAN, checker skips a tag */
+#define PKTREC_M0_VERSION_1_5      0x00010005   /* 1.5: checker fix (untagged PRSQ counted) */
 #define PKTREC_M0_PATH_CTRL        0x008   /* RW [2n+1:2n] TX source of port n (reset 0) */
 #define   PKTREC_M0_PATH_IDLE            0u          /* nothing is sent */
 #define   PKTREC_M0_PATH_LOOP            1u          /* own RX (RX n -> TX n) */

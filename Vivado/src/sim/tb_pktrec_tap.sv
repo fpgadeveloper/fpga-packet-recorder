@@ -663,7 +663,7 @@ module tb_pktrec_tap;
 
     // ---- 1. registers ----
     expect_reg(R_ID, 32'h504B4D30, "ID");
-    expect_reg(R_VERSION, 32'h00010004, "VERSION");
+    expect_reg(R_VERSION, 32'h00010005, "VERSION");
     for (int p = 0; p < 4; p++) begin
       expect_reg(preg(p, P_IFG_CTRL), 32'h00080C01, "IFG_CTRL reset");
       expect_reg(preg(p, P_IFG_THRESH), 32'h08000C00, "IFG_THRESH reset");

@@ -27,6 +27,14 @@
 //      (VID 100, as gen_seq.py --vlan 100 --size 1522) and PRSQ 62 B (the minimum
 //      with a tag), raw format with a tag; the checker counts tagged frames like
 //      untagged ones (LOST / ERRORS 0), also mixed with untagged frames
+//   7. checker on a MAC-like RX stream: random tvalid gaps inside frames (16-bit
+//      MAC / SGMII rate adaptation / shell FIFO), frames back to back (beat 0
+//      in the cycle after tlast) or after random idle; untagged PRSQ at 64 B
+//      and 1518 B on the wire (gen_seq.py layout: EtherType @12, IPv4 @14,
+//      UDP @34, "PRSQ" @42, seq @50) mixed with tagged PRSQ -> FRAMES = sent,
+//      LOST / ERRORS 0. Bench C (m0 1.4 bitstream) counted 0 untagged PRSQ
+//      frames: the RTL passed 1-6 but the synthesized netlist did not -- run
+//      this testbench on the post-synthesis netlist with scripts/sim_netlist.tcl
 //
 // Prints PASS / FAIL and calls $finish (sim.tcl contract).
 
@@ -184,6 +192,29 @@ module tb_pktrec_gen;
     repeat (12) @(posedge clk);
   endtask
 
+  // MAC-like feed: random tvalid gaps inside the frame (gap_pct % of cycles),
+  // idle after tlast = 0 (back to back) .. max_idle cycles
+  task automatic feed_gapped(input frame_t f, input bit bad, input int gap_pct, input int max_idle);
+    int nb = (f.size() + 1) / 2;
+    int b = 0;
+    while (b < nb) begin
+      @(posedge clk);
+      if ($urandom_range(99) < gap_pct) begin
+        c_tvalid <= 0; c_tlast <= 0; c_tdata <= $urandom;
+      end else begin
+        c_tdata  <= {(2*b+1 < f.size()) ? f[2*b+1] : 8'h00, f[2*b]};
+        c_tvalid <= 1; c_tlast <= (b == nb - 1); c_tbad <= bad;
+        b++;
+      end
+    end
+    begin
+      int idle = $urandom_range(max_idle);
+      for (int i = 0; i < idle; i++) begin
+        @(posedge clk); c_tvalid <= 0; c_tlast <= 0; c_tdata <= $urandom;
+      end
+    end
+  endtask
+
   initial begin
     frame_t saved[$];
     $display("tb_pktrec_gen: start");
@@ -287,13 +318,36 @@ module tb_pktrec_gen;
       fail($sformatf("test 6 checker raw: frames %0d lost %0d errors %0d last %0d (3/1/0/12)",
                      c_frames, c_lost, c_errors, c_last));
 
+    $display("test 7: checker, gapped MAC-like RX stream, untagged + tagged PRSQ");
+    process::self().srandom(32'h5052_5351);
+    c_raw <= 0; c_en <= 0; repeat (3) @(posedge clk); c_en <= 1; repeat (3) @(posedge clk);
+    for (int i = 0; i < 60; i++) begin
+      int l = (i % 3 == 2) ? 1514 : 60;          // 64 B / 1518 B on the wire (+ FCS)
+      vlan_en = (i % 5 == 4);                    // every 5th frame tagged (VID 100)
+      feed_gapped(ref_frame(0, vlan_en ? l + 4 : l, 64'd5000 + i), 0, 30, (i % 4 == 0) ? 0 : 6);
+    end
+    vlan_en = 0;
+    @(posedge clk); c_tvalid <= 0; c_tlast <= 0;
+    repeat (10) @(posedge clk);
+    if (c_frames != 60 || c_lost != 0 || c_errors != 0 || c_bad != 0 || c_last != 5059)
+      fail($sformatf("test 7 gapped: frames %0d lost %0d errors %0d bad %0d last %0d (60/0/0/0/5059)",
+                     c_frames, c_lost, c_errors, c_bad, c_last));
+    // untagged only, no gaps, back to back (the M5 / bench C stream)
+    c_en <= 0; repeat (3) @(posedge clk); c_en <= 1; repeat (3) @(posedge clk);
+    for (int i = 0; i < 20; i++) feed_gapped(ref_frame(0, 1514, 64'd100 + i), 0, 0, 0);
+    @(posedge clk); c_tvalid <= 0; c_tlast <= 0;
+    repeat (10) @(posedge clk);
+    if (c_frames != 20 || c_lost != 0 || c_errors != 0 || c_last != 119)
+      fail($sformatf("test 7 untagged b2b: frames %0d lost %0d errors %0d last %0d (20/0/0/119)",
+                     c_frames, c_lost, c_errors, c_last));
+
     if (errors == 0) $display("tb_pktrec_gen: PASS");
     else $display("tb_pktrec_gen: FAIL (%0d errors)", errors);
     $finish;
   end
 
   initial begin
-    #20ms;
+    #40ms;
     $display("tb_pktrec_gen: FAIL (timeout)");
     $finish;
   end
