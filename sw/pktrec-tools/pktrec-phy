@@ -21,17 +21,35 @@ Commands:
                          configure all four PHYs (see init_phy) and re-trigger the
                          SGMII status word on every copper link that comes up
   status [--json]        per port: PHY link/speed/duplex, SGMII/PCS state, GPIO levels
-  path <port|all> idle|loop|fwd|gen|replay   select the TX source of a port (also keeps
+  path <port|all> idle|loop|fwd|gen|replay [--i-accept-lan-loop]
+                         select the TX source of a port (also keeps
                          PAIR_MODE consistent: a pair is "tap" when both ports are fwd).
                          replay (m0 map 1.3, M6) = path mode 4: frames from the replay
                          scheduler (pktrec-replay sets it itself); refused on a pair
-                         that forwards (TAP), and fwd is refused next to a replay port
-  mode <pair 0|1> tap|monitor [--force]   per-pair mode: tap = both ports forward to
-                         each other (inline TAP), monitor = both ports receive only.
+                         that forwards (TAP), and fwd is refused next to a replay port.
+                         Loop safety (see "Loop safety" below): loop is refused unless
+                         the port's path is idle, its pair is not in TAP mode, its PHY
+                         is not in loopback and it is not on the LAN pair; fwd/gen/
+                         replay are refused into a port whose PHY is in loopback
+  mode <pair 0|1> tap|monitor [--force] [--i-accept-lan-loop]   per-pair mode: tap =
+                         both ports forward to each other (inline TAP), monitor = both
+                         ports receive only.
                          Refused while a capture runs (capture CTRL.ENABLE) unless --force;
                          tap is refused while a port of the pair is in replay (--force
-                         takes the port out of replay). In tap mode pktrec-phy-watch
-                         (watch) propagates link loss across the pair (see watch)
+                         takes the port out of replay), and while a PHY of the pair is
+                         in loopback (--force does not override that). In tap mode
+                         pktrec-phy-watch (watch) propagates link loss across the pair
+  safe [--json]          loop-safety report: per port PHY loopback / power-down, path,
+                         effective path, pair mode, watch hold; flags every reflecting
+                         combination (exit status 2 when one is found)
+  test linkdown <port> [--i-accept-lan-loop] | test linkup <port>
+                         simulate a link loss on a port with the safe method (the one
+                         watch uses to hold a port): P1-P3 PHY power-down (BMCR[11]);
+                         P0 (never powered down, see "P0 guard") path idle first, then
+                         MII loopback. linkup undoes it (+ AN restart, SGMII re-trigger,
+                         P0's fwd path restored if its pair is still in TAP mode).
+                         Refused on the LAN pair (pair 0) unless --i-accept-lan-loop:
+                         run link-propagation tests on pair 1 (P2<->P3)
   mode status [--json]   PAIR_MODE, PATH_CTRL and the effective path per pair
   ifg <port|all> [--enable on|off] [--nom B] [--min B] [--hi B] [--lo B] [--json]
                          dynamic inter-frame gap of the TAP forward path: settings,
@@ -50,8 +68,9 @@ Commands:
   sfd log <port> [--dir rx|tx] [--json]   pop the port's SFD log FIFO (needs --log on)
   gen <port> start [--size B] [--count N] [--ifg B | --rate PPS] [--raw] [--etype E]
              [--dst MAC] [--src MAC] [--stream ID] [--seq-first N] [--rand-mask M]
-             [--no-select] [--force]   start the port's generator (selects PATH gen
-                         unless --no-select)
+             [--no-select] [--force] [--i-accept-lan-loop]   start the port's generator
+                         (selects PATH gen unless --no-select); refused while the
+                         port's PHY is in loopback (--force does not override that)
   gen <port> stop | status [--json]
   chk <port> start [--raw] [--etype E] | stop | status [--json]   receive checker
   (--size is the wire size INCLUDING the FCS, like test/gen_seq.py: 64..16387;
@@ -62,16 +81,19 @@ Commands:
                          re-trigger the SGMII status word (CFG2[7] 0->1) whenever a
                          PHY's copper link changes (DP83867 sends it only once), and
                          for pairs in TAP mode propagate link state: when a port's
-                         copper link stays down for --debounce s, put its partner PHY
-                         into MII loopback (BMCR[14]): the partner's copper link drops,
-                         so the device on the other side sees link down too, while the
-                         PHY keeps running (clocks, MDIO, SGMII). When the port comes
-                         back, clear the loopback (+ AN restart), re-trigger SGMII and
-                         read BMCR back. Ports held in loopback by us never propagate,
-                         and a released port gets --grace s to negotiate before its
-                         link-down counts (no ping-pong). No PHY is ever powered down:
-                         P0's DP83867 clocks P1-P3 (see "P0 guard" below). On exit, or
-                         when the pair leaves TAP mode, every held PHY is released.
+                         copper link stays down for --debounce s, hold its partner
+                         with its copper link down, so the device on the other side
+                         sees link down too: P1-P3 by PHY power-down (BMCR[11], MDI
+                         off); P0, which must never be powered down (its CLK_OUT
+                         clocks P1-P3, see "P0 guard"), by first setting path 0 idle
+                         (EFF_PATH confirmed: nothing is forwarded into P0 any more)
+                         and only then MII loopback (BMCR[14]). When the port comes
+                         back, release: power-up / loopback cleared (+ AN restart),
+                         SGMII re-trigger, BMCR re-check, and for P0 last of all path 0
+                         fwd again. Held ports never propagate, and a released port
+                         gets --grace s to negotiate before its link-down counts (no
+                         ping-pong). On exit, or when the pair leaves TAP mode, every
+                         held PHY is released.
                          On every copper link-up, read the PHY's skew FIFO status
                          (reg 0x0055): non-zero (0x0111 / 0x1011 seen on the 1000BASE-T
                          master) means this link-up has --skew-ns (8) ns more RX
@@ -79,8 +101,25 @@ Commands:
                          base - 8 ns; zero restores the base (--no-0055-correction: off).
                          Every action is logged (--json: one JSON object per line);
                          state in $PKTREC_RUN_DIR/phy-watch.json (/run/pktrec).
-  mdio <phy> <reg> [val] raw PHY register access (phy: p0..p3 or MDIO address;
-                         reg > 0x1f uses the extended REGCR/ADDAR indirection)
+  mdio <phy> <reg> [val] [--i-accept-lan-loop]   raw PHY register access (phy:
+                         p0..p3 or MDIO address; reg > 0x1f uses the extended REGCR/
+                         ADDAR indirection). A BMCR write with bit 14 (MII loopback)
+                         set is checked against the loop-safety rule below
+
+Loop safety: a PHY or path loopback on a port that is being forwarded into
+sends the far side's traffic straight back at it. With a TAP pair between a
+router and a host, MII loopback on the host-side PHY returned every frame from
+the router to the router (P0 RX -> P1 TX -> PHY1 loopback -> P1 RX -> P0 TX):
+the switch learnt every LAN address on the TAP port and the whole LAN went
+down. Rule enforced here: a port may be put into a loopback (BMCR[14] via mdio,
+path loop, test linkdown on P0) only if no path forwards into it (its own path
+is idle and EFF_PATH confirms it) and it is not in a TAP pair; no non-idle path
+(fwd/gen/replay, mode tap) is selected into a port whose PHY is in loopback; no
+generator runs on a port whose PHY is in loopback. Pair 0 (P0/P1) is treated as
+the LAN pair (PKTREC_LAN_PAIRS, default "0"; "" = none): path loop and test
+linkdown are refused there too. --force never overrides these checks; only
+--i-accept-lan-loop does, with a warning. The one internal exception is watch
+holding P0, which reaches the safe state itself (path 0 idle first).
 
 P0 guard: on the OP080 only P0's DP83867 has a crystal; its CLK_OUT (25 MHz)
 feeds the XI clock input of P1-P3 (docs.opsero.com/op080/datasheet/
@@ -176,6 +215,13 @@ BMCR_RESET, BMCR_LOOPBACK, BMCR_AN_EN, BMCR_PWRDN, BMCR_ISOLATE, BMCR_AN_RESTART
 P_TX_MAX_LEN, P_RX_MAX_LEN = 0x14, 0x18
 RUN_DIR = os.environ.get("PKTREC_RUN_DIR", "/run/pktrec")
 WATCH_STATE = os.path.join(RUN_DIR, "phy-watch.json")
+# Loop safety (module docstring): pairs cabled into a live network (router / LAN)
+LAN_PAIRS = {int(x) for x in os.environ.get("PKTREC_LAN_PAIRS", "0").replace(",", " ").split()}
+LAN_PORTS = {n for p in LAN_PAIRS for n in (2 * p, 2 * p + 1)}
+LAN_LOOP_WARNING = ("WARNING (--i-accept-lan-loop): loop-safety check overridden. A loopback on "
+                    "a port that is forwarded into, or on a port cabled to a live network, sends "
+                    "the far side's traffic back at it; on the router-facing pair this takes the "
+                    "whole LAN down (switch MAC learning). Undo it as soon as the test is over.")
 
 
 class Regs:
@@ -396,20 +442,30 @@ class Board:
     def copper_link(self, n):
         return bool(self.mdio_rd(PHY_ADDR[n], PHYSTS) & 0x0400)
 
-    def phy_power_up(self, n):
-        """Clear BMCR[11] power-down (left by an older watch). This tool never sets it:
-        see the P0 guard."""
-        self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_PWRDN, 0)
-
     def phy_powered_down(self, n):
         return bool(self.mdio_rd(PHY_ADDR[n], BMCR) & BMCR_PWRDN)
+
+    def phy_power_down(self, n):
+        """BMCR[11] power-down: MDI off, the far device sees link down. Never on P0
+        (p0_guard refuses it: P0's CLK_OUT clocks P1-P3)."""
+        self.mdio_rmw(PHY_ADDR[n], BMCR, 0, BMCR_PWRDN)
+
+    def phy_power_on(self, n):
+        """Clear BMCR[11] and restart auto-negotiation (BMCR[9], self-clearing)."""
+        self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_PWRDN, BMCR_AN_RESTART)
 
     def phy_loopback(self, n, on):
         """BMCR[14] MII loopback on / off. With it on, the DP83867 drops its copper link
         (the far device sees link down) but keeps running: its clocks (P0's CLK_OUT
         feeds P1-P3), MDIO and the SGMII side stay alive (bench 2026-10-13). Turning it
-        off also restarts auto-negotiation (BMCR[9], self-clearing)."""
+        off also restarts auto-negotiation (BMCR[9], self-clearing).
+        Loop safety: refused (RuntimeError) while anything is sent into port n (its
+        path or EFF_PATH is not idle): whatever its TX carries would come straight
+        back on its RX. Callers make the path idle first."""
         if on:
+            busy = tx_into(self, n)
+            if busy:
+                raise RuntimeError(f"refused: MII loopback on P{n}: " + "; ".join(busy))
             self.mdio_rmw(PHY_ADDR[n], BMCR, 0, BMCR_LOOPBACK)
         else:
             self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_LOOPBACK, BMCR_AN_RESTART)
@@ -417,12 +473,223 @@ class Board:
     def phy_looped(self, n):
         return bool(self.mdio_rd(PHY_ADDR[n], BMCR) & BMCR_LOOPBACK)
 
+    # ---- per-port path (loop safety) ----
+    def path_of(self, n):
+        """Selected TX source of port n: idle|loop|fwd|gen|replay."""
+        if (self.replay_ports() >> n) & 1:
+            return "replay"
+        return MODE_NAMES[(self.m0.rd(M0_PATH_CTRL) >> (2 * n)) & 3]
+
+    def eff_path_of(self, n):
+        """TX source port n uses now (EFF_PATH, m0 map 1.2); None if not readable."""
+        if not self.has_tap():
+            return None
+        e = self.m0.rd(M0_EFF_PATH)
+        if self.has_replay() and (e >> (8 + n)) & 1:
+            return "replay"
+        return MODE_NAMES[(e >> (2 * n)) & 3]
+
+    def set_port_path(self, n, mode):
+        """PATH_CTRL of one port only; PAIR_MODE is left alone (watch's P0 hold keeps
+        the pair in TAP mode while P0's path is idle)."""
+        m = self.m0.rd(M0_PATH_CTRL) & 0xFF
+        self.m0.wr(M0_PATH_CTRL, (m & ~(3 << (2 * n))) | (MODES[mode] << (2 * n)))
+
+    def wait_eff_path(self, n, mode, timeout=0.2):
+        """True once EFF_PATH shows `mode` for port n (TX switches at a frame boundary)."""
+        t0 = time.monotonic()
+        while True:
+            e = self.eff_path_of(n)
+            if e is None or e == mode:
+                return True
+            if time.monotonic() - t0 > timeout:
+                return False
+            time.sleep(0.005)
+
     def sgmii_retrigger(self, n):
         """Make the DP83867 send a fresh SGMII config word (CFG2[7] 0 -> 1)."""
         a = PHY_ADDR[n]
         v = self.mdio_rd(a, CFG2)
         self.mdio_wr(a, CFG2, v & ~0x0080)
         self.mdio_wr(a, CFG2, v | 0x0080)
+
+
+# ---------------------------------------------------------------------------
+# Loop safety (module docstring "Loop safety"; LAN outage 2026-10-13)
+# ---------------------------------------------------------------------------
+def path_what(n, p):
+    return {"loop": f"P{n}'s own RX", "fwd": f"P{n ^ 1}'s RX (TAP forwarding)",
+            "gen": f"P{n}'s generator", "replay": "replay frames"}.get(p, p)
+
+
+def tx_into(b, n):
+    """Reasons why something is sent into port n (empty = its TX is idle)."""
+    p = b.path_of(n)
+    if p != "idle":
+        return [f"P{n}'s path is {p} (its TX carries {path_what(n, p)})"]
+    e = b.eff_path_of(n)
+    if e not in (None, "idle"):
+        return [f"P{n}'s EFF_PATH is still {e} (path switches at the next frame boundary)"]
+    return []
+
+
+def loop_hazards(b, n):
+    """Why port n must not be put into a loopback now (empty list = allowed): a path
+    forwards into it, or it is in a TAP pair."""
+    why = tx_into(b, n)
+    if b.pair_modes()[n // 2] == "tap":
+        why.append(f"P{n} is in TAP pair {n // 2} (P{n & 2}<->P{(n & 2) + 1} forward to each other)")
+    return why
+
+
+def watch_holds():
+    """Ports pktrec-phy-watch holds right now (from its state file)."""
+    st = read_watch_state() or {}
+    return set(st.get("held") or [])
+
+
+def lan_gate(why, what, accept):
+    """Refuse `what` for the reasons `why`, unless --i-accept-lan-loop (then warn)."""
+    if not why:
+        return
+    msg = (f"{what}: " + "; ".join(why) + ". A loopback on a port that is forwarded into (or "
+           "cabled to the LAN) reflects the far side's traffic back at it - on the router-facing "
+           "pair a LAN-wide reflection loop. Make the path idle first (pktrec-phy mode <pair> "
+           "monitor / path <n> idle) and test on pair 1. --force does not override this; "
+           "--i-accept-lan-loop does")
+    if not accept:
+        raise SystemExit(f"pktrec-phy: refused: {msg}")
+    print(LAN_LOOP_WARNING)
+    print(f"  overridden: {msg}")
+
+
+def safety_doc(b):
+    """Per-port loop-safety state and every reflecting combination (pktrec-phy safe)."""
+    held = watch_holds()
+    pairs = b.pair_modes()
+    gen_ok = b.m0.rd(M0_VERSION) >= 0x00010001
+    ports = []
+    for n in range(4):
+        d = {"port": n, "pair": n // 2, "pair_mode": pairs[n // 2], "lan": n in LAN_PORTS,
+             "path": b.path_of(n), "eff_path": b.eff_path_of(n), "watch_held": n in held,
+             "phy_loopback": None, "phy_powered_down": None, "gen_running": None}
+        try:
+            bm = b.mdio_rd(PHY_ADDR[n], BMCR)
+            if bm != 0xFFFF:
+                d["phy_loopback"] = bool(bm & BMCR_LOOPBACK)
+                d["phy_powered_down"] = bool(bm & BMCR_PWRDN)
+        except RuntimeError as e:
+            d["mdio_error"] = str(e)
+        if gen_ok:
+            d["gen_running"] = bool(b.m0.rd(GEN_BASE + n * GEN_STRIDE + G_STATUS) & 1)
+        ports.append(d)
+    hazards = []
+    for d in ports:
+        n, q = d["port"], ports[d["port"] ^ 1]
+        sends = d["path"] != "idle" or d["eff_path"] not in (None, "idle")
+        if d["phy_loopback"] and sends:
+            if q["path"] == "fwd" or q["eff_path"] == "fwd":
+                hazards.append({"port": n, "kind": "loop",
+                                "msg": f"REFLECTION LOOP: P{n ^ 1} RX -> P{n} TX -> PHY{n} loopback -> "
+                                       f"P{n} RX -> P{n ^ 1} TX: the device on P{n ^ 1} gets its own "
+                                       "traffic back" + (" (LAN pair!)" if q["lan"] else "")})
+            else:
+                hazards.append({"port": n, "kind": "reflect",
+                                "msg": f"P{n}'s TX ({d['path']}) is looped back into P{n} RX by its PHY"})
+        if d["path"] == "loop" or d["eff_path"] == "loop":
+            hazards.append({"port": n, "kind": "path_loop",
+                            "msg": f"path loop: P{n} sends what it receives back to its link "
+                                   "partner" + (" (LAN pair!)" if d["lan"] else "")
+                                   + (" and its PHY loops it again: frames circulate"
+                                      if d["phy_loopback"] else "")})
+        if d["phy_loopback"] and d["gen_running"] and (q["path"] == "fwd"):
+            hazards.append({"port": n, "kind": "gen_flood",
+                            "msg": f"P{n}'s generator runs into its PHY loopback and P{n ^ 1} "
+                                   "forwards those frames out" + (" (LAN pair!)" if q["lan"] else "")})
+    return {"lan_pairs": sorted(LAN_PAIRS), "ports": ports, "hazards": hazards,
+            "safe": not hazards}
+
+
+def cmd_safe(b, args):
+    doc = safety_doc(b)
+    if args.json:
+        print(json.dumps(doc, indent=1))
+    else:
+        for d in doc["ports"]:
+            phy = ("MDIO error" if d["phy_loopback"] is None else
+                   "LOOPBACK" if d["phy_loopback"] else
+                   "POWER-DOWN" if d["phy_powered_down"] else "normal")
+            eff = "" if d["eff_path"] in (None, d["path"]) else f" (effective {d['eff_path']})"
+            print(f"P{d['port']}: pair {d['pair']} {d['pair_mode']:<7}"
+                  f"{' LAN' if d['lan'] else '    '}  path {d['path']:<6}{eff}  PHY {phy:<10}"
+                  f"{'  held by watch' if d['watch_held'] else ''}"
+                  f"{'  generator running' if d['gen_running'] else ''}")
+        for h in doc["hazards"]:
+            print(f"  UNSAFE P{h['port']}: {h['msg']}")
+        print("SAFE: no reflecting combination" if doc["safe"] else
+              f"UNSAFE: {len(doc['hazards'])} reflecting combination(s)")
+    if not doc["safe"]:
+        raise SystemExit(2)
+
+
+def hold_link_down(b, n):
+    """Take port n's copper link down the safe way (watch's hold, test linkdown).
+    P1-P3: PHY power-down. P0 (never powered down): path 0 idle FIRST, wait until
+    EFF_PATH confirms it (nothing is forwarded into P0 any more), THEN MII loopback.
+    -> list of the steps done, in order."""
+    if n != 0:
+        b.phy_power_down(n)
+        return [f"BMCR[11] power-down P{n}"]
+    steps = []
+    if b.path_of(0) != "idle":
+        steps.append(f"path 0 {b.path_of(0)} -> idle")
+        b.set_port_path(0, "idle")
+    if not b.wait_eff_path(0, "idle"):
+        raise RuntimeError("P0's EFF_PATH did not become idle within 0.2 s: MII loopback NOT set")
+    steps.append("EFF_PATH P0 idle confirmed")
+    b.phy_loopback(0, True)                   # re-checks tx_into(0) itself
+    steps.append("BMCR[14] MII loopback P0")
+    return steps
+
+
+def release_link_down(b, n, restore_fwd=True):
+    """Undo hold_link_down: power-up / loopback off (+ AN restart), SGMII re-trigger,
+    BMCR re-check (one retry); for P0 last of all path 0 fwd again, if restore_fwd and
+    pair 0 is (still) in TAP mode. -> (steps, recheck_ok)."""
+    bit = BMCR_LOOPBACK if n == 0 else BMCR_PWRDN
+    undo = (lambda: b.phy_loopback(0, False)) if n == 0 else (lambda: b.phy_power_on(n))
+    undo()
+    steps = ["BMCR[14] cleared + AN restart" if n == 0 else "BMCR[11] cleared + AN restart"]
+    b.sgmii_retrigger(n)
+    steps.append("SGMII re-trigger")
+    ok = not b.mdio_rd(PHY_ADDR[n], BMCR) & bit
+    if not ok:
+        undo()
+        ok = not b.mdio_rd(PHY_ADDR[n], BMCR) & bit
+    steps.append("BMCR re-check " + ("ok" if ok else "FAILED after a retry"))
+    if n == 0 and restore_fwd and ok and b.pair_modes()[0] == "tap" and b.path_of(0) == "idle":
+        b.set_port_path(0, "fwd")
+        steps.append("path 0 idle -> fwd")
+    return steps, ok
+
+
+def cmd_test(b, args):
+    n = args.port
+    if not 0 <= n <= 3:
+        raise SystemExit("pktrec-phy: port must be 0..3")
+    if args.test_cmd == "linkdown":
+        b.need_tap()
+        if n in LAN_PORTS:
+            lan_gate([f"P{n} is on the LAN pair {n // 2} (router-facing): its link loss "
+                      "reaches the LAN" + (" and P0's method is MII loopback" if n == 0 else "")],
+                     f"test linkdown P{n}", args.i_accept_lan_loop)
+        steps = hold_link_down(b, n)
+        print(f"P{n}: copper link held down: " + ", ".join(steps))
+    else:
+        steps, ok = release_link_down(b, n)
+        print(f"P{n}: released: " + ", ".join(steps))
+        if not ok:
+            raise SystemExit(1)
 
 
 def init_phy(b, n, only1000, sfd):
@@ -492,8 +759,13 @@ def status_doc(b):
            "pg_1v0": (io >> 8) & 1, "pg_2v5": (io >> 9) & 1, "ports": []}
     for n in range(4):
         a = PHY_ADDR[n]
-        cu = {"up": None, "speed": None, "full_duplex": None, "error": None}
+        cu = {"up": None, "speed": None, "full_duplex": None, "error": None,
+              "phy_loopback": None, "phy_powered_down": None}
         try:
+            bmcr = b.mdio_rd(a, BMCR)
+            if bmcr != 0xFFFF:
+                cu["phy_loopback"] = bool(bmcr & BMCR_LOOPBACK)
+                cu["phy_powered_down"] = bool(bmcr & BMCR_PWRDN)
             bmsr = b.mdio_rd(a, BMSR)
             bmsr = b.mdio_rd(a, BMSR)          # link bit latches low: read twice
             st = b.mdio_rd(a, PHYSTS)
@@ -511,7 +783,8 @@ def status_doc(b):
                     "speed": speed_str((s >> 6) & 3), "full_duplex": bool(s & 0x100)},
             "lp_adv": b.eth_port(n, P_LP_ADV), "link_up": (s >> 11) & 1,
             "gpio0": (io >> n) & 1, "gpio1": (io >> (4 + n)) & 1,
-            "path": MODE_NAMES[(mode >> (2 * n)) & 3]})
+            "path": MODE_NAMES[(mode >> (2 * n)) & 3],
+            "phy_loopback": cu["phy_loopback"], "phy_powered_down": cu["phy_powered_down"]})
     doc["pairs"] = [{"pair": p, "ports": [2 * p, 2 * p + 1], "mode": m}
                     for p, m in enumerate(b.pair_modes())]
     return doc
@@ -535,6 +808,10 @@ def cmd_status(b, args):
             copper = f"up {cu['speed']:>4} {'FD' if cu['full_duplex'] else 'HD'}"
         else:
             copper = "down"
+        if cu.get("phy_loopback"):
+            copper += " (PHY loop)"
+        elif cu.get("phy_powered_down"):
+            copper += " (PHY PD)"
         c = p["pcs"]
         pcs = (f"sync={c['sync']} an={c['an']}{' TIMEOUT' if c['an_timeout'] else ''} "
                f"lp_link={c['lp_link']} {c['speed']} {'FD' if c['full_duplex'] else 'HD'}")
@@ -551,6 +828,23 @@ def cmd_path(b, args):
     for n in ports:
         if not 0 <= n <= 3:
             raise SystemExit("port must be 0..3 or all")
+    for n in ports:                            # loop safety, before anything is written
+        if args.mode == "idle":
+            continue
+        looped = b.phy_looped(n)
+        if args.mode == "loop":
+            why = [] if b.path_of(n) == "loop" else loop_hazards(b, n)
+            if looped:
+                why.append(f"P{n}'s PHY is in MII loopback: frames would circulate")
+            if n in LAN_PORTS:
+                why.append(f"P{n} is on the LAN pair {n // 2}: path loop sends the network's "
+                           "own traffic back to it")
+            lan_gate(why, f"path {n} loop", args.i_accept_lan_loop)
+        elif looped:
+            lan_gate([f"P{n}'s PHY is in MII loopback (BMCR[14]): whatever path {args.mode} "
+                      f"sends into P{n} comes straight back on its RX"],
+                     f"path {n} {args.mode}", args.i_accept_lan_loop)
+    for n in ports:
         partner = n ^ 1
         if args.mode == "replay":
             if not b.has_replay():
@@ -635,75 +929,89 @@ class Propagator:
     """Link-state propagation for pairs in TAP mode (watch).
 
     A port whose copper link has been down for `debounce` s makes us hold its
-    partner PHY in MII loopback (BMCR[14]): the partner's copper link drops, so the
-    device on the partner's side sees link down, as on a direct cable. The PHY
-    itself keeps running (clocks, MDIO, SGMII). When the port's link has been up
-    again for `debounce` s, the partner is released: loopback cleared + AN restart,
-    SGMII re-triggered, BMCR read back (re-check). Guards against ping-pong:
+    partner with its copper link down, so the device on the partner's side sees
+    link down, as on a direct cable (hold_link_down):
+      - P1, P2, P3: PHY power-down (BMCR[11]). The MDI goes down; nothing can be
+        reflected. MDIO keeps working.
+      - P0 must never be powered down: its DP83867's CLK_OUT clocks P1-P3 (P0
+        guard; bench 2026-10-13: a power-down of P0 silenced P1-P3). So, in this
+        order: (1) path 0 idle - PATH_CTRL only, PAIR_MODE stays tap - and wait for
+        EFF_PATH to confirm it (nothing is forwarded into P0 any more), (2) only
+        then MII loopback (BMCR[14]). If EFF_PATH does not confirm, no loopback.
+    When the port's link has been up again for `debounce` s, the partner is
+    released (release_link_down), in this order: power-up / loopback cleared + AN
+    restart, SGMII re-trigger, BMCR re-check (one retry), and for P0 last of all
+    path 0 fwd again (only while pair 0 is still in TAP mode).
+
+    Why not MII loopback everywhere (fix round 1): a loopback on a port that is
+    forwarded into reflects the far side's traffic back at it. The hold itself was
+    safe (the held port's partner had no link), but it made loopback look like a
+    harmless way to drop a link, and that is how the LAN outage of 2026-10-13 was
+    caused (MII loopback forced by hand on P1 while pair 0 forwarded). Loopback is
+    now used only on P0, and only after its forward path is idle.
+
+    Guards against ping-pong:
       - a port WE hold never propagates (its link-down is our doing);
       - a port we just released gets `grace` s (copper auto-negotiation takes
         ~3 s) before its own link-down counts;
       - at start every port gets `grace` s too.
-    If someone else clears the loopback (pktrec-phy init, mdio), we notice and
-    forget the hold. When a pair leaves TAP mode, or watch exits, every PHY held
-    here is released.
-
-    Why not BMCR[11] power-down (the first implementation): on the OP080 P0's
-    DP83867 clocks P1-P3 through its CLK_OUT. Powering P0 down for a link loss on
-    P1 dropped P2/P3 as well and silenced P1-P3 on MDIO, so P1's own recovery could
-    never be seen (bench 2026-10-13). MII loopback was proven on the same bench to
-    drop the far link while keeping everything alive. No PHY is powered down here.
+    If someone else undoes a hold (pktrec-phy init, mdio), we notice and forget it
+    (P0: path 0 fwd restored). When a pair leaves TAP mode, or watch exits, every
+    port held here is released.
 
     The held ports are recorded in $PKTREC_RUN_DIR/phy-watch.json, so a restarted
     watch releases exactly the holds a previous instance left (and not a loopback
-    somebody set by hand for a test)."""
+    or power-down somebody set by hand for a test, e.g. pktrec-phy test linkdown)."""
 
     def __init__(self, b, log, debounce=0.5, grace=6.0, saved=None):
         self.b, self.log, self.debounce, self.grace = b, log, debounce, grace
         now = time.monotonic()
-        self.held = [False] * 4             # held in MII loopback by us
+        self.held = [False] * 4             # held link-down by us
         self.state = [None] * 4             # last copper link state
         self.t_change = [now] * 4
         self.grace_until = [now + grace] * 4
-        tap = self.b.pair_modes()
         prev = set((saved or {}).get("held", []))
-        for n in range(4):
-            # a PHY left powered down by an older watch (BMCR[11]) in a TAP pair
-            if tap[n // 2] == "tap" and self.b.phy_powered_down(n):
-                self.b.phy_power_up(n)
-                self.b.sgmii_retrigger(n)
-                self.log(n, "power_up", "PHY was powered down at start (older watch?) "
-                         "-> powered up", reason="startup")
-            # a loopback hold left by a previous watch (crash / restart)
-            if n in prev and self.b.phy_looped(n):
+        for n in sorted(prev):
+            # a hold left by a previous watch (crash / restart): power-down (P1-P3),
+            # loopback (P0; also an MII loopback left on P1-P3 by a fix-round-1 watch)
+            bm = self.b.mdio_rd(PHY_ADDR[n], BMCR)
+            if bm != 0xFFFF and bm & (BMCR_PWRDN | BMCR_LOOPBACK):
+                if n != 0 and bm & BMCR_LOOPBACK:
+                    self.b.phy_loopback(n, False)
                 self.release(n, now, "left held by a previous watch")
 
     def held_ports(self):
         return [n for n in range(4) if self.held[n]]
 
     def hold(self, n, now, reason):
-        self.b.phy_loopback(n, True)
+        try:
+            steps = hold_link_down(self.b, n)
+        except RuntimeError as e:
+            if n == 0 and self.b.pair_modes()[0] == "tap" and not self.b.phy_looped(0):
+                self.b.set_port_path(0, "fwd")
+            self.log(n, "hold_failed", f"hold NOT applied ({reason}): {e}", reason=reason)
+            return
         self.held[n] = True
-        self.log(n, "hold", f"PHY held in MII loopback: copper link DOWN ({reason})", reason=reason)
+        how = "path idle + MII loopback" if n == 0 else "PHY power-down"
+        self.log(n, "hold", f"held link-down by {how}: copper link DOWN ({reason}) "
+                 f"[{' -> '.join(steps)}]", reason=reason, method=how, steps=steps)
 
     def release(self, n, now, reason):
-        self.b.phy_loopback(n, False)
+        steps, ok = release_link_down(self.b, n)
         self.held[n] = False
         self.grace_until[n] = now + self.grace
-        self.b.sgmii_retrigger(n)
-        ok = not self.b.phy_looped(n)       # re-check
-        if not ok:                          # one retry, then report
-            self.b.phy_loopback(n, False)
-            ok = not self.b.phy_looped(n)
-        self.log(n, "release", f"PHY released from MII loopback (+AN restart, SGMII re-trigger"
-                 f"{', BMCR re-check ok' if ok else ', BMCR[14] STILL SET after a retry'}) ({reason})",
-                 reason=reason, recheck_ok=ok)
+        self.log(n, "release", f"released ({reason}) [{' -> '.join(steps)}]",
+                 reason=reason, recheck_ok=ok, steps=steps)
 
     def release_all(self, reason):
         now = time.monotonic()
         for n in range(4):
             if self.held[n]:
                 self.release(n, now, reason)
+
+    def still_held(self, n):
+        bm = self.b.mdio_rd(PHY_ADDR[n], BMCR)
+        return bool(bm & (BMCR_LOOPBACK if n == 0 else BMCR_PWRDN))
 
     def step(self, now, links):
         for n in range(4):
@@ -713,6 +1021,8 @@ class Propagator:
                 self.state[n] = links[n]
                 self.t_change[n] = now
         tap = self.b.pair_modes()
+        if not self.b.has_tap() and self.held[0]:
+            tap[0] = "tap"                  # no PAIR_MODE register: P0's idle path is ours
         for pair in range(2):
             a, c = 2 * pair, 2 * pair + 1
             if tap[pair] != "tap":
@@ -720,12 +1030,16 @@ class Propagator:
                     if self.held[x]:
                         self.release(x, now, f"pair {pair} left TAP mode")
                 continue
-            for x in (a, c):                    # loopback cleared by someone else?
-                if self.held[x] and not self.b.phy_looped(x):
+            for x in (a, c):                    # hold undone by someone else?
+                if self.held[x] and not self.still_held(x):
                     self.held[x] = False
                     self.grace_until[x] = now + self.grace
-                    self.log(x, "external_release", "MII loopback was cleared by someone else; "
-                             "no longer held")
+                    extra = ""
+                    if x == 0 and self.b.path_of(0) == "idle":
+                        self.b.set_port_path(0, "fwd")
+                        extra = "; path 0 fwd restored"
+                    self.log(x, "external_release", "hold was undone by someone else; "
+                             "no longer held" + extra)
             for x, y in ((a, c), (c, a)):
                 if self.state[x] is None or now - self.t_change[x] < self.debounce:
                     continue
@@ -912,11 +1226,11 @@ def cmd_watch(b, args):
                            "skew": skew.doc() if skew else None})
     save()
     log(None, "start", f"watch: SGMII re-trigger on link changes, link-state propagation "
-        f"{'OFF' if prop is None else f'ON via MII loopback (debounce {args.debounce} s, grace {args.grace} s)'}"
+        f"{'OFF' if prop is None else f'ON (P1-P3 power-down, P0 path idle + MII loopback; debounce {args.debounce} s, grace {args.grace} s)'}"
         f", 0x0055 RX correction "
         f"{'OFF' if skew is None or not skew.ok else f'ON ({skew.ns} ns)'}"
         f"; pair modes {', '.join(b.pair_modes())}")
-    # systemd stops the service with SIGTERM: leave no PHY held in loopback
+    # systemd stops the service with SIGTERM: leave no port held
     signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
         watch_loop(b, None, args.interval, list(range(4)), quiet=True, prop=prop, log=log,
@@ -985,6 +1299,12 @@ def cmd_mode(b, args):
                              "pktrec-replay running?): replay and TAP forwarding on the same pair "
                              "are mutually exclusive; --force takes the port out of replay")
         b.m0.wr(M0_PATH_RPL, b.replay_ports() & ~rpl)
+    if args.mode == "tap":                     # loop safety: --force does not override
+        held = watch_holds()
+        why = [f"P{n}'s PHY is in MII loopback (BMCR[14])" +
+               (" - held by pktrec-phy-watch until its partner's link returns" if n in held else "")
+               for n in (2 * pair, 2 * pair + 1) if b.phy_looped(n)]
+        lan_gate(why, f"mode {pair} tap (forwarding into a looped PHY)", args.i_accept_lan_loop)
     if not b.has_tap():
         print("note: no PAIR_MODE register in this bitstream (m0 map < 1.2): only PATH_CTRL is set")
     path = MODES["fwd" if args.mode == "tap" else "idle"]
@@ -1153,8 +1473,13 @@ def cmd_mdio(b, args):
     reg = parse_int(args.reg)
     if args.val is None:
         print(f"0x{b.mdio_rd(phy, reg):04x}")
-    else:
-        b.mdio_wr(phy, reg, parse_int(args.val))
+        return
+    val = parse_int(args.val)
+    if reg == BMCR and val & BMCR_LOOPBACK and phy in PHY_ADDR:
+        n = PHY_ADDR.index(phy)                # loop safety (no --force; see docstring)
+        lan_gate(loop_hazards(b, n), f"mdio P{n} BMCR 0x{val:04x} (bit 14 MII loopback)",
+                 args.i_accept_lan_loop)
+    b.mdio_wr(phy, reg, val)
 
 
 # ---------------------------------------------------------------------------
@@ -1338,6 +1663,11 @@ def cmd_gen(b, args):
     g = GEN_BASE + n * GEN_STRIDE
     if args.gen_cmd == "start":
         size = args.size
+        if b.phy_looped(n):                    # loop safety: --force does not override
+            lan_gate([f"P{n}'s PHY is in MII loopback (BMCR[14]): the generated frames come "
+                      f"back on P{n}'s RX" + (", and P{} forwards them out".format(n ^ 1)
+                                              if b.path_of(n ^ 1) == "fwd" else "")],
+                     f"gen {n} start", args.i_accept_lan_loop)
         if not 64 <= size <= 16387:
             raise SystemExit("pktrec-phy: --size must be 64..16387 (wire size incl. FCS)")
         length = size - 4
@@ -1408,6 +1738,10 @@ def cmd_chk(b, args):
         print_gen(doc, "chk")
 
 
+LAN_HELP = ("override the loop-safety check (prints a warning); --force never does. Only "
+            "with nothing but test equipment on the pair")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="pktrec-phy", description=__doc__.split("\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1426,6 +1760,7 @@ def main():
     p = sub.add_parser("path", help="select the TX source of a port")
     p.add_argument("port", help="0..3 or all")
     p.add_argument("mode", choices=sorted(MODES) + ["replay"])
+    p.add_argument("--i-accept-lan-loop", action="store_true", help=LAN_HELP)
     p = sub.add_parser("counters", help="M0 frame counters")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--json", action="store_true")
@@ -1472,6 +1807,7 @@ def main():
                    help="start even when size + mask exceeds TX_MAX_LEN (oversize frames go out "
                         "error-terminated)")
     q.add_argument("--no-select", action="store_true", help="do not set PATH_CTRL to gen")
+    q.add_argument("--i-accept-lan-loop", action="store_true", help=LAN_HELP)
     q.add_argument("--bad", action="store_true",
                    help="send every frame error-terminated (bad-frame forwarding test, m0 map 1.2)")
     gs.add_parser("stop")
@@ -1487,14 +1823,14 @@ def main():
     q = cs.add_parser("status")
     q.add_argument("--json", action="store_true")
     p = sub.add_parser("watch", help="re-trigger SGMII on link changes; TAP link propagation "
-                       "(MII loopback); 0x0055 RX latency correction")
+                       "(P1-P3 power-down, P0 path idle + MII loopback); 0x0055 RX correction")
     p.add_argument("--interval", type=float, default=0.25)
     p.add_argument("--no-propagate", action="store_true",
                    help="do not propagate link state across TAP pairs")
     p.add_argument("--debounce", type=float, default=0.5,
                    help="s a link change must persist before it is propagated (0.5)")
     p.add_argument("--grace", type=float, default=6.0,
-                   help="s a PHY released from loopback gets to negotiate before its link-down "
+                   help="s a released PHY gets to negotiate before its link-down "
                         "counts (6)")
     p.add_argument("--no-0055-correction", dest="no_0055_correction", action="store_true",
                    help="do not correct RX_OFFSET from the PHY's skew FIFO status (0x0055) "
@@ -1503,10 +1839,11 @@ def main():
                    help="RX latency (ns) a non-zero 0x0055 adds to a link-up (8, bench-measured)")
     p.add_argument("--json", action="store_true", help="log one JSON object per line")
     p = sub.add_parser("mode", help="per-pair TAP / monitor mode (M3); in tap mode the watch "
-                       "service propagates link loss across the pair (MII loopback)")
+                       "service propagates link loss across the pair")
     p.add_argument("what", help="pair 0|1, or status")
     p.add_argument("mode", nargs="?", choices=sorted(PAIR_MODES))
     p.add_argument("--force", action="store_true", help="switch even while a capture runs")
+    p.add_argument("--i-accept-lan-loop", action="store_true", help=LAN_HELP)
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("ifg", help="dynamic inter-frame gap of the TAP forward path (M3)")
     p.add_argument("port", help="0..3 or all")
@@ -1532,13 +1869,25 @@ def main():
     p.add_argument("phy", help="p0..p3 or an MDIO address")
     p.add_argument("reg")
     p.add_argument("val", nargs="?")
+    p.add_argument("--i-accept-lan-loop", action="store_true", help=LAN_HELP)
+    p = sub.add_parser("safe", help="loop-safety report: PHY loopback / path / pair per port, "
+                       "reflecting combinations flagged (exit 2)")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("test", help="simulate a link loss the safe way (pair 1 only by default)")
+    ts = p.add_subparsers(dest="test_cmd", required=True)
+    q = ts.add_parser("linkdown", help="P1-P3 power-down; P0 path idle, then MII loopback")
+    q.add_argument("port", type=port_t)
+    q.add_argument("--i-accept-lan-loop", action="store_true", help=LAN_HELP)
+    q = ts.add_parser("linkup", help="undo linkdown (+ AN restart, SGMII re-trigger)")
+    q.add_argument("port", type=port_t)
+    q.set_defaults(i_accept_lan_loop=False)
     args = ap.parse_args()
 
     b = Board(args.devmem)
     try:
         {"init": cmd_init, "status": cmd_status, "path": cmd_path, "counters": cmd_counters,
          "watch": cmd_watch, "mdio": cmd_mdio, "sfd": cmd_sfd, "gen": cmd_gen,
-         "chk": cmd_chk, "mode": cmd_mode, "ifg": cmd_ifg,
+         "chk": cmd_chk, "mode": cmd_mode, "ifg": cmd_ifg, "safe": cmd_safe, "test": cmd_test,
          "latency": cmd_latency}[args.cmd](b, args)
     except KeyboardInterrupt:
         pass

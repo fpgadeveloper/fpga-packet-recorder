@@ -1,8 +1,9 @@
 # Ethernet FMC Max (OP080): configure the four DP83867 PHYs at boot and keep
 # the SGMII status word fresh on every copper link change (the DP83867 sends it
 # only once, see pktrec-phy 'watch'). For pairs in TAP mode it propagates a
-# link loss to the partner port by holding the partner PHY in MII loopback
-# (never by powering a PHY down: P0's PHY clocks P1-P3 on the OP080), and after
+# link loss to the partner port by holding the partner's link down: P1-P3 by
+# PHY power-down, P0 (whose PHY clocks P1-P3 on the OP080, never powered down)
+# by path 0 idle first, then MII loopback (see pktrec-phy "Loop safety"); after
 # every link-up it corrects the port's SFD RX_OFFSET from the PHY's skew FIFO
 # status (reg 0x0055, +8 ns when non-zero). State: /run/pktrec/phy-watch.json.
 # Runs as a service so it survives SSH sessions (nohup/setsid copies die with
