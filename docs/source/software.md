@@ -236,6 +236,7 @@ At the end it prints a summary to stderr:
 | 0 | Clean. |
 | 2 | Written, but with anomalies: corrupt stretches skipped, records later than the reorder window, a truncated tail, or recorder data loss recorded in the header. |
 | 1 | Error. |
+| 3 | The output could not be written: the reader closed the pipe (EPIPE, e.g. `pktrec-export cap.cap - \| head`) or the disk is full; the message names the write error. |
 
 The reorder window, the header checks and resynchronisation, and the pcapng mapping are
 described in [File formats](capture_format.md#pcapng-mapping).

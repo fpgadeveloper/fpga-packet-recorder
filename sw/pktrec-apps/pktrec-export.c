@@ -32,7 +32,8 @@
  * and skipped silently.
  *
  * Exit codes: 0 = clean, 2 = written but with anomalies (resyncs, records
- * later than the window, a truncated tail), 1 = error.
+ * later than the window, a truncated tail), 1 = error, 3 = the output could
+ * not be written (the reader closed the pipe, disk full, ...).
  */
 
 #define _GNU_SOURCE
@@ -220,7 +221,8 @@ static void usage(FILE *f)
 "untruncated frame has caplen = len - 4.\n"
 "\n"
 "Exit code: 0 = clean, 2 = written with anomalies (corrupt stretches skipped,\n"
-"records outside the reorder window, truncated tail), 1 = error.\n",
+"records outside the reorder window, truncated tail), 1 = error, 3 = the output\n"
+"could not be written (reader closed the pipe, disk full).\n",
 		DEF_WINDOW_RECORDS, DEF_WINDOW_BYTES >> 20, DEF_MAX_FRAME);
 }
 
@@ -620,6 +622,10 @@ static int emit_one(struct exp *e)
 	return ret;
 }
 
+/* add_record() failures: out of memory (reorder window) / output write error */
+#define ADD_ENOMEM	(-1)
+#define ADD_EWRITE	(-2)
+
 static int add_record(struct exp *e, const struct pktrec_rec_hdr *h, const uint8_t *data)
 {
 	struct ent n;
@@ -672,18 +678,18 @@ static int add_record(struct exp *e, const struct pktrec_rec_hdr *h, const uint8
 	n.dropcount = dropcount;
 	n.data = malloc(h->cap_len ? h->cap_len : 1);
 	if (!n.data)
-		return -1;
+		return ADD_ENOMEM;
 	memcpy(n.data, data, h->cap_len);
 	if (heap_push(e, &n)) {
 		free(n.data);
-		return -1;
+		return ADD_ENOMEM;
 	}
 	e->held_bytes += h->cap_len;
 	if (e->nheap > e->max_held)
 		e->max_held = e->nheap;
 	while (e->nheap && (e->nheap > e->o.window_records || e->held_bytes > e->o.window_bytes))
 		if (emit_one(e))
-			return -1;
+			return ADD_EWRITE;
 	return 0;
 }
 
@@ -848,7 +854,12 @@ static int parse_stream(struct exp *e)
 				err_msg("resynchronised at stream offset %" PRIu64 " after %" PRIu64
 					" bytes", e->offset, e->offset - e->resync_start);
 			e->resyncing = false;
-			if (add_record(e, &h, p + PKTREC_REC_HDR_BYTES)) {
+			switch (add_record(e, &h, p + PKTREC_REC_HDR_BYTES)) {
+			case 0:
+				break;
+			case ADD_EWRITE:
+				return -1;	/* the caller reports the write error */
+			default:
 				err_msg("out of memory (reorder window)");
 				return -1;
 			}
@@ -997,10 +1008,10 @@ int main(int argc, char **argv)
 			goto werr;
 
 	if (parse_stream(e)) {
+		if (ferror(e->out))
+			goto werr;
 		if (g_stop)
 			err_msg("interrupted");
-		else if (ferror(e->out))
-			goto werr;
 		goto out;
 	}
 	while (e->nheap)
@@ -1026,10 +1037,10 @@ int main(int argc, char **argv)
 	goto out;
 werr:
 	if (errno == EPIPE)
-		err_msg("output closed by the reader");
+		err_msg("write %s: output closed by the reader (EPIPE)", e->o.output);
 	else
 		perr("write %s", e->o.output);
-	ret = 1;
+	ret = 3;
 out:
 	while (e->nheap) {
 		struct ent r = heap_pop(e);
