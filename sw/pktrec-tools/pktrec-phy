@@ -129,10 +129,14 @@ path loop, test linkdown on P0) only if no path forwards into it (its own path
 is idle and EFF_PATH confirms it) and it is not in a TAP pair; no non-idle path
 (fwd/gen/replay, mode tap) is selected into a port whose PHY is in loopback; no
 generator runs on a port whose PHY is in loopback. Pair 0 (P0/P1) is treated as
-the LAN pair (PKTREC_LAN_PAIRS, default "0"; "" = none): path loop and test
-linkdown are refused there too. --force never overrides these checks; only
---i-accept-lan-loop does, with a warning. The one internal exception is watch
-holding P0, which reaches the safe state itself (path 0 idle first).
+the LAN pair (PKTREC_LAN_PAIRS, default "0"; "" = none): there, any loopback
+(BMCR[14] via mdio, path loop, test linkdown, the internal hold path) is refused
+in EVERY mode, even with the pair in monitor and both paths idle (bench C: a
+looped P1 is one 'mode 0 tap' away from the incident; the LAN pair never needs
+a loopback). --force never overrides these checks; only --i-accept-lan-loop
+does, with a warning. The one internal exception is pktrec-phy-watch holding P0
+for link propagation: it runs inside the watch, sets path 0 idle first and sets
+the loopback only once EFF_PATH confirms that nothing is forwarded into P0.
 
 P0 guard: on the OP080 only P0's DP83867 has a crystal; its CLK_OUT (25 MHz)
 feeds the XI clock input of P1-P3 (docs.opsero.com/op080/datasheet/
@@ -473,16 +477,17 @@ class Board:
         """Clear BMCR[11] and restart auto-negotiation (BMCR[9], self-clearing)."""
         self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_PWRDN, BMCR_AN_RESTART)
 
-    def phy_loopback(self, n, on):
+    def phy_loopback(self, n, on, lan_ok=False):
         """BMCR[14] MII loopback on / off. With it on, the DP83867 drops its copper link
         (the far device sees link down) but keeps running: its clocks (P0's CLK_OUT
         feeds P1-P3), MDIO and the SGMII side stay alive (bench 2026-10-13). Turning it
         off also restarts auto-negotiation (BMCR[9], self-clearing).
         Loop safety: refused (RuntimeError) while anything is sent into port n (its
         path or EFF_PATH is not idle): whatever its TX carries would come straight
-        back on its RX. Callers make the path idle first."""
+        back on its RX. Callers make the path idle first. Also refused on a LAN-pair
+        port unless lan_ok (watch's P0 hold, or --i-accept-lan-loop already given)."""
         if on:
-            busy = tx_into(self, n)
+            busy = tx_into(self, n) + ([] if lan_ok else lan_loop_why(n))
             if busy:
                 raise RuntimeError(f"refused: MII loopback on P{n}: " + "; ".join(busy))
             self.mdio_rmw(PHY_ADDR[n], BMCR, 0, BMCR_LOOPBACK)
@@ -559,6 +564,14 @@ def loop_hazards(b, n):
     if b.pair_modes()[n // 2] == "tap":
         why.append(f"P{n} is in TAP pair {n // 2} (P{n & 2}<->P{(n & 2) + 1} forward to each other)")
     return why
+
+
+def lan_loop_why(n):
+    """Loopback on a LAN-pair port is refused in every mode (bench C, fix round 3)."""
+    if n not in LAN_PORTS:
+        return []
+    return [f"P{n} is on the LAN pair {n // 2} (router-facing): loopback there is refused in "
+            "every mode (monitor/idle too - one 'mode tap' away from a LAN-wide reflection)"]
 
 
 def watch_holds():
@@ -651,11 +664,13 @@ def cmd_safe(b, args):
         raise SystemExit(2)
 
 
-def hold_link_down(b, n):
+def hold_link_down(b, n, lan_ok=False):
     """Take port n's copper link down the safe way (watch's hold, test linkdown).
     P1-P3: PHY power-down. P0 (never powered down): path 0 idle FIRST, wait until
     EFF_PATH confirms it (nothing is forwarded into P0 any more), THEN MII loopback.
-    -> list of the steps done, in order."""
+    lan_ok: allow the P0 loopback although P0 is on the LAN pair - only watch's
+    propagation hold (the documented exception) and test linkdown after
+    --i-accept-lan-loop pass it. -> list of the steps done, in order."""
     if n != 0:
         b.phy_power_down(n)
         return [f"BMCR[11] power-down P{n}"]
@@ -666,7 +681,7 @@ def hold_link_down(b, n):
     if not b.wait_eff_path(0, "idle"):
         raise RuntimeError("P0's EFF_PATH did not become idle within 0.2 s: MII loopback NOT set")
     steps.append("EFF_PATH P0 idle confirmed")
-    b.phy_loopback(0, True)                   # re-checks tx_into(0) itself
+    b.phy_loopback(0, True, lan_ok=lan_ok)    # re-checks tx_into(0) + LAN pair itself
     steps.append("BMCR[14] MII loopback P0")
     return steps
 
@@ -702,7 +717,7 @@ def cmd_test(b, args):
             lan_gate([f"P{n} is on the LAN pair {n // 2} (router-facing): its link loss "
                       "reaches the LAN" + (" and P0's method is MII loopback" if n == 0 else "")],
                      f"test linkdown P{n}", args.i_accept_lan_loop)
-        steps = hold_link_down(b, n)
+        steps = hold_link_down(b, n, lan_ok=args.i_accept_lan_loop)
         print(f"P{n}: copper link held down: " + ", ".join(steps))
     else:
         steps, ok = release_link_down(b, n)
@@ -1004,7 +1019,8 @@ class Propagator:
 
     def hold(self, n, now, reason):
         try:
-            steps = hold_link_down(self.b, n)
+            # the one LAN-pair loopback exception: P0's propagation hold (path idle first)
+            steps = hold_link_down(self.b, n, lan_ok=True)
         except RuntimeError as e:
             if n == 0 and self.b.pair_modes()[0] == "tap" and not self.b.phy_looped(0):
                 self.b.set_port_path(0, "fwd")
@@ -1542,7 +1558,7 @@ def cmd_mdio(b, args):
     val = parse_int(args.val)
     if reg == BMCR and val & BMCR_LOOPBACK and phy in PHY_ADDR:
         n = PHY_ADDR.index(phy)                # loop safety (no --force; see docstring)
-        lan_gate(loop_hazards(b, n), f"mdio P{n} BMCR 0x{val:04x} (bit 14 MII loopback)",
+        lan_gate(loop_hazards(b, n) + lan_loop_why(n), f"mdio P{n} BMCR 0x{val:04x} (bit 14 MII loopback)",
                  args.i_accept_lan_loop)
     b.mdio_wr(phy, reg, val)
 

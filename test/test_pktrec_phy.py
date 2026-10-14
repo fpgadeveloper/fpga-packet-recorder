@@ -30,8 +30,10 @@ run with --i-accept-lan-loop).
    -> path 0 fwd restored; P1 power-down cleared), a hand-set loopback and a
    hand-set power-down elsewhere are left alone.
 3b. loop safety: mdio BMCR[14] refused on a port that is forwarded into / in a
-   TAP pair (--force is no override, --i-accept-lan-loop is, with a warning) and
-   allowed on an idle port; mode tap / path fwd refused into a looped PHY (also
+   TAP pair (--force is no override, --i-accept-lan-loop is, with a warning),
+   refused on the LAN pair in every mode (pair 0 monitor + 'mdio p1 0 0x5140'
+   -> refused, BMCR unchanged; internal phy_loopback too) and allowed on an
+   idle pair-1 port; mode tap / path fwd refused into a looped PHY (also
    with --force); path loop refused in a TAP pair, on a looped PHY and on the
    LAN pair; gen refused on a looped port; test linkdown refused on P0/P1,
    P3 = power-down, P0 with the override = path idle then loopback, linkup
@@ -503,8 +505,24 @@ def test_safety():
     W.allow = False
     BOARD.mdio_wr(a1, 0, 0x1140)
     run(["mode", "0", "monitor"])
-    out = run(["mdio", "p1", "0", "0x5140"])
-    check("EXIT" not in out and bm(1) & 0x4000, "pair 0 monitor (paths idle): P1 MII loopback allowed")
+    out = run(["mdio", "p1", "0", "0x5140"])           # bench C, fix round 3: the exact case
+    check("EXIT" in out and "refused" in out and "LAN pair" in out and bm(1) == 0x1140,
+          "pair 0 monitor (paths idle): 'mdio p1 0 0x5140' refused (LAN pair), BMCR p1 unchanged")
+    out = run(["mdio", "p0", "0", "0x5140"])
+    check("EXIT" in out and "LAN pair" in out and not bm(0) & 0x4000,
+          "pair 0 monitor: 'mdio p0 0 0x5140' refused (LAN pair)")
+    try:
+        BOARD.phy_loopback(1, True)
+        ok = False
+    except RuntimeError as e:
+        ok = "LAN pair" in str(e)
+    check(ok and not bm(1) & 0x4000, "internal phy_loopback(P1) refused on the LAN pair")
+    run(["mode", "1", "monitor"])
+    out = run(["mdio", "p2", "0", "0x5140"])
+    check("EXIT" not in out and bm(2) & 0x4000, "pair 1 monitor (paths idle): P2 MII loopback allowed")
+    BOARD.mdio_wr(m.PHY_ADDR[2], 0, 0x1140)
+    W.renegotiate(2)
+    BOARD.mdio_wr(a1, 0, 0x5140)                        # P1 looped behind the tool's back
     st = json.loads(run(["status", "--json"]))
     check(st["ports"][1]["phy_loopback"] is True and st["ports"][2]["phy_loopback"] is False,
           "status --json: phy_loopback per port")
