@@ -48,10 +48,13 @@ Commands:
   sfd log <port> [--dir rx|tx] [--json]   pop the port's SFD log FIFO (needs --log on)
   gen <port> start [--size B] [--count N] [--ifg B | --rate PPS] [--raw] [--etype E]
              [--dst MAC] [--src MAC] [--stream ID] [--seq-first N] [--rand-mask M]
-             [--no-select]   start the port's generator (selects PATH gen unless --no-select)
+             [--no-select] [--force]   start the port's generator (selects PATH gen
+                         unless --no-select)
   gen <port> stop | status [--json]
   chk <port> start [--raw] [--etype E] | stop | status [--json]   receive checker
-  (--size is the wire size INCLUDING the FCS, like test/gen_seq.py: 64..16387)
+  (--size is the wire size INCLUDING the FCS, like test/gen_seq.py: 64..16387;
+  size + rand mask must not exceed the port's MAC TX_MAX_LEN, 1518 B by default,
+  or those frames go out error-terminated: refused unless --force)
   watch [--interval S] [--no-propagate] [--debounce S] [--grace S]
         [--no-0055-correction] [--skew-ns NS] [--json]
                          re-trigger the SGMII status word (CFG2[7] 0->1) whenever a
@@ -1334,6 +1337,22 @@ def cmd_gen(b, args):
         if not 64 <= size <= 16387:
             raise SystemExit("pktrec-phy: --size must be 64..16387 (wire size incl. FCS)")
         length = size - 4
+        # The MAC cuts frames above its TX_MAX_LEN (1518 B incl. FCS by default) and
+        # sends them error-terminated: the far end counts them as RX_BAD, silently from
+        # the generator's point of view (bench 2026-10-13: --rand-mask 0x5ff, up to
+        # 1599 B, gave ~7.8 % bad frames). Refuse unless --force.
+        tx_max = (b.eth_port(n, P_TX_MAX_LEN) & 0xFFFF) + 1
+        if tx_max <= 64:
+            tx_max = 1518                      # register not implemented: design default
+        biggest = size + (args.rand_mask or 0)
+        if biggest > tx_max:
+            msg = (f"--size {size}" + (f" + --rand-mask 0x{args.rand_mask:x}" if args.rand_mask else "")
+                   + f" gives frames up to {biggest} B, beyond P{n}'s TX_MAX_LEN {tx_max} B "
+                   "(incl. FCS): the MAC sends those error-terminated, the receiver counts them "
+                   "as bad frames")
+            if not args.force:
+                raise SystemExit(f"pktrec-phy: {msg}. Use a smaller size/mask, or --force")
+            print(f"WARNING: {msg}")
         ifg = args.ifg
         if args.rate:
             ifg = max(12, round(1e9 / 8 / args.rate) - (size + 8))
@@ -1440,7 +1459,12 @@ def main():
     q.add_argument("--src", help="default 02:00:00:00:00:0<port>")
     q.add_argument("--stream", type=parse_int, help="PRSQ stream id (default the port)")
     q.add_argument("--seq-first", type=parse_int, default=0)
-    q.add_argument("--rand-mask", type=parse_int, help="random extra length: size + (LFSR & mask)")
+    q.add_argument("--rand-mask", type=parse_int,
+                   help="random extra length: size + (LFSR & mask); size + mask must stay within "
+                        "the MAC's TX_MAX_LEN (1518 B by default)")
+    q.add_argument("--force", action="store_true",
+                   help="start even when size + mask exceeds TX_MAX_LEN (oversize frames go out "
+                        "error-terminated)")
     q.add_argument("--no-select", action="store_true", help="do not set PATH_CTRL to gen")
     q.add_argument("--bad", action="store_true",
                    help="send every frame error-terminated (bad-frame forwarding test, m0 map 1.2)")

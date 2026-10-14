@@ -405,6 +405,7 @@ def main():
     test_propagation()
     test_restart()
     test_skew()
+    test_gen()
     print(f"\n{'ALL PASSED' if not FAILS else str(len(FAILS)) + ' FAILED'}")
     for f in FAILS:
         print("  FAILED: " + f)
