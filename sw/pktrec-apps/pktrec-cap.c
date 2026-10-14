@@ -540,6 +540,11 @@ struct rec {
 	uint64_t bytes_last;
 	struct port_cnt pc_last[PKTREC_NUM_PORTS];
 	uint64_t bp_last;
+	/* BP_CYCLES when the stream ended (snapshot_counters): the fill phase after
+	 * it makes the counter run on with no traffic, so later stats use this */
+	uint64_t bp_stop;
+	double t_bp_stop;
+	bool have_bp_stop;
 	unsigned max_inflight;
 };
 
@@ -894,16 +899,26 @@ static void print_stats(struct rec *r, bool final)
 	int k, jk = 0;
 	unsigned i;
 	uint64_t drops = 0, bp;
-	double dp_hz = rd(&r->hw.cap, PKTREC_CAP_DP_CLK_HZ);
+	double dp_hz = rd(&r->hw.cap, PKTREC_CAP_DP_CLK_HZ), bp_dt = dt, bp_pct;
 
 	if (ioctl(r->dev, FDREC_IOC_GET_STATS, &st) < 0)
 		memset(&st, 0, sizeof(st));
 	bp = rd64(&r->hw.cap, PKTREC_CAP_BP_CYCLES_LO);
+	if (r->have_bp_stop) {
+		/* after the stream ended: back-pressure up to the end of the stream only
+		 * (the fill beats of the stop sequence wait for the recorder too, which
+		 * showed as 'bp 56-63 %' on the final line with no traffic) */
+		bp = r->bp_stop;
+		bp_dt = r->t_bp_stop - r->t_last;
+	}
+	bp_pct = bp_dt > 0 && dp_hz > 0 && bp >= r->bp_last ?
+		 100.0 * (double)(bp - r->bp_last) / (bp_dt * dp_hz) : 0.0;
+	if (bp_pct > 100.0)
+		bp_pct = 100.0;
 	k = snprintf(line, sizeof(line), "%7.1fs %7.1f MB/s %9.3f GB ring %2u/%u bp %4.1f%%",
 		     el, dt > 0 ? (r->bytes_written - r->bytes_last) / dt / 1e6 : 0,
 		     r->bytes_written / 1e9, st.bufs_ready + st.bufs_user,
-		     r->o.buffers,
-		     dt > 0 && dp_hz > 0 ? 100.0 * (double)(bp - r->bp_last) / (dt * dp_hz) : 0);
+		     r->o.buffers, bp_pct);
 	for (i = 0; i < PKTREC_NUM_PORTS; i++) {
 		struct port_cnt c;
 		char fps[16], bps[16];
@@ -942,9 +957,7 @@ static void print_stats(struct rec *r, bool final)
 			"\"drops\":%" PRIu64 ",\"ports\":{%s}}\n", final ? "true" : "false", el,
 			dt > 0 ? (r->bytes_written - r->bytes_last) / dt / 1e6 : 0.0,
 			r->bytes_written, r->bytes_written / 1e9, st.bufs_ready + st.bufs_user,
-			r->o.buffers,
-			dt > 0 && dp_hz > 0 ? 100.0 * (double)(bp - r->bp_last) / (dt * dp_hz) : 0.0,
-			drops, jports);
+			r->o.buffers, bp_pct, drops, jports);
 		fflush(r->sj);
 	}
 	r->t_last = now;
@@ -1006,6 +1019,9 @@ static void snapshot_counters(struct rec *r)
 		read_port(&r->hw, i, &r->pc[i]);
 	r->hdr->tb_stop_ns = rd64(&r->hw.cap, PKTREC_CAP_TB_NOW_LO);
 	r->hdr->stop_time_ns = realtime_ns();
+	r->bp_stop = rd64(&r->hw.cap, PKTREC_CAP_BP_CYCLES_LO);
+	r->t_bp_stop = now_s();
+	r->have_bp_stop = true;
 }
 
 /*
