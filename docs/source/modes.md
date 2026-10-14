@@ -150,6 +150,11 @@ state for pairs in TAP mode:
   the device on the other side sees its link come up for up to about 6 s, then go down again;
 * when the pair leaves TAP mode or the watcher stops, every port it holds is released.
 
+After every link-up the watcher also corrects the port's receive offset by −8 ns when the
+PHY's register `0x0055` is non-zero, but only on a port that resolved as 1000BASE-T master
+(the only case where the latency step was measured); a non-zero value on a slave is logged
+and not corrected.
+
 Every action, with its steps in order, is logged (`journalctl -u pktrec-phy-watch`).
 `--no-propagate` turns propagation off:
 
@@ -192,6 +197,9 @@ pair**. In practice:
 * `pktrec-phy gen <n> start` is refused on a port whose PHY is in loopback;
 * `pktrec-phy test linkdown` (simulated link loss) is refused on pair 0.
 
+On the pair that carries the network, any loopback (`mdio` with bit 14, `path loop`,
+`test linkdown`) is refused in every mode, also in monitor mode with both paths idle.
+
 `--force` never overrides these checks. `--i-accept-lan-loop` does, with a warning; use it only
 when nothing but test equipment is connected to the pair. Pair 0 is treated as the pair that
 carries the network (`PKTREC_LAN_PAIRS`, default `0`). `pktrec-phy safe` prints the loopback,
@@ -202,5 +210,5 @@ power-down, path and pair state of every port and flags any combination that ref
 sudo pktrec-phy safe
 ```
 
-The link watcher's own P0 hold is the one place that uses MII loopback on a pair in TAP mode;
+The link watcher's own P0 hold is the one place that uses MII loopback on the network pair;
 it reaches the safe state first (P0's path idle) and only then sets the loopback.
