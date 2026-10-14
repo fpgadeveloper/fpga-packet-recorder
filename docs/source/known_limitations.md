@@ -26,25 +26,42 @@
   is captured whole but with the bad-frame flag (counted in `RX_BAD`), and in TAP mode it
   leaves the other port cut at 1522 bytes and error-terminated. The limit is a per-port
   register: `pktrec-phy maxlen <port|all> --set <bytes>` raises it (up to 16383, e.g. 2000
-  for "baby jumbo" frames) and raises the dynamic inter-frame gap thresholds with it.
+  for "baby jumbo" frames) and raises the (experimental) dynamic inter-frame gap thresholds
+  with it.
   Frames above 1522 bytes have been checked in simulation only.
 * **Store-and-forward TAP.** The forwarding latency grows with the frame size: 8 ns per byte
   plus 917 ns (1.43 µs at 64 bytes, 13.06 µs at 1518 bytes). It is fixed for a given frame
   size, but it is not the constant latency of a cut-through or passive TAP. See
   [Port modes](modes.md#forwarding-latency).
-* **8-byte inter-frame gaps.** When a device on a TAP pair sends at full utilisation with a
-  faster clock than the board's, the TAP shortens the gap of the forwarded frames from 12 to
-  8 bytes until its buffer drains. IEEE 802.3 receivers must accept that, and the devices
-  tested did, but the far device can see shorter gaps than were sent. The forwarded traffic is
-  otherwise retimed by the board's transmit clock.
+* **A device faster than the board at sustained 100 % utilisation loses frames (counted).**
+  The TAP sends every frame with a gap of at least 12 bytes (13 after an odd-length frame) on
+  the board's own clock. A device whose clock is faster than the board's (up to +200 ppm),
+  or that sends odd-length frames back-to-back with exactly 12-byte gaps, can deliver more
+  than the board sends. The 16 KB forward buffer absorbs bursts of that; if it lasts, the
+  frames that no longer fit are dropped whole and counted in `DROP_FWD`, never lost
+  silently. Below 100 % utilisation nothing is dropped. The traffic is retimed by the board's
+  transmit clock, so the far device can see gaps different from those that were sent.
+* **No catch-up with shorter gaps.** The design can shorten the transmit gap while the
+  forward buffer is full (dynamic inter-frame gap, registers `IFG_CTRL` / `IFG_THRESH`), but
+  this is off by default and the reduced gap is 12 bytes: the DP83867 PHYs lose frames after
+  gaps below 12 bytes. Measured on 2026-10-14 (P2 to P0 of one board, line rate, 64-to-67-byte
+  frames): with a 12-byte gap all 15 854 447 frames arrived; with 11 bytes 4 055 good and 37
+  bad of 15 995 514; with 8 bytes 41 good and 258 bad of 16 594 129 (the PHY's FIFO depth
+  settings did not help). In a TAP, reduced-gap episodes (8 to 11 bytes) wiped out traffic far
+  beyond the episodes (6 403 to 23 815 of 15.5 million frames arrived). `pktrec-phy ifg`
+  refuses a gap below 12 bytes unless `--i-know-the-phy-drops-frames` is given (experiments
+  with other PHYs only).
 * **Errored frames are not forwarded bit-exact.** A frame received with a bad FCS is forwarded
   with an error code in place of the FCS: the far device sees a receive error, not the same
   bytes and FCS. The original FCS is never captured (`if_fcslen` = 0).
 * **Link-state propagation** takes a few seconds: 0.5 s debounce, then auto-negotiation; a
   partner whose device is gone sees its link come up for up to about 6 s before it is taken
   down again. P1 to P3 are held down by PHY power-down; P0, whose PHY clocks the other three
-  and must not be powered down, is held by MII loopback after its path has been set idle.
-  This method has not been measured on hardware yet.
+  and must not be powered down, is held by MII loopback (with auto-negotiation off) after its
+  path has been set idle. Measured on 2026-10-14: P0's link lost → P1 held 0.51 s later →
+  the far device on P1 saw its link go down 0.26 s after that. The P0 hold was verified in
+  an earlier form that kept the copper link up (auto-negotiation still on); the corrected
+  P0 hold has not been measured on hardware yet.
 * **Loopback and TAP forwarding are mutually exclusive.** A PHY or path loopback on a port that
   is forwarded into reflects the far device's traffic back to it; on the pair that carries the
   network this stops the whole network (it has happened on a test bench). `pktrec-phy` refuses

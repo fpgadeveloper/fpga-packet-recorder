@@ -98,10 +98,55 @@ corrupted frames.
 
 The CPU never touches the frame data during a capture.
 
-## TAP forwarding latency
+## TAP forwarding
 
-See [Port modes](modes.md#forwarding-latency): 8 ns × frame length + 917 ns, ± 15 ns
-(1.43 µs at 64 bytes, 13.06 µs at 1518 bytes).
+**Latency.** See [Port modes](modes.md#forwarding-latency): 8 ns × frame length + 917 ns,
+± 15 ns (1.43 µs at 64 bytes, 13.06 µs at 1518 bytes), measured with a router and a PC as the
+two devices.
+
+**Bench measurements, 2026-10-14.** ZCU106 + Ethernet FMC Max, one board: pair 0 (P0/P1) in
+TAP mode, P2 cabled to P0 and P3 to P1, so the P2 and P3 hardware generators are the two
+devices and their checkers count what arrives. Generators at line rate (12-byte gaps) in
+both directions at the same time, 802.1Q-tagged sequence frames (VID 100), counters cleared
+before each run. Bitstream of 2026-10-14 13:32 (the TAP's MACs still with deficit idle
+count, see the note below).
+
+| Traffic, both directions | Duration | Frames P2→P3 / P3→P2 | Lost / errors / bad | DROP_FWD | Forward FIFO max |
+|--------------------------|----------|----------------------|---------------------|----------|------------------|
+| 66 B (smallest tagged) | 60 s | 89 665 573 / 89 405 816 | 0 / 0 / 0 | 0 | 62 B |
+| 1518 B | 60 s | 5 002 562 / 5 009 319 | 0 / 0 / 0 | 0 | 1514 B |
+| 498 to 1521 B random | 60 s | 7 443 343 / 7 442 525 | 0 / 0 / 0 | 0 | 1518 B |
+| 67 B (odd, fixed) | 30 s | 44 483 589 / 44 440 704 | 0 / 0 / 0 | 0 | 64 B |
+| **66 B soak** | **10 min** | **874 012 663 / 874 080 371** | **0 / 0 / 0** | **0** | 62 B |
+
+In every run the frames received on one TAP port equalled the frames transmitted on the
+other, exactly. With mixed odd and even lengths (66 to 1089 bytes random, or 66/67
+alternating) 2.5 × 10⁻⁵ to 3 × 10⁻⁴ of the frames were lost on the cable after the TAP
+(the TAP itself forwarded every frame): the MACs' deficit idle count sent 11-byte gaps after
+some odd-length frames and the receiving DP83867 dropped frames after them. The MACs are
+built without deficit idle count since then (every gap ≥ 12 bytes, checked in simulation);
+the mixed-length runs on hardware are pending.
+
+* **Forwarding with capture:** 29 000 000 × 66 B each way (1.45 million frames/s per port)
+  and 1 600 000 × 1518 B each way, forwarded at line rate while P0 and P1 were captured:
+  every frame forwarded and captured, 0 capture drops, the exported pcapng files complete
+  and in order (`check_pcap`).
+* **Latency** (300 frames per size and direction, one frame in flight): 8 ns × frame length
+  + 933 to 936 ns in both directions (64 B: 1446 ns, 1518 B: 13 077 ns median), jitter
+  ±13 ns; 16 to 19 ns more than with the router and PC, the same at every size.
+* **Link-state propagation:** P2's link taken down → P0 lost its link → P1 held down
+  0.505 to 0.515 s later (0.5 s debounce) → P3 saw its link go down 0.255 to 0.258 s after
+  that (5 of 5). When P2 came back, all four links were up again 6.9 to 7.4 s later. The
+  opposite direction (P0 held) needed a fix (MII loopback with auto-negotiation off) that is
+  in the image but has not been re-measured.
+* **Errored frames:** 1000 frames of 128 bytes sent error-terminated by the P2 generator → P0 counted 1000 receive
+  errors, P3 received 1000 bad frames and 0 good ones; 1 000 000 at line rate (66 bytes):
+  P0 and P3 receive errors both +1 000 000 exactly. Captured on P0, all 1000 records carry
+  the bad-frame flag, and the exported pcapng marks them as CRC errors.
+* **Inter-frame gap below 12 bytes** (P2 to P0, monitor mode, generator at line rate):
+  12-byte gap 15 854 447 sent, all received; 11 bytes: 15 995 514 sent, 4 055 good and 37
+  bad received; 8 bytes: 16 594 129 sent, 41 good and 258 bad. Hence the TAP never sends a
+  gap below 12 bytes (see [Known limitations](known_limitations)).
 
 ## Timestamp accuracy
 

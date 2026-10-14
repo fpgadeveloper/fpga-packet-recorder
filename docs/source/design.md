@@ -108,7 +108,13 @@ used unmodified):
 * The 64-bit MAC timestamp inputs are fed by the capture block's timebase (see
   [Timebase](#timebase)).
 * The transmit inter-frame gap of each MAC comes from `pktrec_m0_path` (`EXT_TX_IFG` = 1), for
-  the dynamic inter-frame gap of TAP mode.
+  the (experimental) dynamic inter-frame gap of TAP mode; it is 12 bytes by default.
+* The MACs are built without deficit idle count (`DIC_EN` = 0): every transmit gap is at
+  least the configured gap, 12 bytes after a frame of even length and 13 after a frame of
+  odd length (the 16-bit datapath starts a frame on lane 0 only). With deficit idle count
+  the MAC averages 12 bytes by sending 11 after some odd-length frames when the next frame
+  is already waiting, as it is when the forward FIFO feeds it, and the DP83867 loses frames
+  after gaps below 12 bytes (bench, 2026-10-14).
 
 ### Port paths (`pktrec_m0_path`)
 
@@ -137,16 +143,25 @@ used unmodified):
 * It reads back the PHY GPIO pins (SFD indications) and the card's power-good signals and
   counts the rising edges of the GPIO pins.
 
-**Dynamic inter-frame gap.** Per transmit port, the gap is `IFG_NOM` (12 bytes) normally and
-`IFG_MIN` (8 bytes) while the forward FIFO holds more than `IFG_HI` (3072 bytes), until it
-falls below `IFG_LO` (2048 bytes). The two devices on a TAP pair transmit with their own
-clocks (±100 ppm), the board with its own: if a device sends at 100 % utilisation and its
-clock is faster, frames arrive faster than they can be sent (at a +200 ppm worst case, 25 KB
-per second). Saving 4 bytes per frame catches up 0.26 % (2600 ppm) with 1518-byte frames and
-4.8 % with 64-byte frames. The FIFO fill includes the frame being received, so `IFG_LO` must
-stay above the largest frame: 2048 bytes leaves more than 500 bytes over the MACs' 1522-byte
-limit, and `pktrec-phy maxlen --set` raises both thresholds when it raises the limit. Below
-100 % utilisation the gap stays at 12 bytes.
+**Clock mismatch and the forward FIFO.** The two devices on a TAP pair transmit with their
+own clocks (±100 ppm), the board with its own: if a device sends at 100 % utilisation and
+its clock is faster, frames arrive faster than they can be sent (at a +200 ppm worst case,
+25 KB per second). The same holds for odd-length frames sent back-to-back with 12-byte gaps,
+which the board sends with 13-byte gaps. The 16 KB forward FIFO absorbs such bursts; when
+the excess lasts, the frames that do not fit are dropped whole and counted (`DROP_FWD`).
+There is no catch-up: a gap shorter than 12 bytes is the only way to send faster at the same
+nominal rate, and the DP83867 loses frames after such gaps (measured 2026-10-14: at 11 bytes
+4 055 of 16.0 million frames arrived, at 8 bytes 41 of 16.6 million).
+
+**Dynamic inter-frame gap (experimental, off by default).** Per transmit port, the gap is
+`IFG_NOM` (12 bytes) normally and `IFG_MIN` while the forward FIFO holds more than `IFG_HI`
+(3072 bytes), until it falls below `IFG_LO` (2048 bytes). Since register map 1.6 the enable
+bit resets to 0 and `IFG_MIN` to 12, so the logic does nothing unless an experiment turns it
+on (`pktrec-phy ifg --min <n> --enable on`, which refuses `n` < 12 without
+`--i-know-the-phy-drops-frames`). The FIFO fill includes the frame being received, so
+`IFG_LO` must stay above the largest frame: 2048 bytes leaves more than 500 bytes over the
+MACs' 1522-byte limit, and `pktrec-phy maxlen --set` raises both thresholds when it raises
+the limit.
 
 **Traffic generator and checker.** Each port has a generator (`pktrec_gen`, path GEN) and a
 receive checker (`pktrec_gen_chk`):
@@ -334,7 +349,7 @@ Port n (`0x100 + n*0x40`):
 | Offset | Name | Description |
 |--------|------|-------------|
 | `0x000` | ID | `0x504B4D30` ("PKM0") |
-| `0x004` | VERSION | `0x00010004` |
+| `0x004` | VERSION | `0x00010006` (1.5: checker counts untagged PRSQ frames; 1.6: IFG_CTRL reset 0x000C0C00) |
 | `0x008` | PATH_CTRL | [2n+1:2n] transmit source of port n: 0 IDLE, 1 LOOP, 2 FWD, 3 GEN |
 | `0x00C` | CNT_CTRL | write 1: clear all counters and IO_STICKY |
 | `0x010` | IO_STATUS | [3:0] GPIO_0, [7:4] GPIO_1, [8] PG_1V0, [9] PG_2V5, [19:16] link up |
@@ -357,7 +372,7 @@ Port n (`0x100 + n*0x40`):
 | `+0x14` | DROP_FWD | frames dropped by the forward FIFO |
 | `+0x18` | GPIO0_EDGES | rising edges of GPIO_0 (receive SFD) |
 | `+0x1C` | GPIO1_EDGES | rising edges of GPIO_1 (transmit SFD) |
-| `+0x20` | IFG_CTRL | [0] dynamic gap enable (1), [15:8] IFG_NOM (12), [23:16] IFG_MIN (8) |
+| `+0x20` | IFG_CTRL | [0] dynamic gap enable (0), [15:8] IFG_NOM (12), [23:16] IFG_MIN (12); reset 0x000C0C00 since map 1.6 (was 0x00080C01) |
 | `+0x24` | IFG_THRESH | [15:0] IFG_HI (3072), [31:16] IFG_LO (2048), bytes of forward FIFO fill |
 | `+0x28` | FWD_FILL | [15:0] forward FIFO fill now, [31:16] maximum since the last clear |
 | `+0x2C` | IFG_STATUS | [0] reduced gap active, [15:8] gap in use |
@@ -490,7 +505,7 @@ The custom RTL has self-checking testbenches in `Vivado/src/sim/` (run with
 |-----------|--------|
 | `tb_pktrec_m0_path` | IDLE/LOOP/FWD paths, whole-frame drops and counters |
 | `tb_pktrec_gen` | generator frames byte for byte against a `gen_seq.py` model, line-rate and IFG spacing, random lengths, count, stop; 802.1Q-tagged frames (1522 bytes, minimum 62 + FCS, raw); checker loss, duplicate and bad counts, tagged and untagged, also on a MAC-like receive stream with random `tvalid` gaps and back-to-back frames. `Vivado/scripts/sim_netlist.tcl` runs the same testbench on the synthesized checker netlist |
-| `tb_pktrec_tap` | real Taxi 1000BASE-X MAC/PCS on both sides of a pair at 100 % utilisation: bad-frame propagation (130 of 400 frames flagged bad exactly), the dynamic gap's hysteresis, clock mismatch (source +4 % fast: 9000 of 9000 frames with the dynamic gap, 75 dropped and counted without it), 12 mode switches mid-traffic with no corrupted, truncated or reordered frame; 1522-byte tagged frames received and forwarded good both ways; 1523- and 1600-byte frames flagged bad and cut at the limit; simulated forwarding latency 8 ns × frame length + 223 ns |
+| `tb_pktrec_tap` | real Taxi 1000BASE-X MAC/PCS on both sides of a pair at 100 % utilisation: bad-frame propagation (130 of 400 frames flagged bad exactly), the (experimental) dynamic gap's hysteresis, clock mismatch (source +4 % fast: 75 of 9000 frames dropped and counted with the default settings, none with the experimental 8-byte gap), back-to-back mixed odd/even lengths (66/67 B alternating, 66 to 1089 B random) at 100 % in both directions with every wire gap measured: all ≥ 12 B (12 after even, 13 after odd lengths) with the MACs' `DIC_EN` = 0; compiled with `SIM_DEFINES=PKTREC_TB_DIC_EN` (the old `DIC_EN` = 1) the test fails on 11-byte gaps, 12 mode switches mid-traffic with no corrupted, truncated or reordered frame; 1522-byte tagged frames received and forwarded good both ways; 1523- and 1600-byte frames flagged bad and cut at the limit; simulated forwarding latency 8 ns × frame length + 223 ns |
 | `tb_pktrec_cap_port` | headers, data and padding of every record, snap length, whole-frame drops under back-pressure with exact counters and sequence gaps, port enable, minimum-size frames at line rate, timestamp conversion across the cycle counter wrap |
 | `tb_pktrec_cap_merge` | whole records only, per-port order, round-robin fairness, fill, soft-reset cut |
 | `tb_pktrec_timebase` | increment, set, adjust, rate change, the delay window of the cycle-count copies at +125 / −250 ppm |

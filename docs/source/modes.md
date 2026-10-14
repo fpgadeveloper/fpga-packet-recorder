@@ -45,13 +45,19 @@ forwarding happens entirely in the fabric, never through Linux.
   as received, with its bad-frame flag.
 * **Latency:** the forwarding is store-and-forward: a frame is sent once it has been received
   completely, so the delay grows with the frame size (8 ns per byte, see the table below).
-* **Inter-frame gap:** normally 12 bytes. When a device sends at full utilisation with a
-  clock that is faster than the board's, the forward buffer fills up; above 3072 bytes the
-  transmitter shortens the gap to 8 bytes until the buffer is below 2048 bytes again
-  (dynamic inter-frame gap). IEEE 802.3 receivers must accept gaps down to 8 bytes.
-* **Frames are never cut.** Frames that do not fit in the 16 KB forward buffer are dropped
-  whole and counted (`DROP_FWD`), which can only happen when the traffic exceeds what the
-  dynamic gap can absorb.
+* **Inter-frame gap:** at least 12 bytes, always: 12 bytes after a frame of even length,
+  13 bytes after a frame of odd length (the transmitter starts frames on a 2-byte boundary).
+  The board never sends a shorter gap, because the Ethernet FMC Max's PHYs (DP83867) lose
+  frames after gaps shorter than 12 bytes (see [Known limitations](known_limitations)).
+* **Sustained overload is dropped and counted, never lost silently.** The forward buffer
+  holds 16 KB, so bursts that arrive faster than the board can send them are absorbed. A
+  device that sends faster than the board for longer, i.e. at a sustained 100 % utilisation
+  with a clock faster than the board's (up to +200 ppm between two devices: 25 KB per
+  second), or back-to-back odd-length frames with 12-byte gaps (one byte per odd-length
+  frame more than the board sends), fills the buffer; the frames that no longer fit are
+  dropped whole and counted in `DROP_FWD` (`pktrec-phy counters`, `pktrec-phy ifg`).
+* **Frames are never cut.** A frame is either forwarded complete or dropped whole and
+  counted.
 * **Link state** is propagated: when one device's link goes down, the board takes the link to
   the other device down too (see [Link-state propagation](#link-state-propagation)).
 
@@ -69,8 +75,13 @@ indications with the calibration applied. Both directions agreed within 3 ns.
 
 That is **8 ns × frame length + 917 ns, ± 15 ns**: the frame time (store-and-forward), 223 ns
 of MAC/FIFO/PCS pipeline (from simulation) and 694 ns for the two PHYs, the SGMII links and
-the transceivers. When the dynamic inter-frame gap is active, a backlog of up to 3 KB
-(about 25 µs) can add to it.
+the transceivers. When a device sends faster than the board (see above), the backlog in the
+forward buffer adds to it: up to 16 KB, about 131 µs.
+
+Measured again on 2026-10-14 with P2 and P3 of the same board as the two devices (re-cabled
+bench, P2 to P0 and P3 to P1): the same 8 ns per byte, a constant of 933 to 936 ns in both
+directions (jitter ±13 ns). The 16 to 19 ns difference to the router/PC setup is the same at
+all sizes and is attributed to the partner PHYs; see [Performance](performance.md#tap-forwarding).
 
 You can measure it on your own setup with `pktrec-phy latency` (see
 [Software](software.md#pktrec-phy)).
@@ -80,11 +91,13 @@ You can measure it on your own setup with `pktrec-phy latency` (see
 Measured on 2026-10-13, pair 0 inline between a router and a PC: 1518-byte frames at
 973 Mb/s from the router side and 848 Mb/s from the PC side at the same time (the most the
 traffic sources produced), captured on both ports for 40 s: counters symmetric (every frame
-received on one port was transmitted on the other), 0 forwarding drops, 0 capture drops. The
-dynamic inter-frame gap did not engage: the router's traffic never arrived faster than the
-board sent it. Separately, 8-byte gaps were sent from the board's generator to the router
-(20 000 × 1518 B) and between two DP83867s (10 000 000 × 64 B): every frame was received
-without error.
+received on one port was transmitted on the other), 0 forwarding drops, 0 capture drops.
+
+Measured on 2026-10-14 with the board's own generators as the two devices, both directions
+at line rate at the same time: 66-byte, 1518-byte and random 498 to 1521-byte frames forwarded
+without loss, a 10-minute soak at 66 bytes (874 million frames each way) without a single
+lost, corrupted or dropped frame, and line-rate forwarding with both ports captured at the
+same time; see [Performance](performance.md#tap-forwarding).
 
 ## Switching modes
 

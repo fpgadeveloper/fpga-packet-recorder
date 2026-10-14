@@ -17,7 +17,8 @@ Yocto / EDF 2025.2 flow.
   timebase; SFD timestamping with 1 ns ISERDES sampling, matching to frames, MAC fallback and
   flags.
 * TAP mode: per-pair TAP/monitor modes, store-and-forward forwarding with errored-frame
-  propagation, dynamic inter-frame gap, clean mode switching, 1000BASE-T-only advertisement,
+  propagation, inter-frame gap of at least 12 bytes (no deficit idle count; counted drops
+  when a partner sends faster than the board), clean mode switching, 1000BASE-T-only advertisement,
   link-state propagation (MII loopback of the partner PHY), per-link-up correction of the PHY's
   receive latency step (register `0x0055`).
 * Replay (register map 1.0): record parser, 128 KB frame store, hardware scheduler (original

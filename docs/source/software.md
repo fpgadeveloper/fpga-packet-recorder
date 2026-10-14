@@ -55,7 +55,7 @@ Most commands accept `--json`.
 | `pktrec-phy maxlen <port\|all> [--set B]` | the MACs' maximum frame length including the FCS (1522 by default); `--set` changes it for RX and TX and raises the dynamic inter-frame gap thresholds to stay above it |
 | `pktrec-phy gen <port> stop\|status` | stops it / shows its counters |
 | `pktrec-phy chk <port> start\|stop\|status` | receive checker for generator traffic: frames, lost, duplicates or reordered, bad |
-| `pktrec-phy ifg <port\|all> [...]` | dynamic inter-frame gap settings and counters of the TAP forward path, forward FIFO fill, flushed frames |
+| `pktrec-phy ifg <port\|all> [...]` | inter-frame gap of the TAP forward path (12 bytes; the experimental dynamic gap is off), forward FIFO fill, `DROP_FWD`, flushed frames; a gap below 12 bytes is refused unless `--i-know-the-phy-drops-frames` (the DP83867 loses frames after it) |
 | `pktrec-phy latency --pair P [--count N]` | TAP forwarding latency per direction from the SFD logs (needs paced traffic: one frame in flight) |
 | `pktrec-phy watch [--no-propagate] [--debounce S] [--grace S]` | the link watcher (normally run by the service) |
 | `pktrec-phy mdio <phy> <reg> [val]` | raw PHY register access (`p0`..`p3` or the MDIO address; registers above 0x1F through the extended-register window) |
