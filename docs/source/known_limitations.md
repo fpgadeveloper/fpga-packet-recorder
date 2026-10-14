@@ -54,25 +54,29 @@
 * **Errored frames are not forwarded bit-exact.** A frame received with a bad FCS is forwarded
   with an error code in place of the FCS: the far device sees a receive error, not the same
   bytes and FCS. The original FCS is never captured (`if_fcslen` = 0).
-* **Link-state propagation** takes a few seconds: 0.5 s debounce, then auto-negotiation; a
-  partner whose device is gone sees its link come up for up to about 6 s before it is taken
-  down again. P1 to P3 are held down by PHY power-down; P0, whose PHY clocks the other three
-  and must not be powered down, is held by MII loopback (with auto-negotiation off) after its
-  path has been set idle. Measured on 2026-10-14: P0's link lost → P1 held 0.51 s later →
-  the far device on P1 saw its link go down 0.26 s after that. The P0 hold was verified in
-  an earlier form that kept the copper link up (auto-negotiation still on); the corrected
-  P0 hold has not been measured on hardware yet.
+* **Link-state propagation is not instant.** The far device sees its link go down about
+  0.8 s after the other device's link went (0.5 s debounce plus the PHY), and the links come
+  back about 7 s after the loss ends (auto-negotiation on both sides). A partner whose device
+  is gone sees its link come up for up to about 6 s before it is taken down again. P1 to P3
+  are held down by PHY power-down; P0, whose PHY clocks the other three and must not be
+  powered down, is held by MII loopback (with auto-negotiation off) after its path has been
+  set idle. See [Port modes](modes.md#link-state-propagation) for the measured times.
+* **Back-to-back odd-length frames are forwarded about 1 % slower.** The gap after an
+  odd-length frame is 13 bytes instead of 12 (see above), so 66/67-byte traffic at line rate
+  carries about 1 % fewer frames than 66-byte traffic.
 * **Loopback and TAP forwarding are mutually exclusive.** A PHY or path loopback on a port that
   is forwarded into reflects the far device's traffic back to it; on the pair that carries the
-  network this stops the whole network (it has happened on a test bench). `pktrec-phy` refuses
-  every such combination (see [Loop safety](modes.md#loop-safety)); raw extended-register
-  writes through `mdio <port> 0x0d/0x0e` are not checked.
+  network this stops the whole network. `pktrec-phy` refuses every such combination, and on
+  the pair that carries the network (pair 0 by default) it refuses every loopback, in any
+  mode, unless `--i-accept-lan-loop` is given (see [Loop safety](modes.md#loop-safety)); raw
+  extended-register writes through `mdio <port> 0x0d/0x0e` are not checked.
 
 ## Timestamps
 
 * **Absolute time is bounded by NTP.** The timebase follows the board's system clock closely,
-  but the system clock is only as accurate as its NTP synchronisation; a 25 ms error was
-  measured 35 minutes after boot with `systemd-timesyncd` as the NTP client. Relative timing between frames
+  but the system clock is only as accurate as its NTP synchronisation: with the image's
+  `chrony`, 1.1 to 1.4 ms against an NTP-synchronised PC was measured (the PC's own error
+  limited that measurement); with `systemd-timesyncd`, 25 ms. Relative timing between frames
   and ports is not affected. See [Timestamping](timestamping.md#timebase-and-absolute-time).
 * **No PTP hardware clock.** The timebase is not exposed as a Linux PTP clock (`/dev/ptpN`)
   and cannot be synchronised by PTP.
@@ -91,6 +95,10 @@
 * **Export speed.** `pktrec-export` converts about 400 000 records per second on one CPU core
   of the board, so a long capture of small frames takes longer to convert or download than it
   took to record.
+* **The Python checker is slow on the board.** `pktrec-check-pcap` (`check_pcap.py`) checks
+  about 6 500 records/s on the board's CPU: hours for a line-rate capture. Use
+  `pktrec-export --check` on the board or `check_pcap.py` on a PC instead (see
+  [Testing](testing.md#checking-large-captures)).
 * **No capture filters or triggers.** Every frame of an enabled port is captured; snap length
   and port enables are the only ways to reduce the data. There is no hardware filtering by
   EtherType, VLAN or address, and no trigger-based or ring-buffer capture.

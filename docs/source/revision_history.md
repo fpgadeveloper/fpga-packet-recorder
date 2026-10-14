@@ -1,6 +1,6 @@
 # Revision history
 
-## v1.0 (2025.2, in development)
+## v1.0 (2025.2)
 
 Initial version of the FPGA Packet Recorder for the ZCU106 (`zcu106`), with the Ethernet FMC
 Max on HPC0 and the FPGA Drive FMC Gen4 on HPC1, built with Vivado / Vitis 2025.2 and the
@@ -10,8 +10,9 @@ Yocto / EDF 2025.2 flow.
   for SSD slot 1; the FPGA Drive Recorder datapath (`fdrec_core` 1.2, AXI DMA) with a second,
   back-pressured source for the capture records.
 * Ethernet ports: four SGMII ports with the Taxi 1G MAC/PCS and low-latency transceiver
-  wrapper (receivers in LPM mode); per-port transmit paths (idle, loopback, forward,
-  generator, replay); hardware traffic generator and checker on every port.
+  wrapper (receivers in LPM mode), transmit MACs without deficit idle count (every gap at
+  least 12 bytes); per-port transmit paths (idle, loopback, forward, generator, replay);
+  hardware traffic generator and checker on every port (port register map 1.6).
 * Capture (register map 1.2): per-port 16 KB frame FIFOs with whole-frame drop counting,
   snap length, port enables, record format v1, 4:1 whole-record merge; 64-bit nanosecond
   timebase; SFD timestamping with 1 ns ISERDES sampling, matching to frames, MAC fallback and
@@ -23,10 +24,15 @@ Yocto / EDF 2025.2 flow.
   receive latency step (register `0x0055`).
 * Replay (register map 1.0): record parser, 128 KB frame store, hardware scheduler (original
   timing, scaled, fixed gap, back to back), lateness and underrun counters.
-* Software: `pktrec-cap`, `pktrec-export` (streaming pcapng), `pktrec-replay`, `pktrec-phy`,
+* Software: `pktrec-cap`, `pktrec-export` (streaming pcapng, optional sequence check of
+  test traffic with `--check`), `pktrec-replay`, `pktrec-phy` (with loop-safety checks),
   `pktrec-tb` (timebase discipline to NTP, persistent calibration), `pktrec-web` (web
-  interface and JSON API), the image's services (PHY init and link watcher, SSD mount,
-  calibration, timebase, web server, console banner).
-* Test tools in `test/` and self-checking RTL testbenches.
+  interface and JSON API, light and dark theme, per-pair connectivity figures), the image's
+  services (PHY init and link watcher, SSD mount, calibration, timebase, web server,
+  console banner).
+* Image: `chrony` as the NTP client; the board's Ethernet port uses the MAC address from
+  the ZCU106 EEPROM; SSH server with SFTP (plain `scp` works).
+* Test tools in `test/`, self-checking RTL testbenches and a post-synthesis netlist
+  simulation of the receive checker.
 * Documentation: this site, with the measured performance, timestamp accuracy, TAP latency
   and replay accuracy.

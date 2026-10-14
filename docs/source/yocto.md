@@ -60,8 +60,8 @@ comes from the design itself. The bitstream is embedded in `BOOT.BIN` and progra
 FSBL at boot. On top of the EDF defaults, three layers are added:
 
 * **`Yocto/bsp/zcu106`**: board fixups in `system-user.dtsi` (UART numbering; the TI DP83867
-  PHY of the board's RJ45 port with its RGMII delays and a fixed MAC address; the `fdrec`
-  driver node), the kernel command line and the hostname `zcu106-pktrec-2025-2`.
+  PHY of the board's RJ45 port with its RGMII delays; the board EEPROM, from which U-Boot
+  reads the board's MAC address; the `fdrec` driver node), the kernel command line and the hostname `zcu106-pktrec-2025-2`.
 * **`Yocto/meta-fdrec`**: the recorder layer of the FPGA Drive Recorder: the `fdrec.ko`
   kernel module, `fdrec` / `fdplay` / `fdverify` / `fdsetup-raid0.sh`, the kernel options
   (AXI DMA, hugepages, io_uring, XFS) and tools (`nvme-cli`, `fio`, `xfsprogs`, `ethtool`,
@@ -75,6 +75,7 @@ FSBL at boot. On top of the EDF defaults, three layers are added:
   | `pktrec-tb` | `pktrec-tb`, `pktrec-tb.service` (timebase discipline), `pktrec-calibration.service` and `/etc/pktrec/calibration.conf` |
   | `pktrec-web` | `pktrec-web`, `pktrec-web.service`, `pktrec-banner.service` (the URL on the console) |
   | `pktrec-test` | `pktrec-pktgen`, `pktrec-check-pcap`, `pktrec-pcapng-lint` |
+  | image bbappend | the recipes above, `chrony` (NTP client) and `openssh-sftp-server` |
   | `linux-xlnx` bbappend | generic UIO driver for the capture register blocks |
 
 The register blocks of the Ethernet ports, the capture block and the replay block are bound

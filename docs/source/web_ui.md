@@ -68,9 +68,24 @@ line: the back end of each port points straight at the SSD with a purple arrow, 
 port only receives and records. The mode name is shown under the figure, a legend under
 that, and hovering over a part of the figure explains it.
 
+```{figure} images/web_ui_pairs_light.png
+:alt: Port cards and pair cards of the web interface, light theme
+:width: 100%
+
+Port and pair cards: P0/P1 in TAP mode with both links up, P2/P3 in monitor mode with no link
+on P3 (light theme).
+```
+
 **Theme.** The page follows the light or dark setting of your system. The sun/moon button
 in the header switches between light and dark; the browser remembers that choice for this
 board's address (in `localStorage`).
+
+```{figure} images/web_ui_pairs_dark.png
+:alt: The same cards in the dark theme
+:width: 100%
+
+The same cards in the dark theme.
+```
 
 **Timebase.** The line under the pairs shows the state of the timebase discipline
 (`pktrec-tb`, see [Timestamping](timestamping.md#timebase-and-absolute-time)):

@@ -10,11 +10,13 @@ packet capture and replay tool.
   captured in the fabric and recorded to an NVMe SSD with the zero-copy datapath of the
   [FPGA Drive Recorder](https://github.com/fpgadeveloper/fpga-drive-recorder): the CPU never
   touches the frame data. Four ports at line rate were recorded without a single drop at
-  every frame size. Any drop is counted per port and reported, never silent.
+  every frame size, and 30-minute captures of 313 million frames without loss. Any drop is
+  counted per port and reported, never silent.
 * **Hardware timestamps with 1 ns resolution**, from the PHYs' start-of-frame-delimiter
   signals, on one 64-bit nanosecond timebase shared by all ports and disciplined to NTP.
 * **TAP or monitor mode per port pair, at run time.** In TAP mode a pair (P0/P1, P2/P3) sits
-  inline in a link and forwards both directions in the fabric while capturing them; in
+  inline in a link and forwards both directions in the fabric while capturing them
+  (store-and-forward, 1.4 µs at 64 bytes, lossless at line rate in both directions); in
   monitor mode every port is a receive-only input, for example from a switch SPAN port.
 * **Web interface** on the board's own Ethernet port: port status, mode, start/stop, live
   statistics, and downloads as **pcapng** that open directly in Wireshark (one interface per
@@ -31,9 +33,10 @@ Important links:
 
 * Datasheet for the [Ethernet FMC Max]
 * Datasheet for the [FPGA Drive FMC Gen4]
-* The user guide for this reference design is in [`docs/`](docs/source) (Sphinx sources for
-  Read the Docs): start with the [description](docs/source/description.md) and
-  [getting started](docs/source/getting_started.md)
+* The user guide for this reference design is in [`docs/`](docs/source): start with the
+  [description](docs/source/description.md) and [getting started](docs/source/getting_started.md).
+  The pages are Sphinx (MyST Markdown) sources and read well on GitHub; to build the HTML
+  site locally, see [docs/README.md](docs/README.md)
 * To report a bug: [Report an issue](https://github.com/fpgadeveloper/fpga-packet-recorder/issues "Report an issue").
 * For technical support: [Contact Opsero](https://opsero.com/contact-us "Contact Opsero").
 
@@ -106,13 +109,18 @@ image needs a native Linux machine. See the [build instructions](docs/source/bui
 1. Write `rootfs.wic.xz` to a micro SD card and copy `BOOT.BIN` to its first (FAT) partition
    (see [Yocto](docs/source/yocto.md#boot-from-sd-card)); set SW6 to SD boot.
 2. Connect the ZCU106's own RJ45 port to a network with DHCP, and the USB-UART to a PC
-   (115200 baud). Power up.
+   (115200 baud). Power up. The port uses the MAC address from the board's EEPROM (U-Boot
+   prints it); reserve it in your DHCP server for a fixed address.
 3. Format the SSD once: log in as `amd-edf` and run `sudo fdsetup-raid0.sh --single /dev/nvme0n1`
    (erases the SSD).
 4. Open the URL printed on the console (`pktrec web UI: http://<board-ip>:8080/`), choose the
    mode of each pair, start a capture, and download it as pcapng.
+5. Or use the command line over SSH (`ssh amd-edf@<board-ip>`): `pktrec-phy` (ports and
+   modes), `pktrec-cap` (capture), `pktrec-export` (pcapng), `pktrec-replay`; files copy
+   with `scp`.
 
-See [getting started](docs/source/getting_started.md).
+See [getting started](docs/source/getting_started.md). The prebuilt boot image zip (from
+`./build.sh package`) contains `rootfs.wic.xz`, its `.bmap`, `BOOT.BIN` and a readme.
 
 ## License
 

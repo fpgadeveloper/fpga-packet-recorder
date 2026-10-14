@@ -108,8 +108,9 @@ two devices.
 TAP mode, P2 cabled to P0 and P3 to P1, so the P2 and P3 hardware generators are the two
 devices and their checkers count what arrives. Generators at line rate (12-byte gaps) in
 both directions at the same time, 802.1Q-tagged sequence frames (VID 100), counters cleared
-before each run. Bitstream of 2026-10-14 13:32 (the TAP's MACs still with deficit idle
-count, see the note below).
+before each run. The first table is from the bitstream of 2026-10-14 13:32, whose MACs still
+used deficit idle count; the second from the release bitstream (2026-10-14 15:06, MACs
+without deficit idle count).
 
 | Traffic, both directions | Duration | Frames P2→P3 / P3→P2 | Lost / errors / bad | DROP_FWD | Forward FIFO max |
 |--------------------------|----------|----------------------|---------------------|----------|------------------|
@@ -123,22 +124,44 @@ In every run the frames received on one TAP port equalled the frames transmitted
 other, exactly. With mixed odd and even lengths (66 to 1089 bytes random, or 66/67
 alternating) 2.5 × 10⁻⁵ to 3 × 10⁻⁴ of the frames were lost on the cable after the TAP
 (the TAP itself forwarded every frame): the MACs' deficit idle count sent 11-byte gaps after
-some odd-length frames and the receiving DP83867 dropped frames after them. The MACs are
-built without deficit idle count since then (every gap ≥ 12 bytes, checked in simulation);
-the mixed-length runs on hardware are pending.
+some odd-length frames and the receiving DP83867 dropped frames after them. The release
+bitstream builds the MACs without deficit idle count (every gap ≥ 12 bytes, 13 after an
+odd-length frame); with it the same mixed-length traffic is lossless:
+
+| Traffic, both directions (release bitstream) | Duration | Frames P2→P3 / P3→P2 | Lost / errors / bad | DROP_FWD | Forward FIFO max |
+|----------------------------------------------|----------|----------------------|---------------------|----------|------------------|
+| 66/67 B alternating | 60 s | 87 810 592 / 87 819 380 | 0 / 0 / 0 | 0 | 64 B |
+| 66 to 1089 B random | 60 s | 12 774 126 / 12 775 128 | 0 / 0 / 0 | 0 | 1086 B |
+| 66 to 129 B random | 60 s | 64 740 894 / 64 748 280 | 0 / 0 / 0 | 0 | 126 B |
+| 64/65 B alternating, untagged | 60 s | 89 874 885 / 89 882 016 | 0 / 0 / 0 | 0 | 62 B |
+| **66/67 B alternating soak** | **10 min** | **863 663 413 / 863 671 822** | **0 / 0 / 0** | **0** | **64 B** |
+| 66 B soak (control) | 10 min | 873 710 725 / 873 724 566 | 0 / 0 / 0 | 0 | 62 B |
+
+Receive errors were 0 on all four ports in every run, and the forward FIFO never held more
+than the frame being forwarded. Without deficit idle count, back-to-back odd-length frames
+cost throughput: 1 extra byte of gap after each odd-length frame, so 66/67-byte traffic
+carries about 1 % fewer frames than 66-byte traffic (863.7 against 873.7 million in 10
+minutes). Here both devices are the board's own generators, which send with the same spacing
+as the TAP; a faster device is described in
+[Known limitations](known_limitations.md#ethernet).
 
 * **Forwarding with capture:** 29 000 000 × 66 B each way (1.45 million frames/s per port)
   and 1 600 000 × 1518 B each way, forwarded at line rate while P0 and P1 were captured:
   every frame forwarded and captured, 0 capture drops, the exported pcapng files complete
-  and in order (`check_pcap`).
+  and in order (`check_pcap`). With the release bitstream: 87 000 000 × 66 B each way
+  (174 000 000 records, 13.92 GB, 232 MB/s): 0 capture drops, 0 forwarding drops, both
+  directions complete and in order, frame interval 679 to 698 ns (mean 688.0 ns).
 * **Latency** (300 frames per size and direction, one frame in flight): 8 ns × frame length
   + 933 to 936 ns in both directions (64 B: 1446 ns, 1518 B: 13 077 ns median), jitter
   ±13 ns; 16 to 19 ns more than with the router and PC, the same at every size.
 * **Link-state propagation:** P2's link taken down → P0 lost its link → P1 held down
   0.505 to 0.515 s later (0.5 s debounce) → P3 saw its link go down 0.255 to 0.258 s after
   that (5 of 5). When P2 came back, all four links were up again 6.9 to 7.4 s later. The
-  opposite direction (P0 held) needed a fix (MII loopback with auto-negotiation off) that is
-  in the image but has not been re-measured.
+  opposite direction, with the release image (5 of 5): P3's link taken down → P1 lost its
+  link (seen 1.11 s after the command) → P0 held by path idle + MII loopback with
+  auto-negotiation off → P2 saw its link go down 0.57 to 0.59 s after P1's; all four links up
+  again 6.8 s after P3 came back. The first direction, repeated with the release image
+  (3 of 3), gave the same result.
 * **Errored frames:** 1000 frames of 128 bytes sent error-terminated by the P2 generator → P0 counted 1000 receive
   errors, P3 received 1000 bad frames and 0 good ones; 1 000 000 at line rate (66 bytes):
   P0 and P3 receive errors both +1 000 000 exactly. Captured on P0, all 1000 records carry

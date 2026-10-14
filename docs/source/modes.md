@@ -97,7 +97,14 @@ Measured on 2026-10-14 with the board's own generators as the two devices, both 
 at line rate at the same time: 66-byte, 1518-byte and random 498 to 1521-byte frames forwarded
 without loss, a 10-minute soak at 66 bytes (874 million frames each way) without a single
 lost, corrupted or dropped frame, and line-rate forwarding with both ports captured at the
-same time; see [Performance](performance.md#tap-forwarding).
+same time. With the release bitstream, mixed odd and even frame lengths (66/67 bytes
+alternating, 66 to 1089 bytes random) are forwarded without loss too, including a 10-minute
+soak of 864 million frames each way; see [Performance](performance.md#tap-forwarding).
+
+Because the gap after an odd-length frame is 13 bytes, back-to-back odd-length frames are
+forwarded at a slightly lower frame rate than the line allows: 66/67-byte traffic at line
+rate carries about 1 % fewer frames than 66-byte traffic (measured: 863.7 against 873.7
+million frames in 10 minutes). Even-length frames are not affected.
 
 ## Switching modes
 
@@ -183,11 +190,16 @@ To test propagation, use pair 1 (P2 and P3), never the pair that carries your ne
 simulate the link loss with `pktrec-phy test linkdown`, which uses the same safe method as the
 watcher (see [Testing](testing.md#link-state-propagation)).
 
-Status of the measurements: putting a DP83867 into MII loopback was verified to take its
-copper link down, so that the device on the other end sees link down; propagation from P0 to
-P1 reacted within 0.9 s and the link and traffic came back after P0's link returned (bench
-2026-10-13, with the earlier loopback-only method). The power-down hold of P1 to P3 and the
-ordered P0 hold described above have not been measured on hardware yet.
+Measured on 2026-10-14 with pair 0 in TAP mode and P2/P3 of the same board as the two
+devices (P2 cabled to P0, P3 to P1):
+
+| Link lost | Partner held | Far device sees link down | All links up again after the loss ends |
+|-----------|--------------|---------------------------|----------------------------------------|
+| P0 (P2 powered down) | P1 by PHY power-down, 0.505 to 0.515 s after P0's link went down | P3: 0.255 to 0.258 s after the hold (8 of 8) | 6.8 to 7.4 s |
+| P1 (P3 powered down) | P0 by path idle + MII loopback (`BMCR` = `0x4140`) | P2: 0.57 to 0.59 s after P1's link loss was detected (5 of 5) | 6.8 s |
+
+After every cycle, both paths were back to forward, all four PHYs answered MDIO, and
+`pktrec-phy safe` reported SAFE.
 
 ## Loop safety
 
