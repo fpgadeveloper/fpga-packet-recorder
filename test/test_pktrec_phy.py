@@ -422,28 +422,31 @@ def test_pair1():
     run(["mode", "1", "monitor"])
 
 def test_pair1_selfcabled():
-    print("pair 1 cabled to itself (bench P2<->P3): test linkdown/linkup 3 does not latch")
+    print("pair 1 cabled to itself (bench P2<->P3): test linkdown/linkup does not latch")
     run(["mode", "1", "tap"])
     W.selfcable = True
-    S = {}
-    script = [
-        (1.0, "P3 power-down (test linkdown 3)", lambda: W.phy[m.PHY_ADDR[3]].__setitem__(0, 0x1940)),
-        (2.0, "snapshot down", lambda: S.__setitem__("down", [W.link(n) for n in range(4)])),
-        (2.2, "P3 power-up (test linkup 3)", lambda: (W.phy[m.PHY_ADDR[3]].__setitem__(0, 0x1140),
-                                                     W.renegotiate(3))),
-        (3.6, "snapshot up", lambda: S.__setitem__("up", ([bm(n) for n in range(4)],
-                                                          [W.link(n) for n in range(4)]))),
-    ]
     try:
-        ev, out = watch_scenario(script, ["--debounce", "0.2", "--grace", "1.0",
-                                          "--no-0055-correction"], 4.0)
+        for t in (3, 2):
+            S = {}
+            a = m.PHY_ADDR[t]
+            script = [
+                (1.0, f"P{t} power-down (test linkdown {t})", lambda: W.phy[a].__setitem__(0, 0x1940)),
+                (2.0, "snapshot down", lambda: S.__setitem__("down", [W.link(n) for n in range(4)])),
+                (2.2, f"P{t} power-up (test linkup {t})", lambda: (W.phy[a].__setitem__(0, 0x1140),
+                                                                   W.renegotiate(t))),
+                (3.6, "snapshot up", lambda: S.__setitem__("up", ([bm(n) for n in range(4)],
+                                                                  [W.link(n) for n in range(4)]))),
+            ]
+            ev, out = watch_scenario(script, ["--debounce", "0.2", "--grace", "1.0",
+                                              "--no-0055-correction"], 4.0)
+            check(S["down"] == [True, True, False, False], f"P{t} powered down -> P2 and P3 down, pair 0 up")
+            check(not any(e.get("event") == "hold" for e in ev),
+                  "no hold: the partner is already down (holding it would latch the pair)")
+            bmcr, links = S["up"]
+            check(not any(b & 0x4800 for b in bmcr) and all(links),
+                  f"P{t} back -> 4 links up (BMCR {[hex(b) for b in bmcr]})")
     finally:
         W.selfcable = False
-    check(S["down"] == [True, True, False, False], "P3 powered down -> P2 and P3 down, pair 0 up")
-    bmcr, links = S["up"]
-    check(not any(b & 0x4800 for b in bmcr) and all(links),
-          f"P3 back -> no re-hold, 4 links up (BMCR {[hex(b) for b in bmcr]})")
-    check(any(e.get("event") == "external_release" for e in ev), "external release logged")
     run(["mode", "1", "monitor"])
 
 

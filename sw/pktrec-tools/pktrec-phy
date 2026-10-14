@@ -987,6 +987,8 @@ class Propagator:
 
     Guards against ping-pong:
       - a port WE hold never propagates (its link-down is our doing);
+      - only a partner whose own link is up is held (a partner that is already
+        down needs no hold; on a pair cabled to itself the hold would latch);
       - a port we just released gets `grace` s (copper auto-negotiation takes
         ~3 s) before its own link-down counts;
       - at start every port gets `grace` s too.
@@ -1084,8 +1086,11 @@ class Propagator:
             for x, y in ((a, c), (c, a)):
                 if self.state[x] is None or now - self.t_change[x] < self.debounce:
                     continue
+                # y's own link must be up: holding a partner that is already down is
+                # pointless, and on a pair cabled to itself (bench P2<->P3) it latches
+                # both links down (y down because x is, x down because y is held)
                 if self.state[x] is False and not self.held[x] and not self.held[y] \
-                        and now >= self.grace_until[x]:
+                        and self.state[y] is True and now >= self.grace_until[x]:
                     self.hold(y, now, f"P{x} link down")
                 elif self.state[x] is True and self.held[y]:
                     self.release(y, now, f"P{x} link up")
