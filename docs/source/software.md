@@ -331,7 +331,7 @@ cycle. `dp_clk` comes from the PS PLL, so the timebase is only as accurate as th
 crystal (the measured board's ran 10 to 12 ppm slow, about 1 s per day).
 
 `pktrec-tb` (Python, `sw/pktrec-tools`, recipe `Yocto/meta-pktrec/recipes-apps/pktrec-tb`)
-keeps the timebase on `CLOCK_REALTIME`. `systemd-timesyncd` keeps that on NTP through the
+keeps the timebase on `CLOCK_REALTIME`. The image's NTP client keeps that on NTP through the
 PS Ethernet port, so capture timestamps are absolute wall-clock times. It runs as
 `pktrec-tb.service` (enabled), and uses the register access of `pktrec-phy`.
 

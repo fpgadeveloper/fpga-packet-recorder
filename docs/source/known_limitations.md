@@ -47,8 +47,8 @@
 ## Timestamps
 
 * **Absolute time is bounded by NTP.** The timebase follows the board's system clock closely,
-  but the system clock is only as accurate as its NTP synchronisation (`systemd-timesyncd` in
-  the image); a 25 ms error was measured 35 minutes after boot. Relative timing between frames
+  but the system clock is only as accurate as its NTP synchronisation; a 25 ms error was
+  measured 35 minutes after boot with `systemd-timesyncd` as the NTP client. Relative timing between frames
   and ports is not affected. See [Timestamping](timestamping.md#timebase-and-absolute-time).
 * **No PTP hardware clock.** The timebase is not exposed as a Linux PTP clock (`/dev/ptpN`)
   and cannot be synchronised by PTP.

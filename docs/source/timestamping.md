@@ -14,7 +14,7 @@ calibrated, and how accurate it is.
 | Per-link-up offset uncertainty | about ±2.3 ns between the 1000BASE-T master and slave roles; a further +8 ns step that the PHY reports in register `0x0055` is corrected at every link-up |
 | Fallback (no SFD match, flagged) | MAC timestamp: 16 ns quantisation, calibrated to within −4..+7 ns of the SFD scale |
 | Timebase | 64-bit ns counter on a 250 MHz clock, disciplined to the system clock (NTP) |
-| Absolute time | bounded by the accuracy of the board's NTP-synchronised system clock (measured: 25 ms off after 35 min with the image's default NTP client, see below) |
+| Absolute time | bounded by the accuracy of the board's NTP-synchronised system clock (measured: 25 ms off 35 min after boot with `systemd-timesyncd`, see below) |
 
 Relative timing, between frames and between ports, does not depend on the system clock:
 it stays at the SFD resolution.
@@ -209,7 +209,7 @@ against it.
 `dp_clk` is derived from the board's crystal, so the free-running timebase is only as
 accurate as that crystal: on the measured board it ran 11.7 ppm slow against NTP (about
 1 s per day). The **`pktrec-tb`** daemon (`pktrec-tb.service`) therefore disciplines the
-timebase to the Linux system clock (`CLOCK_REALTIME`), which `systemd-timesyncd` keeps on NTP
+timebase to the Linux system clock (`CLOCK_REALTIME`), which the image's NTP client keeps on NTP
 through the board's RJ45 port:
 
 * every second it measures the offset between the timebase and the system clock and steers
@@ -236,8 +236,9 @@ The last line is the **absolute accuracy**: the timebase follows the board's sys
 closely, but the system clock itself was still 12 ms off at its last NTP poll and drifting
 by about −11.7 ppm, because `systemd-timesyncd` polls rarely (every 17 minutes at that point)
 and had only partly learned the crystal's error. Absolute timestamps are therefore only as
-good as the board's NTP synchronisation, typically milliseconds with the image's default NTP
-client. Relative timing between frames and ports is unaffected.
+good as the board's NTP synchronisation: how close the NTP server is, how often the client
+polls, and how well it has learned the crystal's error. Relative timing between frames and
+ports is unaffected.
 
 When the daemon stops, the timebase keeps its last frequency and runs free. A Linux PTP
 hardware clock (`/dev/ptpN`) is not provided.
