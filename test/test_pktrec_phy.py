@@ -40,7 +40,10 @@ run with --i-accept-lan-loop).
 4. 0x0055 RX correction: link-up with 0x0055 = 0x0111 -> RX_OFFSET = base - 8;
    apply-calibration writing a new base -> adopted, correction re-applied;
    link-up with 0x0055 = 0 -> base; --no-0055-correction leaves RX_OFFSET alone.
-5. gen: size + rand mask beyond TX_MAX_LEN + 1 (1518) refused, --force sends.
+5. gen: size + rand mask beyond TX_MAX_LEN + 1 (1522) refused, --force sends;
+   --vlan writes GEN_VLAN (EN | PCP | VID), a plain start clears it, --size 1522
+   --vlan 100 accepted; maxlen --set 2000 writes RX/TX_MAX_LEN 1999 and raises
+   IFG_LO/HI (2526/3550), --set 1522 leaves raised thresholds alone.
 6. sfd config --mac-offset writes MAC_OFFSET.
 Exit 0 when every check passed.
 """
@@ -129,10 +132,13 @@ class FakeRegs:
         if base == m.ETH_BASE:
             self.r[m.ETH_ID] = m.ETH_ID_VALUE
             for n in range(4):
-                self.r[m.ETH_PORT_BASE + n * m.ETH_PORT_STRIDE + m.P_TX_MAX_LEN] = 1517
+                self.r[m.ETH_PORT_BASE + n * m.ETH_PORT_STRIDE + m.P_TX_MAX_LEN] = 1521
+                self.r[m.ETH_PORT_BASE + n * m.ETH_PORT_STRIDE + m.P_RX_MAX_LEN] = 1521
         elif base == m.M0_BASE:
             self.r[m.M0_ID] = m.M0_ID_VALUE
-            self.r[m.M0_VERSION] = 0x00010003
+            self.r[m.M0_VERSION] = 0x00010004
+            for n in range(4):
+                self.r[m.M0_PORT_BASE + n * m.M0_PORT_STRIDE + m.P_IFG_THRESH] = 0x08000C00
         elif base == m.CAP_BASE:
             self.r[0] = m.CAP_ID_VALUE
             self.r[4] = 0x00010002
@@ -568,15 +574,40 @@ def test_gen():
     print("gen: frames beyond TX_MAX_LEN")
     out = run(["gen", "2", "start", "--size", "64", "--rand-mask", "0x5ff", "--count", "10"])
     g = m.GEN_BASE + 2 * m.GEN_STRIDE
-    check("EXIT" in out and "1599" in out and not BOARD.m0.rd(g + m.G_CTRL) & 1,
+    check("EXIT" in out and "1599" in out and "1522" in out and not BOARD.m0.rd(g + m.G_CTRL) & 1,
           "size 64 + mask 0x5ff (up to 1599 B) refused, generator not started")
     out = run(["gen", "2", "start", "--size", "64", "--rand-mask", "0x5ff", "--count", "10", "--force"])
     check("WARNING" in out and BOARD.m0.rd(g + m.G_CTRL) & 1, "--force: warned and started")
     out = run(["gen", "2", "start", "--size", "64", "--rand-mask", "0x3ff", "--count", "10"])
     check("EXIT" not in out and "WARNING" not in out, "64 + 0x3ff (up to 1087 B): no warning")
-    out = run(["gen", "2", "start", "--size", "1519", "--count", "10"])
-    check("EXIT" in out, "--size 1519 refused")
+    out = run(["gen", "2", "start", "--size", "1523", "--count", "10"])
+    check("EXIT" in out, "--size 1523 refused")
+    out = run(["gen", "2", "start", "--size", "1522", "--vlan", "100", "--count", "10"])
+    check("EXIT" not in out and "WARNING" not in out and "vlan=100" in out
+          and BOARD.m0.rd(g + m.G_VLAN) == (1 << 16) | 100 and BOARD.m0.rd(g + m.G_LEN) == 1518,
+          "--size 1522 --vlan 100: GEN_VLAN 0x10064, LEN 1518")
+    run(["gen", "2", "start", "--size", "200", "--vlan", "7", "--pcp", "5", "--count", "1"])
+    check(BOARD.m0.rd(g + m.G_VLAN) == (1 << 16) | (5 << 13) | 7, "--vlan 7 --pcp 5: TCI 0xa007")
+    out = run(["gen", "2", "start", "--size", "64", "--vlan", "7", "--count", "1"])
+    check("EXIT" in out and "66" in out, "tagged PRSQ below 66 B refused")
+    run(["gen", "2", "start", "--size", "200", "--count", "1"])
+    check(BOARD.m0.rd(g + m.G_VLAN) == 0, "untagged start clears GEN_VLAN")
     run(["gen", "2", "stop"])
+    print("maxlen")
+    e = m.ETH_PORT_BASE + 1 * m.ETH_PORT_STRIDE
+    t = m.M0_PORT_BASE + 1 * m.M0_PORT_STRIDE + m.P_IFG_THRESH
+    out = run(["maxlen", "1"])
+    check("RX 1522 B, TX 1522 B" in out and "LO 2048" in out, "maxlen shows the 1522 B default")
+    out = run(["maxlen", "1", "--set", "2000"])
+    check(BOARD.eth.rd(e + m.P_RX_MAX_LEN) == 1999 and BOARD.eth.rd(e + m.P_TX_MAX_LEN) == 1999
+          and BOARD.m0.rd(t) == (2526 << 16) | 3550,
+          "--set 2000: RX/TX_MAX_LEN 1999, IFG_LO/HI 2526/3550")
+    out = run(["maxlen", "1", "--set", "1522"])
+    check(BOARD.eth.rd(e + m.P_TX_MAX_LEN) == 1521 and BOARD.m0.rd(t) == (2526 << 16) | 3550,
+          "--set 1522: limits back, thresholds not lowered")
+    out = run(["maxlen", "1", "--set", "70000"])
+    check("EXIT" in out, "--set beyond 16383 refused")
+
 
 
 def test_sfd_config():

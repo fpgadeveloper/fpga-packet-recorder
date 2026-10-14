@@ -68,14 +68,27 @@ Commands:
   sfd log <port> [--dir rx|tx] [--json]   pop the port's SFD log FIFO (needs --log on)
   gen <port> start [--size B] [--count N] [--ifg B | --rate PPS] [--raw] [--etype E]
              [--dst MAC] [--src MAC] [--stream ID] [--seq-first N] [--rand-mask M]
-             [--no-select] [--force] [--i-accept-lan-loop]   start the port's generator
-                         (selects PATH gen unless --no-select); refused while the
-                         port's PHY is in loopback (--force does not override that)
+             [--vlan VID [--pcp P]] [--no-select] [--force] [--i-accept-lan-loop]
+                         start the port's generator (selects PATH gen unless
+                         --no-select); refused while the port's PHY is in loopback
+                         (--force does not override that); --vlan inserts an 802.1Q
+                         tag after the source MAC (m0 map 1.4), as gen_seq.py --vlan:
+                         --size 1522 --vlan 100 = a full-size tagged frame
   gen <port> stop | status [--json]
   chk <port> start [--raw] [--etype E] | stop | status [--json]   receive checker
   (--size is the wire size INCLUDING the FCS, like test/gen_seq.py: 64..16387;
-  size + rand mask must not exceed the port's MAC TX_MAX_LEN, 1518 B by default,
-  or those frames go out error-terminated: refused unless --force)
+  size + rand mask must not exceed the port's MAC TX_MAX_LEN, 1522 B by default
+  (1518 + one 802.1Q tag; 1518 B on eth map 1.0 bitstreams), or those frames go out
+  error-terminated: refused unless --force)
+  maxlen <port|all> [--set B] [--json]   MAC max frame length (bytes incl. FCS) of
+                         RX and TX: RX frames above it are flagged bad (oversize, counted
+                         in RX_BAD), TX frames above it are cut and sent error-terminated.
+                         Reset 1522; --set 64..16383 (e.g. 2000 baby jumbo, 9022 jumbo)
+                         writes RX_MAX_LEN / TX_MAX_LEN and, if needed, raises the port's
+                         dynamic-IFG thresholds so IFG_LO stays above the largest frame
+                         (IFG_LO >= B + 526, IFG_HI >= IFG_LO + 1024). Change it while
+                         the port carries no traffic (the value crosses into the MAC
+                         clocks unsynchronised; one frame may see a mixed limit)
   watch [--interval S] [--no-propagate] [--debounce S] [--grace S]
         [--no-0055-correction] [--skew-ns NS] [--json]
                          re-trigger the SGMII status word (CFG2[7] 0->1) whenever a
@@ -153,6 +166,7 @@ ETH_ID, ETH_VERSION, ETH_GCTRL, ETH_GSTATUS = 0x000, 0x004, 0x008, 0x00C
 ETH_MDIO_CMD, ETH_MDIO_RDATA, ETH_MDIO_STATUS, ETH_MDIO_DIV = 0x010, 0x014, 0x018, 0x01C
 ETH_PORT_BASE, ETH_PORT_STRIDE = 0x100, 0x40
 P_CTRL, P_STATUS, P_LP_ADV, P_STICKY = 0x00, 0x04, 0x08, 0x0C
+IFG_LO_DEFAULT, IFG_HI_DEFAULT, IFG_LO_MARGIN = 2048, 3072, 526
 ETH_ID_VALUE = 0x504B5245
 
 # pktrec_m0_path registers
@@ -178,6 +192,7 @@ GEN_BASE, GEN_STRIDE = 0x200, 0x80
  G_ETYPE, G_STREAM, G_SEQ_FIRST, G_FRAMES, G_BYTES) = (
     0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x3C)
 C_CTRL, C_FRAMES, C_LOST, C_ERRORS, C_BAD, C_LAST_SEQ = 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C
+G_VLAN, G_VLAN_EN = 0x44, 1 << 16   # m0 map 1.4: [15:0] TCI, [16] EN
 
 # capture block: SFD timestamping (PKTREC_SFD_*), capture map 1.2
 CAP_ID_VALUE, CAP_VERSION = 0x504B4350, 0x004
@@ -318,6 +333,10 @@ class Board:
         if c.rd(0) != CAP_ID_VALUE:
             return None
         return bool(c.rd(CAP_CTRL) & CAP_CTRL_ENABLE)
+
+    def has_gen_vlan(self):
+        """m0 map 1.4: generator 802.1Q tag (GEN_VLAN), checker skips a tag."""
+        return self.m0.rd(M0_VERSION) >= 0x00010004
 
     def has_replay(self):
         """m0 map 1.3 (M6): PATH_RPL (path mode 4 replay)."""
@@ -1380,6 +1399,52 @@ def cmd_ifg(b, args):
               f"DROP_FWD {d['drop_fwd']} FLUSH {d['flush']}")
 
 
+def maxlen_doc(b, n):
+    rx = (b.eth_port(n, P_RX_MAX_LEN) & 0xFFFF) + 1
+    tx = (b.eth_port(n, P_TX_MAX_LEN) & 0xFFFF) + 1
+    d = {"port": n, "rx_max": rx, "tx_max": tx}
+    if b.has_tap():
+        thr = b.m0.rd(M0_PORT_BASE + n * M0_PORT_STRIDE + P_IFG_THRESH)
+        d.update(ifg_hi=thr & 0xFFFF, ifg_lo=thr >> 16)
+    return d
+
+
+def cmd_maxlen(b, args):
+    ports = range(4) if args.port == "all" else [int(args.port.lstrip("pP"))]
+    for n in ports:
+        if not 0 <= n <= 3:
+            raise SystemExit("port must be 0..3 or all")
+    if args.set is not None:
+        if not 64 <= args.set <= 16383:
+            raise SystemExit("pktrec-phy: --set must be 64..16383 bytes (incl. FCS)")
+        lo_min = max(IFG_LO_DEFAULT, args.set + IFG_LO_MARGIN)
+        for n in ports:
+            base = ETH_PORT_BASE + n * ETH_PORT_STRIDE
+            b.eth.wr(base + P_RX_MAX_LEN, args.set - 1)
+            b.eth.wr(base + P_TX_MAX_LEN, args.set - 1)
+            if b.has_tap():
+                # the FWD fill counts the frame being received: IFG_LO must exceed the
+                # largest frame or the reduced gap never ends while traffic flows
+                t = M0_PORT_BASE + n * M0_PORT_STRIDE + P_IFG_THRESH
+                thr = b.m0.rd(t)
+                lo, hi = thr >> 16, thr & 0xFFFF
+                if lo < lo_min:
+                    lo = lo_min
+                    hi = max(hi, lo + 1024)
+                    if hi > 16383:
+                        raise SystemExit(f"pktrec-phy: --set {args.set}: IFG_HI {hi} would "
+                                         "exceed the 16 KB FWD FIFO")
+                    b.m0.wr(t, (lo << 16) | hi)
+    docs = [maxlen_doc(b, n) for n in ports]
+    if args.json:
+        print(json.dumps({"ports": docs}, indent=1))
+        return
+    for d in docs:
+        print(f"P{d['port']}: max frame RX {d['rx_max']} B, TX {d['tx_max']} B (incl. FCS)"
+              + (f" | dynamic IFG thresholds HI {d['ifg_hi']} / LO {d['ifg_lo']} B"
+                 if "ifg_lo" in d else ""))
+
+
 # ---------------------------------------------------------------------------
 # TAP forwarding latency (SFD log FIFOs of the capture block)
 # ---------------------------------------------------------------------------
@@ -1623,6 +1688,7 @@ def gen_doc(b, n):
     m, g = b.m0, GEN_BASE + n * GEN_STRIDE
     ctrl, st, cc = m.rd(g + G_CTRL), m.rd(g + G_STATUS), m.rd(g + C_CTRL)
     length = m.rd(g + G_LEN)
+    vl = m.rd(g + G_VLAN) if b.has_gen_vlan() else 0
     return {"port": n, "path": MODE_NAMES[(m.rd(M0_PATH_CTRL) >> (2 * n)) & 3],
             "gen": {"enable": ctrl & 1, "format": "raw" if ctrl & 2 else "prsq",
                     "rand_len": (ctrl >> 2) & 1, "bad": (ctrl >> 3) & 1, "running": st & 1, "done": (st >> 1) & 1,
@@ -1633,6 +1699,8 @@ def gen_doc(b, n):
                     "src": mac_str(m.rd(g + G_SRC_LO) | (m.rd(g + G_SRC_HI) << 32)),
                     "etype": m.rd(g + G_ETYPE), "stream": m.rd(g + G_STREAM),
                     "seq_first": m.rd(g + G_SEQ_FIRST),
+                    "vlan": (vl & 0xFFF) if vl & G_VLAN_EN else None,
+                    "pcp": (vl >> 13) & 7 if vl & G_VLAN_EN else None,
                     "frames": Board.rd64(m, g + G_FRAMES), "bytes": Board.rd64(m, g + G_BYTES)},
             "chk": {"enable": cc & 1, "format": "raw" if cc & 2 else "prsq", "etype": cc >> 16,
                     "frames": m.rd(g + C_FRAMES), "lost": m.rd(g + C_LOST),
@@ -1646,7 +1714,8 @@ def print_gen(doc, what):
         print(f"P{doc['port']} gen: path={doc['path']} {'RUNNING' if gd['running'] else 'stopped'}"
               f"{' (done)' if gd['done'] else ''} format={gd['format']} size={gd['size_with_fcs']}"
               f"{' +rand&0x%x' % gd['len_mask'] if gd['rand_len'] else ''}"
-              f"{' BAD' if gd['bad'] else ''} ifg={gd['ifg']} "
+              f"{' BAD' if gd['bad'] else ''}"
+              f"{' vlan=%d' % gd['vlan'] if gd.get('vlan') is not None else ''} ifg={gd['ifg']} "
               f"count={gd['count'] or 'endless'} dst={gd['dst']} src={gd['src']} "
               f"{'etype=0x%04x' % gd['etype'] if gd['format'] == 'raw' else 'stream=%d' % gd['stream']} "
               f"seq_first={gd['seq_first']} | sent {gd['frames']} frames {gd['bytes']} bytes")
@@ -1671,13 +1740,21 @@ def cmd_gen(b, args):
         if not 64 <= size <= 16387:
             raise SystemExit("pktrec-phy: --size must be 64..16387 (wire size incl. FCS)")
         length = size - 4
-        # The MAC cuts frames above its TX_MAX_LEN (1518 B incl. FCS by default) and
+        if args.vlan is not None:
+            if not 0 <= args.vlan <= 4095 or not 0 <= args.pcp <= 7:
+                raise SystemExit("pktrec-phy: --vlan must be 0..4095, --pcp 0..7")
+            if not b.has_gen_vlan():
+                raise SystemExit("pktrec-phy: this bitstream's generator has no VLAN tag "
+                                 f"(m0 map 0x{m.rd(M0_VERSION):08x}, needs 1.4)")
+            if not args.raw and size < 66:
+                raise SystemExit("pktrec-phy: a tagged PRSQ frame needs --size >= 66")
+        # The MAC cuts frames above its TX_MAX_LEN (1522 B incl. FCS by default) and
         # sends them error-terminated: the far end counts them as RX_BAD, silently from
         # the generator's point of view (bench 2026-10-13: --rand-mask 0x5ff, up to
         # 1599 B, gave ~7.8 % bad frames). Refuse unless --force.
         tx_max = (b.eth_port(n, P_TX_MAX_LEN) & 0xFFFF) + 1
         if tx_max <= 64:
-            tx_max = 1518                      # register not implemented: design default
+            tx_max = 1518                      # register not implemented: Taxi default
         biggest = size + (args.rand_mask or 0)
         if biggest > tx_max:
             msg = (f"--size {size}" + (f" + --rand-mask 0x{args.rand_mask:x}" if args.rand_mask else "")
@@ -1702,6 +1779,9 @@ def cmd_gen(b, args):
         m.wr(g + G_ETYPE, args.etype)
         m.wr(g + G_STREAM, n if args.stream is None else args.stream)
         m.wr(g + G_SEQ_FIRST, args.seq_first)
+        if b.has_gen_vlan():
+            m.wr(g + G_VLAN, 0 if args.vlan is None
+                 else G_VLAN_EN | (args.pcp << 13) | args.vlan)
         if not args.no_select:
             mode = m.rd(M0_PATH_CTRL) & 0xFF
             b.write_path((mode & ~(3 << (2 * n))) | (3 << (2 * n)))
@@ -1802,7 +1882,10 @@ def main():
     q.add_argument("--seq-first", type=parse_int, default=0)
     q.add_argument("--rand-mask", type=parse_int,
                    help="random extra length: size + (LFSR & mask); size + mask must stay within "
-                        "the MAC's TX_MAX_LEN (1518 B by default)")
+                        "the MAC's TX_MAX_LEN (1522 B by default, see maxlen)")
+    q.add_argument("--vlan", type=parse_int, metavar="VID",
+                   help="insert an 802.1Q tag with this VLAN id (m0 map 1.4); --size includes it")
+    q.add_argument("--pcp", type=int, default=0, help="802.1Q priority with --vlan (0)")
     q.add_argument("--force", action="store_true",
                    help="start even when size + mask exceeds TX_MAX_LEN (oversize frames go out "
                         "error-terminated)")
@@ -1853,6 +1936,11 @@ def main():
     p.add_argument("--hi", type=int, help="FWD fill (bytes) that starts the reduced gap (3072)")
     p.add_argument("--lo", type=int, help="FWD fill (bytes) that ends it (2048; > largest frame)")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("maxlen", help="MAC max frame length per port (RX oversize flag, TX cut)")
+    p.add_argument("port", help="0..3 or all")
+    p.add_argument("--set", type=int, metavar="BYTES",
+                   help="max frame incl. FCS, 64..16383 (reset 1522); raises IFG_LO/HI if needed")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("latency", help="TAP forwarding latency from the SFD logs (M3)")
     p.add_argument("--pair", type=int, choices=[0, 1], help="both directions of a pair")
     p.add_argument("--in", dest="inp", type=port_t, help="receiving port")
@@ -1887,7 +1975,8 @@ def main():
     try:
         {"init": cmd_init, "status": cmd_status, "path": cmd_path, "counters": cmd_counters,
          "watch": cmd_watch, "mdio": cmd_mdio, "sfd": cmd_sfd, "gen": cmd_gen,
-         "chk": cmd_chk, "mode": cmd_mode, "ifg": cmd_ifg, "safe": cmd_safe, "test": cmd_test,
+         "chk": cmd_chk, "mode": cmd_mode, "ifg": cmd_ifg, "maxlen": cmd_maxlen,
+         "safe": cmd_safe, "test": cmd_test,
          "latency": cmd_latency}[args.cmd](b, args)
     except KeyboardInterrupt:
         pass
