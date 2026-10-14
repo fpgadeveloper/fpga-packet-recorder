@@ -7,11 +7,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Packet Recorder</title>
 <link rel="stylesheet" href="style.css">
+<script>/* apply the saved theme before the first paint */
+try { var t = localStorage.getItem("pktrec-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
 </head>
 <body>
 <header>
   <h1>FPGA Packet Recorder</h1>
-  <span id="conn" class="pill">connecting…</span>
+  <span class="hdr-r">
+    <span id="conn" class="pill">connecting…</span>
+    <button id="theme" class="icon" type="button" title="Switch to dark theme" aria-label="Switch to dark theme">
+      <svg class="i-moon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></g></svg>
+    </button>
+  </span>
 </header>
 <main>
   <section>

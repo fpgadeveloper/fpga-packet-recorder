@@ -58,10 +58,75 @@ function renderPorts() {
     </div>`;
   }).join("");
   const running = status.capture && status.capture.state !== "idle";
-  $("pairs").innerHTML = status.pairs.map((q) => `<div class="pair">
-      <span><b>P${q.ports[0]}/P${q.ports[1]}</b> <small>${q.mode === "tap" ? "TAP: forwarded through the fabric, both directions captured" : q.mode === "monitor" ? "monitor: receive only" : q.mode === "other" ? "custom paths: " + esc(q.paths.join("/")) : "unknown"}</small></span>
-      <span class="seg">${["tap", "monitor"].map((m) => `<button data-pair="${q.pair}" data-mode="${m}" class="${q.mode === m ? "on" : ""}" ${running ? "disabled title=\"stop the capture first\"" : ""}>${m === "tap" ? "TAP" : "Monitor"}</button>`).join("")}</span>
+  // rebuild the pair cards only when something they show changed (keeps focus and tooltips)
+  const key = JSON.stringify([running, status.pairs.map((q) => [q.mode, q.paths,
+    q.ports.map((n) => { const p = status.ports[n] || {}; return [p.link, p.speed, p.duplex, p.error]; })])]);
+  if (key === pairsKey) return;
+  pairsKey = key;
+  $("pairs").innerHTML = status.pairs.map((q) => `<div class="paircard">
+      <div class="ph">
+        <b>P${q.ports[0]}/P${q.ports[1]}</b>
+        <span class="seg">${["tap", "monitor"].map((m) => `<button data-pair="${q.pair}" data-mode="${m}" class="${q.mode === m ? "on" : ""}" ${running ? "disabled title=\"stop the capture first\"" : ""}>${m === "tap" ? "TAP" : "Monitor"}</button>`).join("")}</span>
+      </div>
+      <small class="pd">${MODE_TEXT[q.mode] || (q.mode === "other" ? "custom paths: " + esc((q.paths || []).join("/")) : "mode unknown")}</small>
+      <figure>${pairFigure(q)}
+        <figcaption><b>${q.mode === "tap" ? "TAP" : q.mode === "monitor" ? "Monitor" : q.mode === "other" ? "Custom" : "Unknown"}</b> mode</figcaption>
+        <div class="legend"><span><i class="up"></i>link up</span><span><i class="down"></i>link down</span>${q.mode === "tap" ? `<span><i class="fwd"></i>forwarded</span>` : ""}<span><i class="rec"></i>recorded</span></div>
+      </figure>
     </div>`).join("");
+}
+
+const MODE_TEXT = {
+  tap: "TAP: forwarded through the fabric, both directions captured",
+  monitor: "monitor: receive only",
+};
+let pairsKey = null;
+
+// Connectivity figure of one pair (inline SVG; colours come from CSS variables / currentColor).
+// Ports face down: cables from the devices enter their fronts; their back ends go to the fabric.
+function pairFigure(q) {
+  const id = "f" + q.pair, X = [70, 180], W = 50, Y = 66, H = 34, DEV = ["device A", "device B"];
+  const mode = q.mode;
+  const ports = q.ports.map((n, i) => {
+    const p = (status.ports && status.ports[n]) || {}, x = X[i], cx = x + W / 2;
+    const up = !!p.link, cls = up ? "up" : "down";
+    const st = up ? `link up${p.speed ? " " + p.speed : ""}${p.duplex ? (p.duplex === "half" ? " HD" : " FD") : ""}` : (p.error ? "error" : "link down");
+    return `<g class="port ${cls}"><title>P${n}: ${esc(st)}${p.path ? ", path " + esc(p.path) : ""}</title>
+        <rect class="body" x="${x}" y="${Y}" width="${W}" height="${H}" rx="4"/>
+        <path class="jack" d="M${cx - 12} ${Y + H - 4}v-15h24v15h-7v4h-10v-4z"/>
+        <circle class="led" cx="${x + W - 7}" cy="${Y + 7}" r="3.2"/>
+        <text x="${i ? x + W + 8 : x - 8}" y="${Y + H / 2 + 4}" text-anchor="${i ? "start" : "end"}">P${n}</text>
+      </g>
+      <g><title>Ethernet cable from ${DEV[i]} to P${n}</title>
+        <path class="cable${up ? "" : " down"}" d="M${cx} ${Y + H + 9}V${Y + H + 34}"/>
+        <rect class="plug" x="${cx - 7}" y="${Y + H}" width="14" height="9" rx="1.5"/>
+        <text class="dim" x="${cx}" y="${Y + H + 48}" text-anchor="middle">${DEV[i]}</text>
+      </g>`;
+  }).join("");
+  const c0 = X[0] + W / 2, c1 = X[1] + W / 2, mid = (c0 + c1) / 2, top = Y - 1;
+  const hdd = `<g class="hdd"><title>SSD: the capture file</title>
+      <rect x="${mid - 28}" y="4" width="56" height="28" rx="4"/>
+      <circle cx="${mid - 12}" cy="18" r="8.5"/><circle class="hub" cx="${mid - 12}" cy="18" r="2"/>
+      <text x="${mid + 13}" y="22" text-anchor="middle">SSD</text></g>`;
+  const defs = `<defs>
+      <marker id="${id}a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="arr-fwd" d="M0 0L10 5L0 10z"/></marker>
+      <marker id="${id}r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path class="arr-rec" d="M0 0L10 5L0 10z"/></marker></defs>`;
+  let paths = "", label = "";
+  if (mode === "tap") {
+    paths = `<g><title>Inline forwarding path in the fabric: P${q.ports[0]} ↔ P${q.ports[1]}</title>
+        <path class="fwd" d="M${c0} ${top}V50H${c1}V${top}" marker-start="url(#${id}a)" marker-end="url(#${id}a)"/></g>
+      <g><title>Both directions are recorded: each port records what it receives</title>
+        <path class="recl tapline" d="M${mid} 50V34" marker-end="url(#${id}r)"/><circle class="arr-rec" cx="${mid}" cy="50" r="2.6"/></g>`;
+    label = "TAP: devices A and B talk through the board; both directions recorded";
+  } else if (mode === "monitor") {
+    paths = q.ports.map((n, i) => `<g><title>P${n} receives only and records to the SSD; nothing is forwarded</title>
+        <path class="recl" d="M${i ? c1 : c0} ${top}L${i ? mid + 14 : mid - 14} 34" marker-end="url(#${id}r)"/></g>`).join("");
+    label = "Monitor: both ports receive only and record; nothing forwarded";
+  } else {
+    label = mode === "other" ? "custom per-port paths (set with pktrec-phy path)" : "mode unknown";
+  }
+  return `<svg class="fig" viewBox="0 0 300 150" role="img" aria-label="P${q.ports[0]}/P${q.ports[1]} ${esc(label)}">
+      <title>${esc(label)}</title>${defs}${hdd}${paths}${ports}</svg>`;
 }
 
 $("pairs").addEventListener("click", async (ev) => {
@@ -191,6 +256,25 @@ $("caps").addEventListener("click", async (ev) => {
   }
 });
 $("refresh").addEventListener("click", loadCaptures);
+
+// ---- theme (follows the system; the header button overrides it, remembered per browser) ----
+const THEME_KEY = "pktrec-theme", darkMq = window.matchMedia ? matchMedia("(prefers-color-scheme: dark)") : null;
+function effectiveTheme() {
+  const t = document.documentElement.dataset.theme;
+  return t === "light" || t === "dark" ? t : darkMq && darkMq.matches ? "dark" : "light";
+}
+function showThemeButton() {
+  const dark = effectiveTheme() === "dark", b = $("theme"), t = `Switch to ${dark ? "light" : "dark"} theme`;
+  b.classList.toggle("dark", dark); b.title = t; b.setAttribute("aria-label", t);
+}
+$("theme").addEventListener("click", () => {
+  const next = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* storage blocked: this page only */ }
+  showThemeButton();
+});
+if (darkMq && darkMq.addEventListener) darkMq.addEventListener("change", showThemeButton);
+showThemeButton();
 
 // ---- polling ----
 function setConn(ok, text) { const c = $("conn"); c.textContent = text; c.className = "pill " + (ok ? "ok" : "bad"); }

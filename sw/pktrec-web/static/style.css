@@ -2,25 +2,28 @@
 /* Copyright (c) 2026 Opsero Electronic Design Inc. */
 :root {
   --bg: #f5f6f8; --fg: #1d2330; --muted: #667085; --card: #ffffff; --line: #d9dde5;
-  --accent: #1f6feb; --ok: #1a7f37; --warn: #b26b00; --bad: #c62828; --barbg: #e7eaf0;
+  --accent: #1f6feb; --on-accent: #ffffff; --ok: #1a7f37; --warn: #9a5b00; --bad: #c62828;
+  --barbg: #e7eaf0; --backdrop: rgba(16, 20, 28, .45); --fig-fill: #eef1f6; --rec: #8250df;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #12151b; --fg: #e4e7ec; --muted: #98a2b3; --card: #1b2029; --line: #2e3542;
-    --accent: #4c8dff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --barbg: #2a303b;
+    --accent: #4c8dff; --on-accent: #0b1220; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+    --barbg: #2a303b; --backdrop: rgba(0, 0, 0, .6); --fig-fill: #232a35; --rec: #b58cff;
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --bg: #12151b; --fg: #e4e7ec; --muted: #98a2b3; --card: #1b2029; --line: #2e3542;
-  --accent: #4c8dff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --barbg: #2a303b;
+  --accent: #4c8dff; --on-accent: #0b1220; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  --barbg: #2a303b; --backdrop: rgba(0, 0, 0, .6); --fig-fill: #232a35; --rec: #b58cff;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-header { display: flex; align-items: center; justify-content: space-between;
+header { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
   padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
 h1 { font-size: 18px; margin: 0; }
 h2 { font-size: 15px; margin: 20px 0 8px; display: flex; align-items: center; gap: 10px; }
@@ -29,7 +32,7 @@ footer { text-align: center; color: var(--muted); font-size: 12px; padding: 12px
 .pill { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
 .pill.ok { color: var(--ok); border-color: var(--ok); }
 .pill.bad { color: var(--bad); border-color: var(--bad); }
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(230px, 100%), 1fr)); gap: 10px; }
 .card, .panel, .pair { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
 .card h3 { margin: 0 0 6px; font-size: 15px; display: flex; justify-content: space-between; align-items: center; }
 .card .row { display: flex; justify-content: space-between; color: var(--muted); }
@@ -38,11 +41,11 @@ footer { text-align: center; color: var(--muted); font-size: 12px; padding: 12px
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
 .dot.up { background: var(--ok); }
 .drops b { color: var(--bad) !important; }
-.pairs { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; margin-top: 10px; }
+.pairs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 10px; margin-top: 10px; }
 .pair { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
 .seg button { border: 0; border-radius: 0; background: transparent; }
-.seg button.on { background: var(--accent); color: #fff; }
+.seg button.on { background: var(--accent); color: var(--on-accent); }
 .panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
 @media (max-width: 760px) { .panel { grid-template-columns: 1fr; } }
 form label { display: block; margin: 6px 0; }
@@ -55,8 +58,8 @@ small { color: var(--muted); }
 button { font: inherit; cursor: pointer; color: var(--fg); background: var(--bg);
   border: 1px solid var(--line); border-radius: 6px; padding: 6px 14px; }
 button:disabled { opacity: .45; cursor: default; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button.danger { background: var(--bad); border-color: var(--bad); color: var(--on-accent); }
 button.small { padding: 2px 10px; font-size: 12px; font-weight: normal; }
 .buttons { display: flex; gap: 10px; margin-top: 10px; }
 .kv { display: grid; grid-template-columns: 110px 1fr auto; gap: 8px; align-items: center; padding: 3px 0; }
@@ -81,9 +84,53 @@ td.act button { padding: 2px 10px; font-size: 12px; }
 tr.rec td:first-child::after { content: " ● recording"; color: var(--bad); font-size: 12px; }
 dialog { border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg);
   max-width: min(900px, 94vw); width: 100%; }
-dialog::backdrop { background: rgba(0,0,0,.4); }
+dialog::backdrop { background: var(--backdrop); }
 pre { overflow: auto; font-size: 12px; background: var(--bg); padding: 10px; border-radius: 6px; max-height: 60vh; }
 
 /* timebase line (pktrec-tb state) */
 #tb small.ok { color: var(--ok); }
-#tb small.warn { color: var(--warn, #b7791f); }
+#tb small.warn { color: var(--warn); }
+
+/* header: connection pill + theme toggle */
+.hdr-r { display: inline-flex; align-items: center; gap: 10px; }
+button.icon { padding: 4px; line-height: 0; border-radius: 50%; background: transparent; }
+button.icon:hover { background: var(--barbg); }
+#theme .i-sun { display: none; }
+#theme.dark .i-sun { display: inline; }
+#theme.dark .i-moon { display: none; }
+
+/* pair mode cards with the connectivity figure */
+.paircard { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+  display: flex; flex-direction: column; gap: 6px; }
+.paircard .ph { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.paircard figure { margin: 4px 0 0; }
+.paircard figcaption { text-align: center; margin-top: 2px; font-size: 12px; color: var(--muted); }
+.paircard figcaption b { color: var(--fg); }
+.fig { display: block; width: 100%; max-width: 360px; height: auto; margin: 0 auto; color: var(--fg); }
+.fig text { fill: currentColor; font: 11px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.fig text.dim { fill: var(--muted); }
+.fig .port rect.body { fill: var(--fig-fill); stroke: var(--muted); stroke-width: 1.5; }
+.fig .port.up rect.body { stroke: var(--ok); }
+.fig .port.down rect.body { stroke: var(--bad); stroke-dasharray: 4 3; }
+.fig .port .led { fill: var(--muted); }
+.fig .port.up .led { fill: var(--ok); }
+.fig .port.down .led { fill: var(--bad); }
+.fig .jack { fill: none; stroke: currentColor; stroke-width: 1.2; opacity: .55; }
+.fig .cable { fill: none; stroke: var(--muted); stroke-width: 3; stroke-linecap: round; }
+.fig .cable.down { stroke-dasharray: 2 5; }
+.fig .plug { fill: var(--muted); }
+.fig .fwd { fill: none; stroke: var(--accent); stroke-width: 2.5; }
+.fig .recl { fill: none; stroke: var(--rec); stroke-width: 2; }
+.fig .recl.tapline { stroke-dasharray: 4 3; }
+.fig .hdd rect { fill: var(--fig-fill); stroke: var(--rec); stroke-width: 1.5; }
+.fig .hdd circle { fill: none; stroke: var(--rec); stroke-width: 1.5; }
+.fig .hdd .hub { fill: var(--rec); stroke: none; }
+.fig .arr-fwd { fill: var(--accent); }
+.fig .arr-rec { fill: var(--rec); }
+.legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 14px; font-size: 12px; color: var(--muted);
+  margin-top: 4px; }
+.legend i { display: inline-block; width: 16px; height: 0; border-top: 2.5px solid; vertical-align: middle; margin-right: 5px; }
+.legend i.fwd { border-color: var(--accent); }
+.legend i.rec { border-color: var(--rec); }
+.legend i.up { width: 9px; height: 9px; border: 1.5px solid var(--ok); border-radius: 2px; }
+.legend i.down { width: 9px; height: 9px; border: 1.5px dashed var(--bad); border-radius: 2px; }
