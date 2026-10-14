@@ -11,10 +11,10 @@ calibrated, and how accurate it is.
 | Source | the DP83867 PHY's receive start-of-frame-delimiter (SFD) indication, sampled in the fabric |
 | Resolution | 1 ns |
 | Jitter between two ports (measured) | 0.40 to 0.52 ns rms, 2 to 3 ns peak-to-peak |
-| Per-link-up offset uncertainty | about ±2.3 ns between the 1000BASE-T master and slave roles; a further +8 ns step that the PHY reports in register `0x0055` is corrected at every link-up |
+| Per-link-up offset uncertainty | about ±2.3 ns between the 1000BASE-T master and slave roles; a further +8 ns step that the master's PHY reports in register `0x0055` is corrected at every link-up of a 1000BASE-T master port |
 | Fallback (no SFD match, flagged) | MAC timestamp: 16 ns quantisation, calibrated to within −4..+7 ns of the SFD scale |
 | Timebase | 64-bit ns counter on a 250 MHz clock, disciplined to the system clock (NTP) |
-| Absolute time | bounded by the accuracy of the board's NTP-synchronised system clock (measured: 25 ms off 35 min after boot with `systemd-timesyncd`, see below) |
+| Absolute time | bounded by the accuracy of the board's NTP-synchronised system clock (measured: −1.1 to −1.4 ms against an NTP-synchronised PC, 30 to 59 min after boot, with `chrony`; 25 ms with `systemd-timesyncd`; see below) |
 
 Relative timing, between frames and between ports, does not depend on the system clock:
 it stays at the SFD resolution.
@@ -108,7 +108,9 @@ The spread includes two 1 ns samplers and both PHYs, so the sampler resolution i
   DP83867 datasheet describes this per-link-up variation of the receive SFD. The link watcher
   (`pktrec-phy-watch.service`) reads the register after every copper link-up and sets that
   port's `RX_OFFSET` to the calibrated value − 8 ns while it is non-zero
-  (`--no-0055-correction` turns this off). The correction is derived from the measurement
+  (`--no-0055-correction` turns this off). The correction is applied on the 1000BASE-T
+  master only: a non-zero value on the slave is logged but not corrected, as there is no
+  measurement for it. The correction is derived from the measurement
   above; its effect on the residual offset has not been measured separately. The ±2.3 ns
   master/slave asymmetry is not corrected.
 * **Time between consecutive frames.** Frames from the generator, captured with SFD
@@ -193,7 +195,8 @@ in register `0x0055`, or stop the link watcher during the calibration: the watch
 
 ```{note}
 `pktrec-tb save-calibration` also saves the timebase frequency, but only once the timebase
-discipline has been locked and stable for 10 minutes; otherwise it keeps the file's previous
+discipline has been locked for 10 minutes and its frequency estimate moved less than 0.5 ppm
+over that time; otherwise it keeps the file's previous
 value and says so. The saved frequency is the daemon's starting point at the next boot.
 ```
 
@@ -238,6 +241,20 @@ and had only partly learned the crystal's error. Absolute timestamps are therefo
 good as the board's NTP synchronisation: how close the NTP server is, how often the client
 polls, and how well it has learned the crystal's error. Relative timing between frames and
 ports is unaffected.
+
+Measured on 2026-10-14 (same board on a LAN, `chrony` as the image's NTP client, frames
+broadcast by a PC through the LAN router to P0 in monitor mode; the PC itself runs
+`systemd-timesyncd`, last offset ±2.9 ms):
+
+| Quantity | Result |
+|----------|--------|
+| Lock after chrony's first step of the system clock (−55 s) | 66 s; lost twice more (during chrony's slew right after the step, and once about 11 min after boot), locked continuously after that |
+| Timebase − system clock, 30 min after boot | offset +1.0 µs, rms 46 ns |
+| Capture timestamp minus the PC's send time (40 frames, sd 15 µs) | −1.105 ms after 30 min, −1.195 ms after 35 min, −1.370 ms after 59 min |
+| Records later than the reorder window, timestamps going backwards | 0 |
+
+With chrony the board's absolute time is within about 1.1 to 1.4 ms of the PC, which is
+inside the PC's own NTP error: the PC, not the recorder, limits this measurement.
 
 When the daemon stops, the timebase keeps its last frequency and runs free. A Linux PTP
 hardware clock (`/dev/ptpN`) is not provided.

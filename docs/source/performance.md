@@ -1,6 +1,6 @@
 # Performance
 
-All results on this page were measured on 2026-10-13 on one ZCU106 with an Ethernet FMC Max
+Unless dated otherwise, the results on this page were measured on 2026-10-13 on one ZCU106 with an Ethernet FMC Max
 Rev-B on HPC0 and an FPGA Drive FMC Gen4 on HPC1, with a **Samsung 980 PRO 1TB** NVMe SSD in
 slot 1 (PCIe Gen3 x1, XFS), running the Yocto image of this design (capture block register
 map 1.2, recorder `fdrec_core` 1.2). Results with other SSDs will differ; the SSD's sustained
@@ -63,9 +63,23 @@ SSD; they reduce the data rate for slower SSDs (the snap length stores at most N
 each frame: for example a snap length of 128 bytes turns a 1518-byte frame into a 144-byte
 record).
 
-The longest capture run was 640 s; captures of 30 minutes or more were not part of these
-measurements. The 40 GB recorder run above shows that the SSD sustained 700 MB/s, above the
-four-port maximum, over that amount of data.
+**30-minute capture** (2026-10-14, same hardware, image with capture block register map
+1.2 and recorder `fdrec_core` 1.2): all four ports enabled, both pairs in monitor mode, the
+P2 and P3 generators at line rate with 1518-byte frames (140 000 000 frames each way),
+20 000 frames/s from a PC on P1 and the LAN background on P0.
+
+| Duration | Records | Data to SSD | Result |
+|----------|---------|-------------|--------|
+| 30 min 1 s | 313 462 888 | 481 GB, 280 MB/s steady | **0 drops**, 0 recorder data loss, 0 DMA errors; P2 and P3 records = 140 000 000 = frames sent = MAC receive count; FIFO high-water ≤ 4.9 KB, ring ≤ 1/32 full |
+
+The raw file showed no hardware sequence gaps and no timestamps going backwards on any port,
+and no gaps in the generator sequence numbers on P2 and P3.
+
+**802.1Q-tagged frames** (2026-10-14): 100 000 frames of 1522 bytes (1518 bytes + one tag,
+VID 100) from the P2 generator were captured on P3 completely: 100 000 records of 1522 bytes,
+0 receive errors, 0 drops, every sequence number once and in order, VLAN ID 100 decoded by
+`tshark`. A 1523-byte frame is counted as a receive error, as the 1522-byte maximum frame
+length requires.
 
 **Overload.** To check that overload is reported and never corrupts a file, a second program
 wrote to the same SSD at 452 MB/s (`dd`, direct I/O) during a four-port 1518-byte line-rate
