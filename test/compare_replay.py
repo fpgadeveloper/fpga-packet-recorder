@@ -8,8 +8,11 @@ pktrec-export) with the frames captured on the receiving port while that
 interface was replayed (pktrec-replay), e.g. replay P3's frames out of P2 and
 capture them on P3 (P2 <-> P3 cable):
 
-    compare_replay.py orig.pcapng --orig-iface P3 replay.pcapng --replay-iface P3
+    compare_replay.py orig.pcapng replay.pcapng [--orig-iface P3] [--replay-iface P3]
                       [--rate X | --topspeed] [--include-bad] [--tolerance NS] [--json]
+
+(options and file names may be given in any order, e.g. "orig.pcapng
+--orig-iface P3 replay.pcapng --replay-iface P3")
 
 Pairing: frames are matched by their bytes (a hash of the frame; the replay
 sends the captured bytes and the MAC appends a new FCS, so the receiver sees
@@ -264,7 +267,7 @@ def main():
                     help="max |interval error| in ns for PASS (default 64)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--selftest", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_intermixed_args()      # file names before, between or after options
     if a.selftest:
         return selftest()
     if not a.original or not a.replayed:
