@@ -86,9 +86,16 @@ def main():
     print("UI")
     s, body, h = call(base, "GET", "/", raw=True)
     check(s == 200 and b"<html" in body and "text/html" in h["Content-Type"], "GET / serves the page")
+    check(b'href="style.css"' in body and b'src="app.js"' in body and b'id="theme"' in body,
+          "page links style.css + app.js and has the theme toggle")
+    assets = {}
     for f in ("app.js", "style.css"):
-        s, body, _ = call(base, "GET", "/" + f, raw=True)
-        check(s == 200 and len(body) > 100, f"GET /{f}")
+        s, assets[f], _ = call(base, "GET", "/" + f, raw=True)
+        check(s == 200 and len(assets[f]) > 100, f"GET /{f}")
+    check(b"function pairFigure" in assets["app.js"] and b"pktrec-theme" in assets["app.js"],
+          "app.js has the connectivity figures and the theme toggle")
+    check(b':root[data-theme="dark"]' in assets["style.css"] and b"prefers-color-scheme: dark" in assets["style.css"]
+          and b".fig " in assets["style.css"], "style.css has the dark theme and the figure styles")
     s, _, _ = call(base, "GET", "/../../etc/passwd", raw=True)
     check(s == 404, "path traversal refused (404)")
 
