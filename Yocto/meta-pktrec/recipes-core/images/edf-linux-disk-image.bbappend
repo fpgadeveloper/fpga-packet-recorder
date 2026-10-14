@@ -4,3 +4,8 @@
 
 # FPGA Packet Recorder additions to the EDF disk image.
 IMAGE_INSTALL:append = " pktrec-tools pktrec-apps pktrec-test pktrec-web pktrec-tb"
+
+# NTP client: chronyd instead of systemd-timesyncd (meta-pktrec chrony bbappend:
+# config + timesyncd masked). The capture timebase follows CLOCK_REALTIME, and
+# chronyd trains the kernel frequency in minutes (timesyncd: >30 min, bench).
+IMAGE_INSTALL:append = " chrony chronyc"
