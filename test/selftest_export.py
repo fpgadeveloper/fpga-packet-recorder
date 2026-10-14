@@ -13,6 +13,10 @@ Builds pktrec-export (make, host compiler), then:
   3. reorder window too small -> exit 2 and the order violation is detected.
   4. streaming: stdin -> stdout gives the same bytes as file -> file.
   5. tshark / capinfos, if installed: no warnings or errors.
+  6. pktrec-export --check (the C sequence check) agrees with check_pcap.py:
+     PASS on the clean capture (same pcapng bytes as without --check),
+     FAIL (exit 4) with the same missing counts on the damaged and drop
+     captures; a too-small window reorders ports, not a port's own frames.
 
 Usage: selftest_export.py [--keep DIR]
 """
@@ -20,6 +24,7 @@ Usage: selftest_export.py [--keep DIR]
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -144,6 +149,42 @@ def main():
             bad = [ln for ln in (r.stderr + r.stdout).splitlines()
                    if "warn" in ln.lower() or "error" in ln.lower() or "appears to" in ln]
             expect(r.returncode == 0 and not bad, f"{os.path.basename(tool)} reads it cleanly")
+
+    print("6. pktrec-export --check")
+    clean = os.path.join(work, "clean.cap")
+    pc = os.path.join(work, "check.pcapng")
+    r = export(clean, pc, "--check", "--expect", "5000")
+    with open(pc, "rb") as f1, open(clean + ".pcapng", "rb") as f2:
+        same = f1.read() == f2.read()
+    expect(r.returncode == 0 and "--check: PASS" in r.stderr and same,
+           "clean: --check PASS, exit 0, pcapng identical to the plain export")
+    r = export(os.path.join(work, "drops.cap"), os.devnull, "--check")
+    expect(r.returncode == 4 and "P0 prsq:0: 4995 frames, seq 0..4999, missing 5," in r.stderr,
+           "drops: exit 4, exactly 5 missing on P0")
+    dmg = os.path.join(work, "damaged.cap")
+    r = export(dmg, os.devnull, "--check", "--expect", "5000")
+    with open(dmg + ".expect.json") as f:
+        lost = json.load(f)["lost"]
+    r2 = run(PY + [os.path.join(HERE, "check_pcap.py"), dmg + ".pcapng", "--json"])
+    res = json.loads(r2.stdout.strip().splitlines()[-1])
+    py_missing = {s["key"].split(":")[1]: s["missing"] for s in res["streams"]}
+    ok = r.returncode == 4
+    for p, n in lost.items():
+        frames = 5000 - n
+        ok = ok and f"P{p} prsq:{p}: {frames} frames," in r.stderr
+        if n:
+            ok = ok and f"{frames} frames, expected 5000" in r.stderr
+    c_missing = {m.group(1): int(m.group(2)) for m in
+                 re.finditer(r"P\d prsq:(\d+): .*?missing (\d+)", r.stderr)}
+    expect(ok and c_missing == py_missing,
+           f"damaged: exit 4, frame counts = 5000 - destroyed {lost}, "
+           f"missing = check_pcap.py's {py_missing} (got {c_missing})")
+    # records of different ports out of order, each port still in order:
+    # the per-port check passes, the export keeps its exit code 2
+    r = export(clean, os.devnull, "--check", "--window-records", "8")
+    expect(r.returncode == 2 and "--check: PASS" in r.stderr
+           and "timestamps backwards 0" in r.stderr,
+           "too-small window: per-port order intact, --check PASS, exit 2 kept")
 
     if not a.keep:
         shutil.rmtree(work)

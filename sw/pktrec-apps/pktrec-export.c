@@ -31,9 +31,13 @@
  * the end of the data). All-zero 16-byte blocks between records are padding
  * and skipped silently.
  *
+ * --check adds a streaming sequence check of gen_seq.py / PRSQ test traffic
+ * (the PRSQ part of test/check_pcap.py) at export speed.
+ *
  * Exit codes: 0 = clean, 2 = written but with anomalies (resyncs, records
  * later than the window, a truncated tail), 1 = error, 3 = the output could
- * not be written (the reader closed the pipe, disk full, ...).
+ * not be written (the reader closed the pipe, disk full, ...), 4 = written,
+ * but --check found a problem (takes precedence over 2).
  */
 
 #define _GNU_SOURCE
@@ -120,6 +124,8 @@ struct opts {
 	bool comments;
 	bool force;
 	bool quiet;
+	bool check;             /* --check: PRSQ sequence check */
+	uint64_t expect;        /* --expect: frames per PRSQ stream */
 };
 
 struct ent {
@@ -212,6 +218,11 @@ static void usage(FILE *f)
 "  --comments                per-packet opt_comment for records flagged with a\n"
 "                            MAC (not SFD) timestamp or an SFD mismatch\n"
 "  --no-isb                  no Interface Statistics Blocks\n"
+"  --check                   check gen_seq.py / PRSQ test traffic while exporting:\n"
+"                            per port and stream, every sequence number once and\n"
+"                            in order, timestamps never backwards; verdict on\n"
+"                            stderr (use -o /dev/null for a check only)\n"
+"  --expect <n>              with --check: each PRSQ stream must have n frames\n"
 "  --force                   write binary output to a terminal\n"
 "  -q, --quiet               no summary on stderr\n"
 "  -h, --help                this help\n"
@@ -222,7 +233,7 @@ static void usage(FILE *f)
 "\n"
 "Exit code: 0 = clean, 2 = written with anomalies (corrupt stretches skipped,\n"
 "records outside the reorder window, truncated tail), 1 = error, 3 = the output\n"
-"could not be written (reader closed the pipe, disk full).\n",
+"could not be written (reader closed the pipe, disk full), 4 = --check failed.\n",
 		DEF_WINDOW_RECORDS, DEF_WINDOW_BYTES >> 20, DEF_MAX_FRAME);
 }
 
@@ -239,6 +250,8 @@ static int parse_args(int argc, char **argv, struct opts *o)
 		{ "no-isb", no_argument, NULL, 'I' },
 		{ "force", no_argument, NULL, 'f' },
 		{ "quiet", no_argument, NULL, 'q' },
+		{ "check", no_argument, NULL, 'C' },
+		{ "expect", required_argument, NULL, 'E' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -291,6 +304,14 @@ static int parse_args(int argc, char **argv, struct opts *o)
 		case 'q':
 			o->quiet = true;
 			break;
+		case 'C':
+			o->check = true;
+			break;
+		case 'E':
+			if (parse_size(optarg, &v) || !v)
+				return die_usage("invalid --expect '%s'", optarg);
+			o->expect = v;
+			break;
 		case 'h':
 			usage(stdout);
 			exit(0);
@@ -301,6 +322,8 @@ static int parse_args(int argc, char **argv, struct opts *o)
 	}
 	if (optind != argc - 1)
 		return die_usage("exactly one <capture-file> is required");
+	if (o->expect && !o->check)
+		return die_usage("--expect needs --check");
 	o->input = argv[optind];
 	return 0;
 }
@@ -602,6 +625,270 @@ static struct ent heap_pop(struct exp *e)
 	return top;
 }
 
+/* ------------------------------------------------------------------------ */
+/* --check: streaming sequence check of gen_seq.py / PRSQ test traffic      */
+/*
+ * The same verdict as test/check_pcap.py for PRSQ frames, at export speed.
+ * Frames are checked in output (timestamp) order. Per port and PRSQ stream
+ * id: frame count, first..last sequence number, missing numbers, duplicates,
+ * out-of-order numbers (lower than one seen before), bad-FCS frames and the
+ * inter-frame interval; per port: timestamps that go backwards. Sequence
+ * numbers are kept in a bitmap (1 bit per number from the first one seen):
+ * 100 M frames need 12.5 MB. Frames that are not PRSQ test frames are counted
+ * as "other" and ignored.
+ */
+
+#define CHK_WILD_JUMP   (1ull << 32)    /* a larger jump = corrupt number */
+
+struct chk_stream {
+	uint8_t port;
+	uint32_t id;
+	uint64_t frames, bad, dups, reorders, wild;
+	uint64_t first, maxseq;
+	uint8_t *bits;          /* bit i = seq first + i seen */
+	uint64_t nbits;         /* allocated bits */
+	uint64_t distinct;
+	uint64_t below;         /* numbers below the first one (out of order) */
+	bool nomem;
+	uint64_t prev_ts;
+	bool have_prev;
+	uint64_t gap_n, gap_min, gap_max;
+	double gap_sum;
+};
+
+struct chk {
+	struct chk_stream *s;
+	size_t n, cap;
+	uint64_t test[PKTREC_NUM_PORTS], other[PKTREC_NUM_PORTS];
+	uint64_t short_frames[PKTREC_NUM_PORTS], ts_back[PKTREC_NUM_PORTS];
+	uint64_t prev_ts[PKTREC_NUM_PORTS];
+	bool have_ts[PKTREC_NUM_PORTS];
+};
+
+static struct chk g_chk;
+
+static uint32_t rd_be32(const uint8_t *p)
+{
+	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+/* PRSQ payload of an Ethernet / [802.1Q/ad]... / IPv4 / UDP frame.
+ * Returns 1 = test frame, 0 = other frame, -1 = truncated before the seq. */
+static int chk_parse(const uint8_t *d, size_t len, uint32_t *id, uint64_t *seq)
+{
+	size_t off = 12, u;
+	unsigned et, ihl;
+
+	if (len < 14)
+		return len < 58 ? -1 : 0;
+	et = (unsigned)d[off] << 8 | d[off + 1];
+	off += 2;
+	while ((et == 0x8100 || et == 0x88A8 || et == 0x9100) && len >= off + 4) {
+		et = (unsigned)d[off + 2] << 8 | d[off + 3];
+		off += 4;
+	}
+	if (et != 0x0800)
+		return 0;
+	if (len < off + 20)
+		return -1;
+	ihl = (d[off] & 0x0F) * 4u;
+	if (d[off] >> 4 != 4 || ihl < 20 || d[off + 9] != 17)
+		return 0;
+	u = off + ihl + 8;              /* UDP payload */
+	if (len < u + 16)
+		return -1;
+	if (memcmp(d + u, "PRSQ", 4))
+		return 0;
+	*id = rd_be32(d + u + 4);
+	*seq = (uint64_t)rd_be32(d + u + 8) << 32 | rd_be32(d + u + 12);
+	return 1;
+}
+
+static struct chk_stream *chk_find(uint8_t port, uint32_t id)
+{
+	struct chk *c = &g_chk;
+	size_t i;
+
+	for (i = 0; i < c->n; i++)
+		if (c->s[i].port == port && c->s[i].id == id)
+			return &c->s[i];
+	if (c->n == c->cap) {
+		size_t nc = c->cap ? c->cap * 2 : 8;
+		struct chk_stream *ns = realloc(c->s, nc * sizeof(*ns));
+
+		if (!ns)
+			return NULL;
+		c->s = ns;
+		c->cap = nc;
+	}
+	memset(&c->s[c->n], 0, sizeof(c->s[0]));
+	c->s[c->n].port = port;
+	c->s[c->n].id = id;
+	return &c->s[c->n++];
+}
+
+/* mark seq in the bitmap; returns true if it was already there */
+static bool chk_mark(struct chk_stream *s, uint64_t seq)
+{
+	uint64_t i = seq - s->first;
+	uint8_t m;
+
+	if (i >= s->nbits) {
+		uint64_t nb = s->nbits ? s->nbits : 1u << 20;
+		uint8_t *p;
+
+		while (nb <= i)
+			nb *= 2;
+		p = realloc(s->bits, nb / 8);
+		if (!p) {
+			s->nomem = true;
+			return false;
+		}
+		memset(p + s->nbits / 8, 0, (nb - s->nbits) / 8);
+		s->bits = p;
+		s->nbits = nb;
+	}
+	m = (uint8_t)(1u << (i & 7));
+	if (s->bits[i >> 3] & m)
+		return true;
+	s->bits[i >> 3] |= m;
+	s->distinct++;
+	return false;
+}
+
+static void chk_record(const struct ent *r)
+{
+	struct chk *c = &g_chk;
+	struct chk_stream *s;
+	uint32_t id;
+	uint64_t seq, d;
+	int k;
+
+	if (c->have_ts[r->port] && r->ts < c->prev_ts[r->port])
+		c->ts_back[r->port]++;
+	c->prev_ts[r->port] = r->ts;
+	c->have_ts[r->port] = true;
+
+	k = chk_parse(r->data, r->cap_len, &id, &seq);
+	if (k <= 0) {
+		if (k < 0 && (uint32_t)r->cap_len + 4u < r->orig_len)
+			c->short_frames[r->port]++;
+		else
+			c->other[r->port]++;
+		return;
+	}
+	c->test[r->port]++;
+	s = chk_find(r->port, id);
+	if (!s)
+		return;
+	s->frames++;
+	if (r->flags & PKTREC_REC_FLAG_BAD)
+		s->bad++;
+	if (s->frames == 1) {
+		s->first = s->maxseq = seq;
+	} else {
+		d = seq > s->maxseq ? seq - s->maxseq : s->maxseq - seq;
+		if (d > CHK_WILD_JUMP) {        /* typically a bad-FCS frame */
+			s->wild++;
+			return;
+		}
+	}
+	if (seq < s->first) {
+		/* below the first number seen: out of order, not in the bitmap */
+		s->below++;
+		s->reorders++;
+	} else {
+		if (!s->nomem && chk_mark(s, seq))
+			s->dups++;
+		if (seq < s->maxseq)
+			s->reorders++;
+	}
+	if (seq > s->maxseq)
+		s->maxseq = seq;
+	if (s->have_prev) {
+		d = r->ts - s->prev_ts;
+		if (!s->gap_n || d < s->gap_min)
+			s->gap_min = d;
+		if (!s->gap_n || d > s->gap_max)
+			s->gap_max = d;
+		s->gap_sum += (double)d;
+		s->gap_n++;
+	}
+	s->prev_ts = r->ts;
+	s->have_prev = true;
+}
+
+static int chk_cmp(const void *pa, const void *pb)
+{
+	const struct chk_stream *a = pa, *b = pb;
+
+	if (a->port != b->port)
+		return a->port < b->port ? -1 : 1;
+	return a->id < b->id ? -1 : a->id > b->id;
+}
+
+/* print the verdict; returns the number of problems */
+static unsigned chk_report(const struct exp *e, uint64_t expect)
+{
+	struct chk *c = &g_chk;
+	unsigned i, fails = 0;
+	size_t j;
+
+	if (c->n)
+		qsort(c->s, c->n, sizeof(c->s[0]), chk_cmp);
+	fprintf(stderr, "pktrec-export --check (PRSQ test frames):\n");
+	for (i = 0; i < PKTREC_NUM_PORTS; i++) {
+		if (e->ifid[i] < 0)
+			continue;
+		fprintf(stderr, "  P%u: %" PRIu64 " test frames, %" PRIu64 " other, %" PRIu64
+			" truncated before the sequence number; timestamps backwards %" PRIu64 "\n",
+			i, c->test[i], c->other[i], c->short_frames[i], c->ts_back[i]);
+		if (c->ts_back[i])
+			fails++;
+	}
+	for (j = 0; j < c->n; j++) {
+		struct chk_stream *s = &c->s[j];
+		uint64_t span = s->maxseq - s->first + 1;
+		uint64_t missing = s->nomem ? 0 : span - s->distinct;
+		uint64_t counted = s->frames - s->wild;
+
+		fprintf(stderr, "  P%u prsq:%" PRIu32 ": %" PRIu64 " frames, seq %" PRIu64 "..%" PRIu64
+			", missing %" PRIu64 ", duplicates %" PRIu64 ", out of order %" PRIu64
+			", bad FCS %" PRIu64 "\n", s->port, s->id, s->frames, s->first, s->maxseq,
+			missing, s->dups, s->reorders, s->bad);
+		if (s->gap_n)
+			fprintf(stderr, "      interval: min %" PRIu64 " ns, mean %.1f ns, max %" PRIu64
+				" ns\n", s->gap_min, s->gap_sum / (double)s->gap_n, s->gap_max);
+		if (s->nomem) {
+			fprintf(stderr, "      out of memory for the sequence bitmap: missing and"
+				" duplicates not counted\n");
+			fails++;
+		}
+		if (s->wild)
+			fprintf(stderr, "      %" PRIu64 " frames with a sequence number > 2^32 away"
+				" (corrupt; not tracked)\n", s->wild);
+		fails += (missing != 0) + (s->dups != 0) + (s->reorders != 0) +
+			 (s->wild > s->bad);
+		if (expect && counted != expect) {
+			fprintf(stderr, "      %" PRIu64 " frames, expected %" PRIu64 "\n",
+				counted, expect);
+			fails++;
+		}
+	}
+	if (!c->n) {
+		fprintf(stderr, "  no PRSQ test frames found\n");
+		fails++;
+	}
+	fprintf(stderr, "pktrec-export --check: %s", fails ? "FAIL" : "PASS");
+	if (fails)
+		fprintf(stderr, " (%u problem%s)", fails, fails == 1 ? "" : "s");
+	fputc('\n', stderr);
+	for (j = 0; j < c->n; j++)
+		free(c->s[j].bits);
+	free(c->s);
+	return fails;
+}
+
 static int emit_one(struct exp *e)
 {
 	struct ent r = heap_pop(e);
@@ -613,6 +900,8 @@ static int emit_one(struct exp *e)
 	else
 		e->last_out_ts = r.ts;
 	e->have_out = true;
+	if (e->o.check)
+		chk_record(&r);
 	if (r.arrival > e->out_records && r.arrival - e->out_records > e->max_disp)
 		e->max_disp = r.arrival - e->out_records;
 	ret = write_epb(e, &r);
@@ -1034,6 +1323,8 @@ int main(int argc, char **argv)
 		print_summary(e);
 	ret = (e->resyncs || e->late || e->tail_bytes || e->h.rec_drop_beats ||
 	       e->h.dma_errors) ? 2 : 0;
+	if (e->o.check && chk_report(e, e->o.expect))
+		ret = 4;
 	goto out;
 werr:
 	if (errno == EPIPE)
