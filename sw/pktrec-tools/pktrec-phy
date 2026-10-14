@@ -45,6 +45,8 @@ Commands:
                          MAC->SFD deltas, TX latency, latest timestamps per port
   sfd config [--rx-win MIN MAX] [--tx-win MIN MAX] [--rx-offset P NS] [--tx-offset P NS]
              [--match on|off] [--log on|off] [--min-low CYC] [--min-high CYC]
+             [--mac-offset NS]   (MAC_OFFSET 0x0A8: ns added to MAC-fallback stamps;
+                         persist all of these with 'pktrec-tb save-calibration')
   sfd log <port> [--dir rx|tx] [--json]   pop the port's SFD log FIFO (needs --log on)
   gen <port> start [--size B] [--count N] [--ifg B | --rate PPS] [--raw] [--etype E]
              [--dst MAC] [--src MAC] [--stream ID] [--seq-first N] [--rand-mask M]
@@ -1245,6 +1247,8 @@ def cmd_sfd(b, args):
             c.wr(SFD_MIN_LOW, args.min_low)
         if args.min_high is not None:
             c.wr(SFD_MIN_HIGH, args.min_high)
+        if args.mac_offset is not None:
+            c.wr(0x0A8, args.mac_offset & 0xFFFFFFFF)
         for (port, ns) in args.rx_offset or []:
             c.wr(SFD_PORT_BASE + port * SFD_PORT_STRIDE + 0x38, ns)
         for (port, ns) in args.tx_offset or []:
@@ -1441,6 +1445,8 @@ def main():
     q.add_argument("--log", choices=["on", "off"])
     q.add_argument("--min-low", type=int)
     q.add_argument("--min-high", type=int)
+    q.add_argument("--mac-offset", type=int, metavar="NS",
+                   help="MAC_OFFSET (0x0A8): signed ns added to MAC-fallback timestamps")
     q = ss.add_parser("log", help="pop a port's SFD log FIFO")
     q.add_argument("port", type=port_t)
     q.add_argument("--dir", choices=["rx", "tx"], default="tx")

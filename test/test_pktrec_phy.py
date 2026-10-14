@@ -26,6 +26,7 @@ P1-P3: if P0 is ever powered down, P1-P3 lose link and MDIO reads return 0xffff.
    apply-calibration writing a new base -> adopted, correction re-applied;
    link-up with 0x0055 = 0 -> base; --no-0055-correction leaves RX_OFFSET alone.
 5. gen: size + rand mask beyond TX_MAX_LEN + 1 (1518) refused, --force sends.
+6. sfd config --mac-offset writes MAC_OFFSET.
 Exit 0 when every check passed.
 """
 
@@ -396,6 +397,12 @@ def test_gen():
     run(["gen", "2", "stop"])
 
 
+def test_sfd_config():
+    print("sfd config --mac-offset")
+    out = run(["sfd", "config", "--mac-offset", "-418"])
+    check(m.s32(CAP.rd(0x0A8)) == -418 and "MAC_OFFSET -418" in out, "MAC_OFFSET written and shown")
+
+
 def main():
     global VERBOSE
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -406,6 +413,7 @@ def main():
     test_restart()
     test_skew()
     test_gen()
+    test_sfd_config()
     print(f"\n{'ALL PASSED' if not FAILS else str(len(FAILS)) + ' FAILED'}")
     for f in FAILS:
         print("  FAILED: " + f)
