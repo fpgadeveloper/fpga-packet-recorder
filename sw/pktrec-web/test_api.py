@@ -15,7 +15,8 @@ and, with --lint, by test/pcapng_lint.py and capinfos if installed); raw
 download; delete (and 404 after). Exits 0 when every check passed.
 
 Against the board, run traffic into the captured ports while it runs.
-Against 'pktrec-web --mock', it also checks the start-failure path.
+Against 'pktrec-web --mock', it also checks the start-failure path and the
+loop-safety refusal of mode tap for a pair with a PHY in loopback (409).
 """
 
 import argparse
@@ -162,6 +163,17 @@ def main():
         check(s == 500 and "fdrec0" in r.get("error", ""), f"start failure reported ({r.get('error')})")
         s, r, _ = call(base, "GET", f"/api/captures/{tag}-mockfail/info")
         check(s == 404, "failed capture file removed")
+        ms = st["version"].get("mock_state")
+        if ms:                                  # loop safety: no tap into a looped PHY
+            lp = os.path.join(ms, "phy_loop.json")
+            with open(lp, "w") as f:
+                json.dump([False, False, False, True], f)
+            try:
+                s, r, _ = call(base, "POST", "/api/mode", {"pair": 1, "mode": "tap"})
+                check(s == 409 and "loopback" in r.get("error", ""),
+                      f"mode tap refused for a pair with a PHY in loopback ({r.get('error')})")
+            finally:
+                os.unlink(lp)
 
     if not st["disk"]["mounted"]:
         return finish()

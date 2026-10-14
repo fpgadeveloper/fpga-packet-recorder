@@ -22,6 +22,8 @@ are exercised end to end. State lives in $PKTREC_MOCK_STATE (JSON files).
   mock_tools.py cap info <file>
   mock_tools.py phy status [--json]
   mock_tools.py phy path <port|all> idle|loop|fwd
+                         (phy_loop.json in the state dir, [bool] x 4, marks PHYs
+                         in MII loopback: status reports them, fwd/loop refused)
   mock_tools.py tb       refresh the pktrec-tb state files in $PKTREC_MOCK_STATE:
                          tb.json (a locked daemon), calibration.conf (the shipped
                          default) and calibration.json (applied at "boot")
@@ -254,6 +256,7 @@ PHY_ADDR = [0x01, 0x03, 0x0C, 0x0F]
 
 def phy_status(a):
     paths = load("phy.json", ["idle"] * 4)
+    looped = load("phy_loop.json", [False] * 4)        # BMCR[14] per port (test hook)
     if a.json:                                     # pktrec-phy status --json
         ports = []
         for n in range(4):
@@ -265,7 +268,8 @@ def phy_status(a):
                 "pcs": {"sync": int(up), "an": "done" if up else "idle", "an_timeout": False,
                         "lp_link": int(up), "speed": "1G", "full_duplex": True},
                 "lp_adv": 0xd801 if up else 0, "link_up": int(up), "gpio0": 0, "gpio1": 0,
-                "path": paths[n]})
+                "path": paths[n], "phy_loopback": bool(looped[n]),
+                "phy_powered_down": False})
         pairs = [{"pair": p, "ports": [2 * p, 2 * p + 1],
                   "mode": "tap" if paths[2 * p] == paths[2 * p + 1] == "fwd" else "monitor"}
                  for p in range(2)]
@@ -290,6 +294,10 @@ def phy_path(a):
     for n in ports:
         if not 0 <= n <= 3:
             print("port must be 0..3 or all", file=sys.stderr)
+            return 1
+        if a.mode != "idle" and load("phy_loop.json", [False] * 4)[n]:
+            print(f"pktrec-phy: refused: path {n} {a.mode}: P{n}'s PHY is in MII loopback",
+                  file=sys.stderr)
             return 1
         paths[n] = a.mode
     save("phy.json", paths)

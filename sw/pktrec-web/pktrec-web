@@ -262,7 +262,8 @@ def phy_status_from_json(doc):
             "link": up, "speed": cu.get("speed") if up else None,
             "duplex": None if not up or fd is None else ("full" if fd else "half"),
             "error": cu.get("error"), "sgmii_sync": bool(pcs.get("sync")) if pcs else None,
-            "pcs_link": bool(p.get("link_up")), "path": p.get("path")}
+            "pcs_link": bool(p.get("link_up")), "path": p.get("path"),
+            "phy_loopback": p.get("phy_loopback")}
     pairs = [q.get("mode") for q in doc.get("pairs") or []] or None
     return ports, pairs
 
@@ -425,6 +426,7 @@ class Backend:
             v["image"] = None
         if self.a.mock:
             v["image"] = "mock (host test)"
+            v["mock_state"] = os.environ.get("PKTREC_MOCK_STATE")
         return v
 
     def ssd_mounted(self):
@@ -519,6 +521,21 @@ class Backend:
             if self.proc is not None:
                 raise ApiError(409, "a capture is running; stop it before changing the mode")
             path = {"tap": "fwd", "monitor": "idle"}[mode]
+            if mode == "tap":
+                # loop safety (pktrec-phy "Loop safety"): never forward into a PHY in
+                # MII loopback - the far side's traffic would come straight back to it
+                # (LAN outage 2026-10-13). pktrec-phy refuses too; this gives a clean 409.
+                r = self.run_safe(self.cmd_phy + ["status", "--json"], 10)
+                try:
+                    ports, _ = phy_status_from_json(json.loads(r.stdout))
+                except (ValueError, KeyError, TypeError):
+                    ports = {}
+                looped = [p for p in PAIRS[pair] if (ports.get(p) or {}).get("phy_loopback")]
+                if looped:
+                    raise ApiError(409, f"pair {pair} not switched to tap: the PHY of "
+                                   + ", ".join(f"P{p}" for p in looped) + " is in MII loopback; "
+                                   "forwarding into it would reflect the traffic back at its "
+                                   "source (see 'pktrec-phy safe'; clear it first)")
             for port in PAIRS[pair]:
                 r = self.run(self.cmd_phy + ["path", str(port), path])
                 if r.returncode != 0:
