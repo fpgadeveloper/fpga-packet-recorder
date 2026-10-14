@@ -14,6 +14,8 @@ ExecStart=/usr/bin/python3 /usr/bin/pktrec-web --banner --interface ${PKTREC_WEB
 StandardOutput=journal+console
 # no address after 180 s is reported but is not a failed boot
 SuccessExitStatus=1
+# keep "active (exited)" after the banner was printed, so systemctl status shows it ran
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
