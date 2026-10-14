@@ -130,7 +130,7 @@ bytes that were reserved before, without a version change: older files have zero
 | 112 | `dma_errors` | u64 | DMA errors reported by the driver |
 | 120 | `target` | char[32] | for example `zcu106` |
 | 152 | `hostname` | char[64] | |
-| 216 | `design` | char[32] | design version string |
+| 216 | `design` | char[32] | design version string: `pktrec-cap --design`, by default the line in `/etc/pktrec-release` (`fpga-packet-recorder <git describe>`, installed with the image; only the version when the line is longer than 31 characters) |
 | 248 | `port[4]` | 4 × 80 bytes | per-port statistics, below |
 | 568 | `tb_disc_flags` | u32 | timebase discipline at the start: [0] fields valid, [1] daemon running, [2] locked, [3] system clock NTP-synchronised, [4] `pktrec-cap` set the timebase at the start |
 | 572 | `tb_disc_locked_s` | u32 | seconds the daemon had been locked |
