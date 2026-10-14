@@ -222,6 +222,8 @@ It refuses to write binary to a terminal unless `--force` is given.
 | `--raw-ts` | - | Write the raw timebase values instead of wall-clock time. |
 | `--comments` | - | Per-packet comment for records flagged with a MAC timestamp or an SFD mismatch. |
 | `--no-isb` | - | No Interface Statistics Blocks. |
+| `--check` | - | Check gen_seq.py / PRSQ test traffic while exporting (below). |
+| `--expect <n>` | - | With `--check`: every PRSQ stream must have exactly `n` frames. |
 
 At the end it prints a summary to stderr:
 
@@ -237,6 +239,25 @@ At the end it prints a summary to stderr:
 | 2 | Written, but with anomalies: corrupt stretches skipped, records later than the reorder window, a truncated tail, or recorder data loss recorded in the header. |
 | 1 | Error. |
 | 3 | The output could not be written: the reader closed the pipe (EPIPE, e.g. `pktrec-export cap.cap - \| head`) or the disk is full; the message names the write error. |
+| 4 | Written, but `--check` found a problem (takes precedence over 2). |
+
+`--check` runs the PRSQ part of `test/check_pcap.py` inside the exporter, on the frames in
+output (timestamp) order, at export speed. Frames must carry the gen_seq.py payload (UDP over
+IPv4, optional 802.1Q/802.1ad tags, `"PRSQ"` + stream id + 64-bit sequence number), as sent
+by `gen_seq.py` and by the board's hardware generators (`pktrec-phy gen`). For each port and
+stream it reports the frame count, the sequence range, missing numbers (gaps inside the range
+seen), duplicates, out-of-order numbers, bad-FCS frames and the inter-frame interval; for each
+port, timestamps that go backwards. Other frames are counted and ignored. The verdict
+(`pktrec-export --check: PASS` or `FAIL`) goes to stderr, also with `-q`. The pcapng output is
+unchanged; for a check without a file, write to `/dev/null`:
+
+```
+pktrec-export --check --expect 87000000 /mnt/rec/captures/run1.cap -o /dev/null
+```
+
+Missing numbers are counted between the first and the last number seen in each stream; use
+`--expect` (or `check_pcap.py --sent` on the PC) to catch frames lost at the start or the end.
+Linux pktgen payloads are not recognised by `--check`; use `check_pcap.py` for those.
 
 The reorder window, the header checks and resynchronisation, and the pcapng mapping are
 described in [File formats](capture_format.md#pcapng-mapping).

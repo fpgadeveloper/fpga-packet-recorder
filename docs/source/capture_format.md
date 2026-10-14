@@ -214,4 +214,4 @@ hardware drops.
 
 Exit codes: 0 clean; 2 written but with anomalies (corrupt stretches skipped, records later
 than the window, a truncated tail, or recorder data loss recorded in the header); 1 error; 3 the output could not be written
-(reader closed the pipe, disk full).
+(reader closed the pipe, disk full); 4 written, but `--check` found a problem.

@@ -31,8 +31,9 @@ out-of-order timestamps, a bad frame, a truncated frame, fill units) and checks 
 file exports with exit code 0 and every sequence number once and in order; that a damaged
 file (a corrupted stretch and a truncated tail) exports with exit code 2, one resync and
 exactly the destroyed frames missing; that hardware drops appear as `isb_ifdrop` = the sum of
-`epb_dropcount`; and that a too-small reorder window is detected. If `tshark` or `capinfos`
-is installed, it also checks that Wireshark reads the export without warnings.
+`epb_dropcount`; that a too-small reorder window is detected; and that `pktrec-export --check`
+gives the same counts as `check_pcap.py`. If `tshark` or `capinfos` is installed, it also
+checks that Wireshark reads the export without warnings.
 
 The web interface can be tried and tested on a PC with stand-in tools (see
 [Web interface](web_ui.md#how-it-works)): `sw/pktrec-web/test_api.py` exercises every API
@@ -85,9 +86,10 @@ drops. The board's ports are initialised at boot; the SSD is mounted at `/mnt/re
    wait
    sudo pktrec-phy chk 3 status
    sudo pktrec-phy path 2 idle
-   sudo pktrec-export /mnt/rec/captures/lr64.cap -o /mnt/rec/captures/lr64.pcapng
-   pktrec-check-pcap /mnt/rec/captures/lr64.pcapng --interface P3 --expect-if P3=85000000
+   sudo pktrec-export --check --expect 85000000 /mnt/rec/captures/lr64.cap -o /dev/null
    ```
+   (or export to a pcapng and check it on the PC; see
+   [Checking large captures](#checking-large-captures)).
 2. From a PC on any port (here P1), with `pktrec-cap --ports 1` running on the board:
    ```
    sudo test/board_pktgen.sh -i <pc-if> -d 02:00:00:00:00:99 -s 64 -c 10000000 -o sent64.json
@@ -98,7 +100,7 @@ drops. The board's ports are initialised at boot; the SSD is mounted at `/mnt/re
    send it with `tcpreplay`.
 
 **Pass criteria:** `pktrec-cap` exits with 0 (no frame dropped anywhere), `pktrec-export`
-exits with 0, `check_pcap.py` reports PASS (every sequence number once, in order, the counts
+exits with 0, `pktrec-export --check` or `check_pcap.py` reports PASS (every sequence number once, in order, the counts
 match, `isb_ifdrop` = 0), and the pcapng opens in Wireshark without warnings.
 
 For a four-port line-rate test, run generators on all ports. Ports whose far end is a device
@@ -110,6 +112,27 @@ and with `--i-accept-lan-loop` on `gen`: `pktrec-phy` refuses a generator on a p
 loopback (see [Loop safety](modes.md#loop-safety)). Never do it on a pair that is cabled into a
 network. Restore the PHYs with `0x1140` afterwards and check with `pktrec-phy safe`. The
 results of these tests are on the [Performance](performance) page.
+
+## Checking large captures
+
+`check_pcap.py` is pure Python. On the board's Cortex-A53 (`pktrec-check-pcap`) it checks about
+6 500 records/s on one core, so a line-rate capture of 87 million frames would take about
+3.7 hours (measured 2026-10-14). For captures of more than about a million frames, use one
+of these instead:
+
+* **On the board, in the exporter:** `pktrec-export --check [--expect N] <capture> -o /dev/null`
+  runs the same sequence check for PRSQ frames while exporting, so it runs at export speed
+  (the export runs at 390 000 to 416 000 records/s on the board; see
+  [Performance](performance.md)). On a PC, `--check` adds less than 10 % to the export time
+  (1 million records in 2.4 s with or without it). It does not recognise pktgen payloads.
+* **On the PC, streamed:** export over SSH and check on the PC, one port per stream:
+  ```
+  ssh amd-edf@<board-ip> pktrec-export --port 0 -o - /mnt/rec/captures/run1.cap \
+      | python3 test/check_pcap.py /dev/stdin --expect 87000000
+  ```
+  Measured 2026-10-14: about 8 MB/s per stream, about 20 minutes for 87 million 66-byte
+  frames on one port. The PC needs no copy of the capture (capture files are readable by
+  every user, so no `sudo` is needed).
 
 ## Link-state propagation
 

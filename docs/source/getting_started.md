@@ -103,7 +103,8 @@ sudo pktrec-export /mnt/rec/captures/first.cap -o /mnt/rec/captures/first.pcapng
 ```
 
 `pktrec-cap` prints live statistics every second and a summary at the end; it exits with 0
-when no frame was dropped. Copy the pcapng to your PC (`scp`), or convert on the PC: the raw
+when no frame was dropped. Copy the pcapng to your PC
+(`scp amd-edf@<board-ip>:/mnt/rec/captures/first.pcapng .`), or convert on the PC: the raw
 `.cap` file can also be downloaded from the web interface, and `pktrec-export` builds and runs
 on a Linux PC. See [Software](software) for all options.
 
