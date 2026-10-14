@@ -39,11 +39,12 @@
  * TI DP83867 PHY, so Linux falls back to the Generic PHY driver and the
  * RGMII clock delays are never programmed - the link negotiates 1G but
  * passes no packets. Values from the official zynqmp-zcu106-revA.dts
- * (PHY at MDIO address 0xc). The fixed MAC replaces the random one the
- * SDT flow leaves us with, keeping DHCP leases stable across boots.
+ * (PHY at MDIO address 0xc). No local-mac-address here: U-Boot reads the
+ * board's own MAC from the ZCU106 EEPROM (see &i2c1 below), sets ethaddr and
+ * writes it into this node (fdt_fixup_ethernet, via the ethernet0 alias)
+ * before starting Linux.
  */
 &gem3 {
-	local-mac-address = [00 0a 35 06 21 07];
 	phy-handle = <&gem3_phy>;
 	mdio {
 		#address-cells = <1>;
@@ -56,6 +57,40 @@
 			ti,fifo-depth = <0x1>;
 			ti,dp83867-rxctrl-strap-quirk;
 		};
+	};
+};
+
+/* Board EEPROM (MAC address source). The SDT flow describes the PS I2C
+ * controllers but none of the board devices behind them, so U-Boot (which
+ * runs on this same device tree: BOOT.BIN loads cortexa53-linux.dtb at
+ * 0x100000, CONFIG_OF_BOARD) finds no EEPROM and falls back to a random MAC.
+ * Describe the path from the official zynqmp-zcu106-revA.dts (UG1244: PS
+ * I2C1 at ff030000 -> TCA9548 U34 @0x74, channel 0 -> 24C08 EEPROM U23
+ * @0x54) and give it the nvmem0 alias: U-Boot's xilinx_read_eeprom() walks
+ * the nvmemN aliases, decodes the Xilinx legacy layout (MAC at offset 0x20)
+ * and sets ethaddr. Linux also binds pca954x + at24 to these nodes.
+ */
+&i2c1 {
+	i2c-mux@74 { /* U34 */
+		compatible = "nxp,pca9548";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		reg = <0x74>;
+		i2c@0 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <0>;
+			board_eeprom: eeprom@54 { /* U23 */
+				compatible = "atmel,24c08";
+				reg = <0x54>;
+			};
+		};
+	};
+};
+
+/ {
+	aliases {
+		nvmem0 = &board_eeprom;
 	};
 };
 

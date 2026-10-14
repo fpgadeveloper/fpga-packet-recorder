@@ -15,7 +15,8 @@
 #   - The PL hardware (xilinx_xdma PCIe Root Port on HPC1, AXI DMA, fdrec_core) is captured by the SDT's
 #     pl.dtsi and lopper-merged into the generated Linux device tree, so no
 #     hand-curated PL system-user.dtsi is needed. system-user.dtsi carries
-#     SoC-side board fixups (UART ttyPS mapping, GEM3 PHY + fixed MAC) and the
+#     SoC-side board fixups (UART ttyPS mapping, GEM3 PHY, board EEPROM for
+#     U-Boot's MAC lookup) and the
 #     fdrec driver binding.
 #   - The Vivado bitstream is extracted into the SDT and wired via
 #     BITSTREAM_PATH; because no PL overlay is requested, fpga-overlay is left

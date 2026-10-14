@@ -107,8 +107,10 @@ quirks, not PL hardware:
 * **PS Ethernet** (`zcu106`): the SDT flow does not describe the board's TI
   DP83867 PHY on GEM3, so Linux would fall back to the Generic PHY driver and
   never program the RGMII clock delays (the link comes up at 1G but passes no
-  packets). The dtsi adds the PHY node with its `ti,*` delay properties and a
-  fixed MAC address.
+  packets). The dtsi adds the PHY node with its `ti,*` delay properties, plus
+  the board EEPROM (I2C mux U34 @0x74 ch0, 24C08 @0x54, alias `nvmem0`) so
+  U-Boot reads the board's own MAC address and passes it to Linux. No MAC
+  address is fixed in the device tree.
 * **Recorder** (`zcu106`): binds the `fdrec` driver to the `fdrec_core`
   register block and the two AXI DMA channels.
 

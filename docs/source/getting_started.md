@@ -28,7 +28,10 @@ pktrec web UI: http://192.168.2.110:8080/
 zcu106-pktrec-2025-2 login:
 ```
 
-(The address is the one your DHCP server assigns.) If the line does not appear, see
+(The address is the one your DHCP server assigns.) The port uses the board's own MAC address,
+read from the ZCU106 EEPROM; U-Boot prints it near the top of the UART output
+(`Ethernet mac: 00:0a:35:...`). Reserve that MAC address in your DHCP server to give the board
+a fixed IP address. If the line does not appear, see
 [Troubleshooting](troubleshooting.md#no-web-interface-url-on-the-console).
 
 ## Log in

@@ -93,9 +93,13 @@ The 2 MB hugepages (`FDREC_HUGEPAGES`, default 256 = 512 MB) hold the recording 
 ring buffers.
 
 ```{note}
-The image gives the board's RJ45 port a **fixed MAC address** (`local-mac-address` in
-`Yocto/bsp/zcu106/meta-user/recipes-bsp/device-tree/files/system-user.dtsi`). If you run more
-than one board on the same network, give each image its own address there.
+The board's RJ45 port uses the board's own **MAC address from the ZCU106 EEPROM**; no MAC
+address is built into the image, so the same image works on any number of boards. U-Boot
+reads the EEPROM (described for it in
+`Yocto/bsp/zcu106/meta-user/recipes-bsp/device-tree/files/system-user.dtsi`), prints the
+address on the UART at power-up (`Ethernet mac:` in the `Xilinx I2C Legacy format` block) and
+passes it to Linux. To keep the board at the same IP address, reserve that MAC address in
+your DHCP server.
 ```
 
 ## Boot from SD card
