@@ -253,13 +253,23 @@ LAN_LOOP_WARNING = ("WARNING (--i-accept-lan-loop): loop-safety check overridden
                     "whole LAN down (switch MAC learning). Undo it as soon as the test is over.")
 
 
+def open_regs_dev(dev):
+    """os.open() a UIO node or /dev/mem; a clean message instead of a traceback
+    when the caller is not root (the register devices are root-only)."""
+    try:
+        return os.open(dev, os.O_RDWR | os.O_SYNC)
+    except PermissionError:
+        prog = os.path.basename(sys.argv[0]) or "pktrec-phy"
+        raise SystemExit(f"{prog}: needs root (sudo): {dev}: permission denied")
+
+
 class Regs:
     """32-bit register window (UIO map or /dev/mem)."""
 
     def __init__(self, base, size, devmem=False):
         self.base = base
         if devmem:
-            fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+            fd = open_regs_dev("/dev/mem")
             self.mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE,
                                 offset=base)
             self.src = "/dev/mem"
@@ -268,7 +278,7 @@ class Regs:
             if dev is None:
                 raise SystemExit(f"pktrec-phy: no UIO device maps 0x{base:x} "
                                  "(generic-uio binding missing? try --devmem)")
-            fd = os.open(dev, os.O_RDWR | os.O_SYNC)
+            fd = open_regs_dev(dev)
             self.mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE,
                                 offset=0)
             self.src = dev
