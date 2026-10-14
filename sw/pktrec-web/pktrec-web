@@ -313,10 +313,18 @@ def tb_discipline(path):
             "lock_threshold_ns": st.get("lock_threshold_ns"), "message": st.get("message")}
 
 
+# The image installs calibration.conf with the build's reproducible mtime (years in the
+# past): a file older than this is the shipped default, not one saved on this board.
+CAL_SHIPPED_BEFORE = 1577836800          # 2020-01-01T00:00:00Z
+
+
 def calibration_state(cal_file, applied_file):
-    d = {"file": cal_file, "present": os.path.isfile(cal_file), "mtime": None, "applied": None}
+    d = {"file": cal_file, "present": os.path.isfile(cal_file), "mtime": None,
+         "shipped_default": None, "applied": None}
     if d["present"]:
-        d["mtime"] = iso_ns(int(os.stat(cal_file).st_mtime * 1e9))
+        mt = os.stat(cal_file).st_mtime
+        d["shipped_default"] = mt < CAL_SHIPPED_BEFORE
+        d["mtime"] = "shipped default" if d["shipped_default"] else iso_ns(int(mt * 1e9))
     ap = read_json_file(applied_file)
     if isinstance(ap, dict):
         d["applied"] = {k: ap.get(k) for k in ("applied", "file", "ok", "errors", "warnings")}

@@ -93,8 +93,8 @@ The same cards in the dark theme.
 * **locked to system time (NTP)**: the hardware timestamps follow the board's system clock,
   within the offset shown (sub-microsecond once locked, see
   [Timestamping](timestamping.md#timebase-and-absolute-time));
-* **tracking, not locked yet**: for about a minute after boot, or after the system clock
-  jumped;
+* **tracking, not locked yet**: for 3 to 4 minutes after power-on (2 to 3 minutes after the
+  NTP client's first step of the system clock), or after the system clock jumped;
 * **not disciplined**: `pktrec-tb.service` is not running, so the timestamps drift from
   wall-clock time at the rate of the board's crystal error (about 10 to 12 ppm on the board
   that was measured).
@@ -145,7 +145,7 @@ code:
 
 | Method and path | Body | Returns |
 |-----------------|------|---------|
-| `GET /api/status` | - | `ports[]` (link, speed, duplex, SGMII sync, path, counters), `pairs[]` (mode `tap`, `monitor` or `other`), `capture`, `disk`, `time` (system time, timebase, `tb_inc_ns`, `tb_freq_ppb`, and `discipline`: see below), `calibration` (`file`, `present`, `mtime`, `applied`: time, ok, errors), `version`, `errors`, `sources` (`json` or `text`: how each tool's output was read) |
+| `GET /api/status` | - | `ports[]` (link, speed, duplex, SGMII sync, path, counters), `pairs[]` (mode `tap`, `monitor` or `other`), `capture`, `disk`, `time` (system time, timebase, `tb_inc_ns`, `tb_freq_ppb`, and `discipline`: see below), `calibration` (`file`, `present`, `mtime`: the file's modification time, or `shipped default` for the file installed with the image, `shipped_default`, `applied`: time, ok, errors), `version`, `errors`, `sources` (`json` or `text`: how each tool's output was read) |
 | `GET /api/stats` | - | `capture` (state, name, elapsed, file size, live: write MB/s, ring buffers used/total, back-pressure, per-port rates and drops; `last` = result of the previous capture), `counters` (per port: frames, bytes, drops, bad, truncated, FIFO high-water, frames/s, bits/s), `disk`. Poll it once a second. |
 | `POST /api/mode` | `{"pair": 0 or 1, "mode": "tap" or "monitor"}` | the new `pairs[]` |
 | `POST /api/capture/start` | `{"ports": [0,1,2,3], "snaplen": 0, "duration_s": 60, "size_bytes": 1000000000, "name": "test1"}`; everything optional | 202 and the capture state |
