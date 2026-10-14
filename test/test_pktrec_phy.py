@@ -358,6 +358,9 @@ def test_propagation():
     i_sg = next((i for i, x in enumerate(e) if i > i_clr and x[:3] == ("mdio", 1, m.CFG2)), None)
     check(i_fwd is not None and i_sg is not None and i_clr < i_sg < i_fwd and e[i_clr][3] & 0x0200,
           "P0 release ordering: BMCR[14] cleared + AN restart, SGMII re-trigger, then path 0 fwd")
+    check(not e[i_lb][3] & 0x1000 and e[i_clr][3] & 0x1000,
+          "P0 hold = loopback WITH AN off (0x4140 drops the copper link, 0x5140 does not: bench D); "
+          "release sets AN enable again")
     holds = [e for e in ev if e["event"] == "hold"]
     check(holds and holds[0]["port"] == 0 and "path 0 fwd -> idle" in holds[0]["steps"]
           and holds[0]["steps"][-1] == "BMCR[14] MII loopback P0",

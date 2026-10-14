@@ -481,10 +481,13 @@ class Board:
         self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_PWRDN, BMCR_AN_RESTART)
 
     def phy_loopback(self, n, on, lan_ok=False):
-        """BMCR[14] MII loopback on / off. With it on, the DP83867 drops its copper link
-        (the far device sees link down) but keeps running: its clocks (P0's CLK_OUT
-        feeds P1-P3), MDIO and the SGMII side stay alive (bench 2026-10-13). Turning it
-        off also restarts auto-negotiation (BMCR[9], self-clearing).
+        """BMCR[14] MII loopback on / off. On also clears BMCR[12] (auto-negotiation
+        enable): only loopback WITH AN off (0x4140) drops the copper link so the far
+        device sees link down (bench 2026-10-13); loopback with AN on (0x5140) keeps
+        the copper link up (bench D 2026-10-14: P0 held at 0x5140, its partner P2 stayed
+        up). The PHY keeps running either way: its clocks (P0's CLK_OUT feeds P1-P3),
+        MDIO and the SGMII side stay alive. Turning it off sets BMCR[12] again and
+        restarts auto-negotiation (BMCR[9], self-clearing).
         Loop safety: refused (RuntimeError) while anything is sent into port n (its
         path or EFF_PATH is not idle): whatever its TX carries would come straight
         back on its RX. Callers make the path idle first. Also refused on a LAN-pair
@@ -493,9 +496,9 @@ class Board:
             busy = tx_into(self, n) + ([] if lan_ok else lan_loop_why(n))
             if busy:
                 raise RuntimeError(f"refused: MII loopback on P{n}: " + "; ".join(busy))
-            self.mdio_rmw(PHY_ADDR[n], BMCR, 0, BMCR_LOOPBACK)
+            self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_AN_EN, BMCR_LOOPBACK)
         else:
-            self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_LOOPBACK, BMCR_AN_RESTART)
+            self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_LOOPBACK, BMCR_AN_EN | BMCR_AN_RESTART)
 
     def phy_looped(self, n):
         return bool(self.mdio_rd(PHY_ADDR[n], BMCR) & BMCR_LOOPBACK)
