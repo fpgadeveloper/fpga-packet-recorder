@@ -1,9 +1,8 @@
 # Documentation for the FPGA Packet Recorder
 
-This folder contains the Sphinx sources for the FPGA Packet Recorder documentation. The
-documentation is published at Read the Docs (the design is in development on the
-`dev` branch). We encourage you to contribute: modify these sources and make a pull
-request to this repository on Github.
+This folder contains the Sphinx sources for the FPGA Packet Recorder documentation, built
+by Read the Docs from `.readthedocs.yaml` at the repository root. We encourage you to
+contribute: modify these sources and make a pull request to this repository on Github.
 
 ## How to build the docs locally
 
@@ -54,3 +53,9 @@ To view the locally generated docs, just browse to `<path-of-this-repo>/docs/bui
 the `index.html` in a web browser. Each time you wish to rebuild the docs, you just need to run
 `make html` and it will work as long as you have activated the virtual environment first.
 
+To check the docs the way a release requires (every warning is an error), run from any
+directory:
+
+```
+sphinx-build -W --keep-going -b html <path-of-this-repo>/docs/source /tmp/pktrec-docs-html
+```
