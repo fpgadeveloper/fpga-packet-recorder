@@ -49,7 +49,8 @@ its previous state.
   sends them error-terminated (the receiver counts a receive error, as described for TAP
   forwarding in [Port modes](modes.md#what-the-devices-see)); `--bad-as-good` sends them with
   a valid FCS. The original FCS value cannot be reproduced.
-* Frames longer than 1518 bytes are cut by the transmitting MAC (see
+* Frames longer than the port's maximum frame length (1522 bytes by default, one 802.1Q
+  tag; `pktrec-phy maxlen` raises it) are cut by the transmitting MAC (see
   [Known limitations](known_limitations)).
 
 ## Timing

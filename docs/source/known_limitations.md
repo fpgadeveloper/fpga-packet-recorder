@@ -20,14 +20,14 @@
   two different speeds, and the SFD windows and offsets are calibrated for 1 Gb/s only. The
   MAC/PCS supports SGMII rate adaptation, so monitoring at 10/100 Mb/s (by running
   `pktrec-phy init` without `--1000-only`) may work, but it has not been tested.
-* **Jumbo frames are not supported.** The MACs accept frames up to 1518 bytes including the
-  FCS (`RX_MAX_LEN` / `TX_MAX_LEN`): longer frames are flagged bad when received and cut when
-  transmitted. The dynamic inter-frame gap thresholds also assume frames of at most 1518
-  bytes.
-* **Full-size VLAN-tagged frames.** By the same limit, an 802.1Q-tagged frame of the maximum
-  size (1522 bytes) exceeds 1518 bytes: it is captured with the bad-frame flag and, in TAP
-  mode, forwarded as an errored frame. This follows from the MAC configuration and has not
-  been measured. Tagged frames up to 1518 bytes are not affected.
+* **Frames longer than 1522 bytes are flagged oversize.** The MACs accept frames up to
+  1522 bytes including the FCS by default (`RX_MAX_LEN` / `TX_MAX_LEN`): a full-size
+  802.1Q-tagged frame passes as a good frame, captured and forwarded intact. A longer frame
+  is captured whole but with the bad-frame flag (counted in `RX_BAD`), and in TAP mode it
+  leaves the other port cut at 1522 bytes and error-terminated. The limit is a per-port
+  register: `pktrec-phy maxlen <port|all> --set <bytes>` raises it (up to 16383, e.g. 2000
+  for "baby jumbo" frames) and raises the dynamic inter-frame gap thresholds with it.
+  Frames above 1522 bytes have been checked in simulation only.
 * **Store-and-forward TAP.** The forwarding latency grows with the frame size: 8 ns per byte
   plus 917 ns (1.43 µs at 64 bytes, 13.06 µs at 1518 bytes). It is fixed for a given frame
   size, but it is not the constant latency of a cut-through or passive TAP. See

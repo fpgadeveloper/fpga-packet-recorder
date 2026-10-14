@@ -51,7 +51,8 @@ Most commands accept `--json`.
 | `pktrec-phy sfd status [--clear]` | SFD timestamping counters per port: edges, matches, stale entries, mismatches, MAC−SFD deltas, transmit latency |
 | `pktrec-phy sfd config [--rx-win MIN MAX] [--tx-win MIN MAX] [--rx-offset P NS] [--tx-offset P NS] [--match on\|off] [--log on\|off] ...` | SFD windows, offsets, matching and logging ([Timestamping](timestamping)) |
 | `pktrec-phy sfd log <port> [--dir rx\|tx]` | reads the port's SFD log FIFO (last 16 timestamps) |
-| `pktrec-phy gen <port> start [--size B] [--count N] [--ifg B \| --rate PPS] [--rand-mask M] [--bad] ...` | starts the port's hardware traffic generator (`--size` includes the FCS; sizes that can exceed the MAC's 1518-byte limit are refused unless `--force`) |
+| `pktrec-phy gen <port> start [--size B] [--count N] [--ifg B \| --rate PPS] [--rand-mask M] [--vlan VID] [--bad] ...` | starts the port's hardware traffic generator (`--size` includes the FCS and the 802.1Q tag that `--vlan` inserts; sizes that can exceed the MAC's limit, 1522 bytes by default, are refused unless `--force`) |
+| `pktrec-phy maxlen <port\|all> [--set B]` | the MACs' maximum frame length including the FCS (1522 by default); `--set` changes it for RX and TX and raises the dynamic inter-frame gap thresholds to stay above it |
 | `pktrec-phy gen <port> stop\|status` | stops it / shows its counters |
 | `pktrec-phy chk <port> start\|stop\|status` | receive checker for generator traffic: frames, lost, duplicates or reordered, bad |
 | `pktrec-phy ifg <port\|all> [...]` | dynamic inter-frame gap settings and counters of the TAP forward path, forward FIFO fill, flushed frames |

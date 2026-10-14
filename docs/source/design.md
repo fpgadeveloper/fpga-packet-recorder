@@ -144,7 +144,9 @@ clocks (±100 ppm), the board with its own: if a device sends at 100 % utilisati
 clock is faster, frames arrive faster than they can be sent (at a +200 ppm worst case, 25 KB
 per second). Saving 4 bytes per frame catches up 0.26 % (2600 ppm) with 1518-byte frames and
 4.8 % with 64-byte frames. The FIFO fill includes the frame being received, so `IFG_LO` must
-stay above the largest frame. Below 100 % utilisation the gap stays at 12 bytes.
+stay above the largest frame: 2048 bytes leaves more than 500 bytes over the MACs' 1522-byte
+limit, and `pktrec-phy maxlen --set` raises both thresholds when it raises the limit. Below
+100 % utilisation the gap stays at 12 bytes.
 
 **Traffic generator and checker.** Each port has a generator (`pktrec_gen`, path GEN) and a
 receive checker (`pktrec_gen_chk`):
@@ -155,8 +157,12 @@ receive checker (`pktrec_gen_chk`):
 * Format 1 (raw): destination, source, EtherType (`GEN_ETYPE`, default `0x88B5`), a u32
   sequence number, zeros.
 * Length 60..16383 bytes without the FCS (the MAC appends it), optionally random
-  (`LEN + (LFSR & LEN_MASK)`). Frames above the MAC's `TX_MAX_LEN` (1518 bytes including
+  (`LEN + (LFSR & LEN_MASK)`). Frames above the MAC's `TX_MAX_LEN` (1522 bytes including
   the FCS) are cut by the MAC and arrive as bad frames.
+* `GEN_VLAN` inserts an 802.1Q tag after the source MAC in either format (as
+  `gen_seq.py --vlan`); the length includes the tag, so `pktrec-phy gen <port> start --size
+  1522 --vlan 100` sends full-size tagged frames. The checker skips one tag in received
+  frames.
 * Rate: a frame starts at most every `ceil((LEN + 4 + 8 + IFG) / 2)` transmit clock cycles
   (IFG in bytes; 12 = line rate, 1.488 Mframes/s at 64 bytes).
 * `COUNT` frames (0 = until stopped); `GEN_CTRL.BAD` sends every frame error-terminated.
@@ -300,7 +306,7 @@ matching `_HI`.
 | Offset | Name | Description |
 |--------|------|-------------|
 | `0x000` | ID | `0x504B5245` ("PKRE") |
-| `0x004` | VERSION | `0x00010000` |
+| `0x004` | VERSION | `0x00010001` (1.1: maximum frame length 1522 bytes at reset) |
 | `0x008` | GCTRL | [0] hold the transceivers and QPLL in reset, [11:8] PHY `RESET_N` pins (reset `0xF`, released) |
 | `0x00C` | GSTATUS | [0] GT power good, [1] QPLL0 lock, [7:4] link up per port |
 | `0x010` | MDIO_CMD | write to start a frame: [31:30] `01`, [29:28] op (`01` write, `10` read), [27:23] PHY, [22:18] register, [15:0] data |
@@ -319,16 +325,16 @@ Port n (`0x100 + n*0x40`):
 | `+0x08` | LP_ADV | SGMII configuration word from the PHY |
 | `+0x0C` | STICKY | write 1 to clear: [0] link down, [1] bad FCS, [2] bad frame, [3] TX underflow, [4] AN interrupt |
 | `+0x10` | TX_IFG | not used in this design (the gap comes from `pktrec_m0_path`) |
-| `+0x14` | TX_MAX_LEN | maximum transmit frame length including FCS, minus 1 (1517) |
-| `+0x18` | RX_MAX_LEN | maximum receive frame length including FCS, minus 1 (1517); longer frames are flagged bad |
+| `+0x14` | TX_MAX_LEN | maximum transmit frame length including FCS, minus 1 (1521: 1518 + one 802.1Q tag); longer frames are cut and sent error-terminated |
+| `+0x18` | RX_MAX_LEN | maximum receive frame length including FCS, minus 1 (1521); longer frames are received whole but flagged bad (oversize) |
 | `+0x1C` | TX_MIN_LEN | minimum transmit length without FCS, minus 1 (59) |
 
-### Port paths: `pktrec_m0_path` (`0x04_2002_0000`, map 1.3)
+### Port paths: `pktrec_m0_path` (`0x04_2002_0000`, map 1.4)
 
 | Offset | Name | Description |
 |--------|------|-------------|
 | `0x000` | ID | `0x504B4D30` ("PKM0") |
-| `0x004` | VERSION | `0x00010003` |
+| `0x004` | VERSION | `0x00010004` |
 | `0x008` | PATH_CTRL | [2n+1:2n] transmit source of port n: 0 IDLE, 1 LOOP, 2 FWD, 3 GEN |
 | `0x00C` | CNT_CTRL | write 1: clear all counters and IO_STICKY |
 | `0x010` | IO_STATUS | [3:0] GPIO_0, [7:4] GPIO_1, [8] PG_1V0, [9] PG_2V5, [19:16] link up |
@@ -376,6 +382,7 @@ Generator and checker n (`0x200 + n*0x80`):
 | `+0x30` | GEN_SEQ_FIRST | first sequence number |
 | `+0x34` / `+0x38` | GEN_FRAMES | frames sent since the start (64) |
 | `+0x3C` / `+0x40` | GEN_BYTES | bytes sent including FCS (64) |
+| `+0x44` | GEN_VLAN | [15:0] 802.1Q TCI (priority, DEI, VLAN id), [16] insert the tag (0) |
 | `+0x48` | CHK_CTRL | [0] ENABLE (0→1 clears), [1] raw format, [31:16] EtherType |
 | `+0x4C` | CHK_FRAMES | generator frames received |
 | `+0x50` | CHK_LOST | sum of sequence gaps |
@@ -482,8 +489,8 @@ The custom RTL has self-checking testbenches in `Vivado/src/sim/` (run with
 | Testbench | Checks |
 |-----------|--------|
 | `tb_pktrec_m0_path` | IDLE/LOOP/FWD paths, whole-frame drops and counters |
-| `tb_pktrec_gen` | generator frames byte for byte against a `gen_seq.py` model, line-rate and IFG spacing, random lengths, count, stop; checker loss, duplicate and bad counts |
-| `tb_pktrec_tap` | real Taxi 1000BASE-X MAC/PCS on both sides of a pair at 100 % utilisation: bad-frame propagation (130 of 400 frames flagged bad exactly), the dynamic gap's hysteresis, clock mismatch (source +4 % fast: 9000 of 9000 frames with the dynamic gap, 75 dropped and counted without it), 12 mode switches mid-traffic with no corrupted, truncated or reordered frame; simulated forwarding latency 8 ns × frame length + 223 ns |
+| `tb_pktrec_gen` | generator frames byte for byte against a `gen_seq.py` model, line-rate and IFG spacing, random lengths, count, stop; 802.1Q-tagged frames (1522 bytes, minimum 62 + FCS, raw); checker loss, duplicate and bad counts, tagged and untagged |
+| `tb_pktrec_tap` | real Taxi 1000BASE-X MAC/PCS on both sides of a pair at 100 % utilisation: bad-frame propagation (130 of 400 frames flagged bad exactly), the dynamic gap's hysteresis, clock mismatch (source +4 % fast: 9000 of 9000 frames with the dynamic gap, 75 dropped and counted without it), 12 mode switches mid-traffic with no corrupted, truncated or reordered frame; 1522-byte tagged frames received and forwarded good both ways; 1523- and 1600-byte frames flagged bad and cut at the limit; simulated forwarding latency 8 ns × frame length + 223 ns |
 | `tb_pktrec_cap_port` | headers, data and padding of every record, snap length, whole-frame drops under back-pressure with exact counters and sequence gaps, port enable, minimum-size frames at line rate, timestamp conversion across the cycle counter wrap |
 | `tb_pktrec_cap_merge` | whole records only, per-port order, round-robin fairness, fill, soft-reset cut |
 | `tb_pktrec_timebase` | increment, set, adjust, rate change, the delay window of the cycle-count copies at +125 / −250 ppm |

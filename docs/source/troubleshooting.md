@@ -64,8 +64,8 @@ for a failed mount.
 
 ### Received frames are flagged bad
 
-* A frame larger than 1518 bytes (including the FCS) is flagged bad by the MAC: jumbo frames
-  and full-size VLAN-tagged frames are not supported (see
+* A frame larger than 1522 bytes (including the FCS) is flagged bad by the MAC (oversize):
+  raise the limit with `pktrec-phy maxlen` for jumbo frames (see
   [Known limitations](known_limitations)).
 * Otherwise the frames really arrived with an error: check the cable, and the far device's
   transmit errors.
