@@ -11,7 +11,8 @@
 //   lane 0:  source (100 % utilisation, IFG 12) -> Taxi TX @ rx_clk_0 (far device's
 //            clock) -> [bit-error injector] -> Taxi RX @ rx_clk_0 (our P0 MAC)
 //            -> pktrec_m0_path FWD FIFO -> Taxi TX @ tx_clk_1 (our P1 MAC, IFG from
-//            the DUT's dynamic IFG output) -> Taxi RX @ tx_clk_1 (device on P1)
+//            the DUT's dynamic IFG output, DIC_EN = OUR_DIC_EN = 0 as in
+//            pktrec_eth_ports_core) -> Taxi RX @ tx_clk_1 (device on P1)
 //            -> checker
 //   lane 1:  the same from P1 to P0
 //
@@ -21,7 +22,8 @@
 // local TX clock (QPLL). P2/P3 are not used (clocks stopped).
 //
 // Tests:
-//   1. Registers: VERSION 1.4, IFG_CTRL / IFG_THRESH reset values, PAIR_MODE RW,
+//   1. Registers: VERSION 1.6, IFG_CTRL (0x000C0C00: reduced gap off, IFG_MIN 12) /
+//      IFG_THRESH reset values, PAIR_MODE RW,
 //      EFF_PATH follows PATH_CTRL.
 //   2. Bad-frame forwarding: frames sent error-terminated (TX tuser -> /V/ over the
 //      FCS) and frames with a bit error on the line (bad FCS) arrive at P0/P1, are
@@ -32,7 +34,8 @@
 //      a frame sent error-terminated arrives at the far end 12 bytes short (two /V/
 //      hops), a line-corrupted frame 6 bytes short (one); the bytes that do arrive
 //      are intact (except the flipped one).
-//   3. Dynamic IFG at 1514-byte frames (the worst case: 4 bytes of catch-up per
+//   3. (experimental since map 1.6: enabled by hand with IFG_MIN 8; the DP83867 does
+//      not accept < 12 B gaps on hardware) Dynamic IFG at 1514-byte frames (the worst case: 4 bytes of catch-up per
 //      1538 bytes = 2600 ppm), source +2000 ppm, 1200 frames: the reduced gap starts
 //      only when the FWD fill exceeds IFG_HI and ends only when it falls below
 //      IFG_LO, and cycles at least twice; between frames the wire carries 12-byte
@@ -42,8 +45,8 @@
 //      ppm x time: 1 s at +200 ppm = 200 us of wire time (25 KB); here 9000 frames x
 //      25.9 ns = 233 us, a backlog of ~350 frames, more than the 16 KB FIFO holds
 //      (~270 64-byte frames). With the dynamic IFG no frame is lost; with it disabled
-//      (DYN_EN = 0) the FWD FIFO overflows, frames are dropped whole and counted
-//      (DROP_FWD = frames missing at the far end).
+//      (reset defaults: DYN_EN = 0, IFG_MIN 12) the FWD FIFO overflows, frames are
+//      dropped whole and counted (DROP_FWD = frames missing at the far end).
 //   5. Mode switching mid-traffic (both directions at 100 %): PATH_CTRL toggles
 //      between FWD/FWD, IDLE/IDLE and LOOP/LOOP at random times. Every frame that
 //      arrives is complete and intact, per-source order is kept, and every frame
@@ -56,6 +59,14 @@
 //      Oversize: 1523 B and 1600 B frames are received whole but flagged bad (RX_BAD;
 //      the capture sees the same BAD flag) and leave our TX cut at the limit and
 //      error-terminated (far end bad, TX_GOOD 0, nothing dropped or stuck).
+//   7. Back-to-back mixed odd/even lengths at 100 % utilisation, both directions,
+//      reset IFG settings, partners +100 ppm (the far devices' MACs use deficit idle
+//      count, so their own gaps are 11/13 B): 66/67-byte frames alternating, then
+//      random 66..1089 bytes. The forward FIFO feeds our TX MACs back-to-back; every
+//      wire gap they send must be >= 12 bytes (bench D finding A: Taxi's DIC_EN = 1
+//      sends 11 B after odd-length frames, which the DP83867 drops). All frames
+//      delivered intact, DROP_FWD 0. Compile with -d PKTREC_TB_DIC_EN (sim.tcl:
+//      SIM_DEFINES=PKTREC_TB_DIC_EN) to model the old DIC_EN = 1 MAC: test 7 fails.
 //   Store-and-forward latency (first /S/ on the far device's wire to first /S/
 //   on our TX wire, MAC/PCS only, no GT/PHY) is printed per frame size.
 //
@@ -116,6 +127,8 @@ module tb_tap_lane #(
   int unsigned bad_every = 0, bad_phase = 0;
   int unsigned fcs_every = 0, fcs_phase = 0;
   bit          vlan = 0;          // frames carry an 802.1Q tag (VID 100) at bytes 12..15
+  int unsigned len_mode = 0;      // 0: every frame len; 1: len, len + 1 alternating (by seq);
+  int unsigned len_rand = 0;      // 2: len + $urandom_range(0, len_rand)
 
   // ---- results ----
   int unsigned n_src = 0;                      // frames sent by the source
@@ -127,6 +140,7 @@ module tb_tap_lane #(
   longint      last_seq [2] = '{-1, -1};
   int unsigned n_fcs_inj = 0;
   int unsigned gap_hist [0:31];
+  int unsigned gap_min = 255;                  // smallest wire gap our TX sent (bytes)
   realtime     lat_min = 1e9, lat_max = 0;
   int unsigned n_lat = 0;
 
@@ -145,7 +159,7 @@ module tb_tap_lane #(
   logic [1:0]  s_tkeep = '0;
   logic        s_tvalid = 1'b0, s_tlast = 1'b0, s_tbad = 1'b0;
   wire         s_tready;
-  int unsigned seq = 0, beat = 0, nb = 0;
+  int unsigned seq = 0, beat = 0, nb = 0, flen = 0;
   bit          active = 0;
 
   always @(posedge src_clk) begin
@@ -164,15 +178,17 @@ module tb_tap_lane #(
       if (!active && (en || quota > 0)) begin
         if (!en) quota--;
         active = 1;
-        len_of[LANE][seq] = len;
+        flen = (len_mode == 1) ? len + (seq & 1) :
+               (len_mode == 2) ? len + $urandom_range(0, len_rand) : len;
+        len_of[LANE][seq] = flen;
         bad_of[LANE][seq] = (bad_every != 0) && (seq % bad_every == bad_phase);
         fcs_of[LANE][seq] = (fcs_every != 0) && (seq % fcs_every == fcs_phase);
         vlan_of[LANE][seq] = vlan;
-        nb = (len + 1) / 2;
+        nb = (flen + 1) / 2;
       end
       if (active) begin
         s_tdata  <= {fbyte(seq, 2 * beat + 1), fbyte(seq, 2 * beat)};
-        s_tkeep  <= (2 * beat + 1 < len) ? 2'b11 : 2'b01;
+        s_tkeep  <= (2 * beat + 1 < flen) ? 2'b11 : 2'b01;
         s_tvalid <= 1'b1;
         s_tlast  <= (beat == nb - 1);
         s_tbad   <= (beat == nb - 1) && bad_of[LANE][seq];
@@ -287,7 +303,14 @@ module tb_tap_lane #(
   wire [1:0]  te_k;
   wire [1:0]  dst_sop;
 
-  taxi_axis_basex_tx_16 #(.SGMII_EN(1'b1), .PTP_TS_EN(1'b0), .PTP_TS_W(64)) our_tx (
+  // our TX MAC: deficit idle count as in pktrec_eth_ports_core (DIC_EN = 0 since
+  // hardware round 5); -d PKTREC_TB_DIC_EN models the old DIC_EN = 1
+`ifdef PKTREC_TB_DIC_EN
+  localparam bit OUR_DIC_EN = 1'b1;
+`else
+  localparam bit OUR_DIC_EN = 1'b0;
+`endif
+  taxi_axis_basex_tx_16 #(.SGMII_EN(1'b1), .PTP_TS_EN(1'b0), .PTP_TS_W(64), .DIC_EN(OUR_DIC_EN)) our_tx (
     .clk(dst_clk), .rst(dst_rst),
     .s_axis_tx(tx_if), .m_axis_tx_cpl(tx_cpl_if),
     .encoded_tx_data(te_d), .encoded_tx_data_k(te_k), .encoded_tx_data_dm(), .encoded_tx_data_dv(),
@@ -313,7 +336,10 @@ module tb_tap_lane #(
         if (te_k[l] && te_d[8*l +: 8] == 8'hFD) begin g_in = 0; g_cnt = 1; end
       end else if (te_k[l] && te_d[8*l +: 8] == 8'hFB) begin
         g_in = 1;
-        if (g_cnt > 0) gap_hist[(g_cnt > 31) ? 31 : g_cnt]++;
+        if (g_cnt > 0) begin
+          gap_hist[(g_cnt > 31) ? 31 : g_cnt]++;
+          if (g_cnt < gap_min) gap_min = g_cnt;
+        end
         g_cnt = 0;
       end else if (g_cnt > 0) begin
         g_cnt++;
@@ -630,7 +656,13 @@ module tb_pktrec_tap;
   task automatic gap_report(input string what);
     string s = "";
     for (int i = 0; i < 32; i++) if (lane0.gap_hist[i]) s = {s, $sformatf(" %0dB:%0d", i, lane0.gap_hist[i])};
-    $display("INFO: %s: P1 TX wire gaps (bytes:count)%s", what, s);
+    $display("INFO: %s: P1 TX wire gaps (bytes:count, 31 = idle)%s", what, s);
+  endtask
+
+  task automatic gap_report1(input string what);
+    string s = "";
+    for (int i = 0; i < 32; i++) if (lane1.gap_hist[i]) s = {s, $sformatf(" %0dB:%0d", i, lane1.gap_hist[i])};
+    $display("INFO: %s: P0 TX wire gaps (bytes:count, 31 = idle)%s", what, s);
   endtask
 
   function automatic void reset_lane_stats();
@@ -638,12 +670,15 @@ module tb_pktrec_tap;
     lane1.n_rx = 0; lane1.n_rx_bad = 0; lane1.n_err = 0; lane1.n_lost = '{0, 0}; lane1.n_foreign = 0;
     lane0.n_ovs = 0; lane1.n_ovs = 0;
     for (int i = 0; i < 32; i++) begin lane0.gap_hist[i] = 0; lane1.gap_hist[i] = 0; end
+    lane0.gap_min = 255; lane1.gap_min = 255;
   endfunction
 
   // ---------------------------------------------------------------------------
   // frame counts of the long tests: 25 KB of accumulated excess each (see header)
   localparam int N1514 = 1200;
   localparam int N64   = 9000;
+  localparam int N_MIX_ALT = 6000;    // test 7: 66/67 B alternating, per direction
+  localparam int N_MIX_RND = 1500;    // test 7: 66..1089 B random, per direction
   reg [31:0] d;
   int unsigned exp_bad, n0, n1, drops, flushed, delivered, comm, lost0, lost1;
 
@@ -663,9 +698,9 @@ module tb_pktrec_tap;
 
     // ---- 1. registers ----
     expect_reg(R_ID, 32'h504B4D30, "ID");
-    expect_reg(R_VERSION, 32'h00010005, "VERSION");
+    expect_reg(R_VERSION, 32'h00010006, "VERSION");
     for (int p = 0; p < 4; p++) begin
-      expect_reg(preg(p, P_IFG_CTRL), 32'h00080C01, "IFG_CTRL reset");
+      expect_reg(preg(p, P_IFG_CTRL), 32'h000C0C00, "IFG_CTRL reset (reduced gap off, IFG_MIN 12)");
       expect_reg(preg(p, P_IFG_THRESH), 32'h08000C00, "IFG_THRESH reset");
     end
     expect_reg(R_PAIR_MODE, 32'h0, "PAIR_MODE reset");
@@ -721,8 +756,9 @@ module tb_pktrec_tap;
       lane0.lat_min = 1e9; lane0.lat_max = 0;
     end
 
-    // ---- 3. 1514-byte frames, source +2000 ppm, dynamic IFG ----
+    // ---- 3. 1514-byte frames, source +2000 ppm, dynamic IFG (experimental: on, min 8) ----
     set_ppm(0, 2000); set_ppm(1, 0);
+    axi_write(preg(1, P_IFG_CTRL), 32'h00080C01);
     #1000;
     clear_counters(); reset_lane_stats();
     n_enter = 0; n_exit = 0; fill_max_seen = 0;
@@ -771,7 +807,7 @@ module tb_pktrec_tap;
     expect_reg(preg(1, P_DROP_FWD), 0, "DROP_FWD (64 B, dyn IFG)");
     if (n_enter == 0) fail("64 B: dynamic IFG never engaged");
 
-    axi_write(preg(1, P_IFG_CTRL), 32'h00080C00);   // DYN_EN = 0
+    axi_write(preg(1, P_IFG_CTRL), 32'h000C0C00);   // reset defaults: DYN_EN 0, IFG_MIN 12
     repeat (20) @(posedge ctrl_clk);
     clear_counters(); reset_lane_stats(); fill_max_seen = 0;
     run_frames(1, N64);
@@ -783,7 +819,6 @@ module tb_pktrec_tap;
     if (lane0.n_rx + drops != N64 || lane0.n_lost[0] > drops)
       fail($sformatf("drops not accounted: delivered %0d + DROP_FWD %0d != %0d (lost %0d)", lane0.n_rx, drops, N64, lane0.n_lost[0]));
     if (lane0.n_err != 0) fail("frames corrupted while dropping");
-    axi_write(preg(1, P_IFG_CTRL), 32'h00080C01);
     $display("INFO: clock-mismatch tests done");
 
     // ---- 5. mode switching mid-traffic ----
@@ -878,6 +913,39 @@ module tb_pktrec_tap;
     if (lane0.n_rx != 5 || lane0.n_rx_bad != 0 || lane0.n_err != 0) fail("1522 B after oversize frames");
     lane0.vlan = 0; lane1.vlan = 0;
     $display("INFO: VLAN / oversize done");
+
+    // ---- 7. back-to-back mixed odd/even lengths, every wire gap >= 12 B ----
+    for (int k = 0; k < 2; k++) begin
+      int unsigned nfr = k == 0 ? N_MIX_ALT : N_MIX_RND;
+      string what = k == 0 ? "66/67 B alternating" : "66..1089 B random";
+      set_ppm(0, 100); set_ppm(1, 100);
+      expect_reg(preg(0, P_IFG_CTRL), 32'h000C0C00, "P0 IFG_CTRL (defaults)");
+      expect_reg(preg(1, P_IFG_CTRL), 32'h000C0C00, "P1 IFG_CTRL (defaults)");
+      #1000;
+      drain();
+      clear_counters(); reset_lane_stats(); fill_max_seen = 0;
+      lane0.len = 62; lane1.len = 62;                 // 66 B with FCS
+      lane0.len_mode = k + 1; lane1.len_mode = k + 1;
+      lane0.len_rand = 1023; lane1.len_rand = 1023;   // mode 2: 66..1089 B
+      run_frames(3, nfr);
+      drain();
+      gap_report(what); gap_report1(what);
+      rd(preg(1, P_DROP_FWD)); drops = rv;
+      rd(preg(0, P_DROP_FWD)); drops += rv;
+      $display("INFO: %s back-to-back: delivered %0d/%0d of %0d/%0d, lost %0d/%0d, errors %0d/%0d, DROP_FWD %0d, smallest gap P1 %0d B / P0 %0d B, P1 FWD fill max %0d B",
+               what, lane0.n_rx, lane1.n_rx, nfr, nfr, lane0.n_lost[0], lane1.n_lost[1], lane0.n_err, lane1.n_err,
+               drops, lane0.gap_min, lane1.gap_min, fill_max_seen);
+      if (lane0.n_rx != nfr || lane1.n_rx != nfr || lane0.n_lost[0] != 0 || lane1.n_lost[1] != 0 ||
+          lane0.n_err != 0 || lane1.n_err != 0 || lane0.n_rx_bad != 0 || lane1.n_rx_bad != 0 || drops != 0)
+        fail($sformatf("%s: frames lost / corrupt / dropped", what));
+      if (lane0.gap_min < 12 || lane1.gap_min < 12)
+        fail($sformatf("%s: wire gap of %0d B (P1) / %0d B (P0) < 12 B after an odd-length frame (deficit idle count)",
+                       what, lane0.gap_min, lane1.gap_min));
+      if (lane0.gap_hist[12] == 0 || lane1.gap_hist[12] == 0)
+        fail($sformatf("%s: no back-to-back 12-byte gaps seen (FIFO never fed the MAC back-to-back)", what));
+      lane0.len_mode = 0; lane1.len_mode = 0;
+    end
+    $display("INFO: mixed odd/even back-to-back done");
 
     if (errors == 0) $display("PASS: tb_pktrec_tap");
     else $display("FAIL: tb_pktrec_tap, %0d error(s)", errors);

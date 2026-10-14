@@ -34,11 +34,13 @@
 // TAP mode (M3): a pair in TAP mode has both ports on FWD. The partner's RX clock
 // (recovered, +-100 ppm of the far device) and our TX clock (local QPLL) differ, so a
 // partner that sends at 100 % utilisation slightly faster than we can send would
-// overflow any FIFO. Dynamic inter-frame gap: per TX port, while the FWD FIFO fill
-// exceeds IFG_HI (bytes) the MAC's TX inter-frame gap (tx_ifg[8n+7:8n] ->
-// pktrec_eth_ports EXT_TX_IFG) drops from IFG_NOM (12) to IFG_MIN (8) until the fill
-// falls below IFG_LO (hysteresis). 4 bytes per frame of catch-up = 2600 ppm at
-// 1518-byte frames, 5 % at 64-byte frames, far more than the +-200 ppm worst case.
+// overflow any FIFO: the 16 KB FWD FIFO absorbs bursts, sustained excess is dropped
+// whole and counted (DROP_FWD). Dynamic inter-frame gap (experimental since map 1.6,
+// off at reset): per TX port, while the FWD FIFO fill exceeds IFG_HI (bytes) the MAC's
+// TX inter-frame gap (tx_ifg[8n+7:8n] -> pktrec_eth_ports EXT_TX_IFG) drops from
+// IFG_NOM (12) to IFG_MIN until the fill falls below IFG_LO (hysteresis). IFG_MIN
+// resets to 12 (no catch-up): the DP83867 loses frames after SGMII gaps < 12 B
+// (bench D, 2026-10-14), so a smaller IFG_MIN is only for experiments with other PHYs.
 // Cycles spent in reduced mode and the number of entries are counted. PAIR_MODE
 // (pktrec_m0_regs) records tap/monitor per pair for software; EFF_PATH reads back
 // the TX source each port actually uses.

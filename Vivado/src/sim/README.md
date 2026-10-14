@@ -21,6 +21,10 @@ Contract for a testbench:
   correct or a line containing `FAIL` (plus the reason) on any error, then calls
   `$finish`. It must always terminate (use a watchdog that prints `FAIL` on timeout).
 
+Optional Verilog defines: `SIM_DEFINES="NAME ..."` in the environment is passed to
+`xvlog` as `-d NAME` (e.g. `SIM_DEFINES=PKTREC_TB_DIC_EN tclsh scripts/sim.tcl pktrec_tap`
+models the TX MACs with deficit idle count; that run must FAIL).
+
 A testbench passes only if its output contains `PASS` and no `FAIL`. `sim.tcl` exits
 with status 1 if any testbench fails. Work files and logs go to `Vivado/sim/<tb>/`
 (gitignored).

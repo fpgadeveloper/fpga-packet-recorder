@@ -134,7 +134,7 @@
 /* ------------------------------------------------------------------------- */
 #define PKTREC_M0_ID               0x000   /* RO 0x504B4D30 "PKM0" */
 #define PKTREC_M0_ID_VALUE         0x504B4D30
-#define PKTREC_M0_VERSION          0x004   /* RO 0x00010005 (1.1: traffic generator + checker;
+#define PKTREC_M0_VERSION          0x004   /* RO 0x00010006 (1.1: traffic generator + checker;
                                               1.2: TAP mode - PAIR_MODE, EFF_PATH, dynamic
                                               IFG, FWD FIFO 16 KB + fill, FLUSH, GEN BAD) */
 #define PKTREC_M0_VERSION_1_1      0x00010001
@@ -142,6 +142,7 @@
 #define PKTREC_M0_VERSION_1_3      0x00010003   /* 1.3 (M6): PATH_RPL, EFF_PATH[11:8] */
 #define PKTREC_M0_VERSION_1_4      0x00010004   /* 1.4: GEN_VLAN, checker skips a tag */
 #define PKTREC_M0_VERSION_1_5      0x00010005   /* 1.5: checker fix (untagged PRSQ counted) */
+#define PKTREC_M0_VERSION_1_6      0x00010006   /* 1.6: IFG_CTRL reset 0x000C0C00 (shrink off) */
 #define PKTREC_M0_PATH_CTRL        0x008   /* RW [2n+1:2n] TX source of port n (reset 0) */
 #define   PKTREC_M0_PATH_IDLE            0u          /* nothing is sent */
 #define   PKTREC_M0_PATH_LOOP            1u          /* own RX (RX n -> TX n) */
@@ -191,9 +192,13 @@
  * largest frame: the reset 2048 leaves >= 500 B of margin over the 1522-byte
  * MAC limit; raise IFG_LO / IFG_HI together with PKTREC_ETH_P_RX/TX_MAX_LEN for
  * longer frames (pktrec-phy maxlen does this). The shell's TX_IFG register is
- * not used (EXT_TX_IFG = 1). */
-#define PKTREC_M0_P_IFG_CTRL       0x20    /* RW [0] DYN_EN (1), [15:8] IFG_NOM (12),
-                                              [23:16] IFG_MIN (8), bytes */
+ * not used (EXT_TX_IFG = 1).
+ * Map 1.6: reset DYN_EN 0, IFG_MIN 12 - the reduced gap is retired (the DP83867
+ * loses frames after SGMII gaps < 12 B, bench D 2026-10-14) and kept only for
+ * experiments; a partner faster than the board at sustained 100 % utilisation
+ * fills the FWD FIFO and its excess is dropped and counted (DROP_FWD). */
+#define PKTREC_M0_P_IFG_CTRL       0x20    /* RW [0] DYN_EN (0), [15:8] IFG_NOM (12),
+                                              [23:16] IFG_MIN (12), bytes */
 #define   PKTREC_M0_IFG_DYN_EN           (1u << 0)
 #define   PKTREC_M0_IFG_NOM_SHIFT        8
 #define   PKTREC_M0_IFG_MIN_SHIFT        16

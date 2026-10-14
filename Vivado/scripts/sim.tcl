@@ -30,6 +30,10 @@
 # xsim itself exits cleanly. The script exits with status 1 if any testbench
 # fails, 0 if all pass. Work files and logs go to Vivado/sim/<tb>/ (gitignored).
 #
+# SIM_DEFINES (environment, optional): space-separated Verilog defines passed to
+# xvlog as -d, e.g. SIM_DEFINES=PKTREC_TB_DIC_EN (tb_pktrec_tap: model the old
+# DIC_EN = 1 TX MAC, test 7 must then fail).
+#
 # XPM macros (eg. xpm_fifo_async) used by the RTL are taken from the
 # precompiled "xpm" library that ships with Vivado (-L xpm).
 #
@@ -131,9 +135,14 @@ proc run_tb {tb_file} {
   set glbl [file join [file dirname [file dirname $xvlog]] data verilog src glbl.v]
   if {[file exists $glbl]} { lappend srcs $glbl }
 
+  set defs {}
+  if {[info exists ::env(SIM_DEFINES)]} {
+    foreach d $::env(SIM_DEFINES) { lappend defs -d $d }
+    puts "=== $tb: defines $::env(SIM_DEFINES) ==="
+  }
   puts "=== $tb: compile ([llength $srcs] files) ==="
   lassign [run_step $work [file join $work xvlog.log] \
-             $xvlog -sv -i $hdl_dir -i [file dirname $tb_file] {*}$srcs] rc out
+             $xvlog -sv {*}$defs -i $hdl_dir -i [file dirname $tb_file] {*}$srcs] rc out
   if {$rc != 0} {
     puts $out
     puts "=== $tb: FAIL (compile error, see [file join $work xvlog.log]) ==="

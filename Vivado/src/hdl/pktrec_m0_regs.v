@@ -6,11 +6,12 @@
 // same map is in include/pktrec_regs.h, keep both in sync):
 //
 //   0x000 ID         RO  0x504B4D30 ("PKM0")
-//   0x004 VERSION    RO  0x00010005 (1.1: generator + checker; 1.2: TAP mode - pair
+//   0x004 VERSION    RO  0x00010006 (1.1: generator + checker; 1.2: TAP mode - pair
 //                        mode, effective path, dynamic IFG, FIFO fill, FLUSH;
 //                        1.3: REPLAY path - PATH_RPL, EFF_PATH[11:8];
 //                        1.4: generator 802.1Q tag GEN_VLAN, checker skips a tag;
-//                        1.5: checker counts untagged PRSQ frames again)
+//                        1.5: checker counts untagged PRSQ frames again;
+//                        1.6: IFG_CTRL reset 0x000C0C00 - reduced gap off, IFG_MIN 12)
 //   0x008 PATH_CTRL  RW  [2n+1:2n] TX source of port n: 0 IDLE, 1 LOOP (own RX),
 //                        2 FWD (pair partner's RX: P0<->P1, P2<->P3), 3 GEN. Reset 0.
 //   0x00C CNT_CTRL   WO  [0] 1 = clear every counter and IO_STICKY (reads 0)
@@ -37,8 +38,12 @@
 //   +0x14 DROP_FWD   frames for TX n dropped by the FWD FIFO (full / oversize)
 //   +0x18 GPIO0_EDGES  rising edges on PHY GPIO_0 (RX SFD once configured)
 //   +0x1C GPIO1_EDGES  rising edges on PHY GPIO_1 (TX SFD once configured)
-//   +0x20 IFG_CTRL   RW  [0] DYN_EN (1) [15:8] IFG_NOM (12) [23:16] IFG_MIN (8):
-//                        MAC TX inter-frame gap in bytes, normal / reduced
+//   +0x20 IFG_CTRL   RW  [0] DYN_EN (0) [15:8] IFG_NOM (12) [23:16] IFG_MIN (12):
+//                        MAC TX inter-frame gap in bytes, normal / reduced. Since 1.6
+//                        the reduced gap is off and IFG_MIN is 12 at reset: the DP83867
+//                        loses frames after SGMII gaps < 12 B (bench D, 2026-10-14), so a
+//                        gap below 12 is for experiments only (pktrec-phy ifg refuses it
+//                        without --i-know-the-phy-drops-frames)
 //   +0x24 IFG_THRESH RW  [15:0] IFG_HI (3072) [31:16] IFG_LO (2048): FWD FIFO fill
 //                        (bytes) above which the reduced gap starts / below which it ends.
 //                        The fill counts the frame being received too (about one frame
@@ -117,7 +122,7 @@ module pktrec_m0_regs #(
 );
 
 localparam [31:0] REG_ID      = 32'h504B4D30;
-localparam [31:0] REG_VERSION = 32'h00010005;
+localparam [31:0] REG_VERSION = 32'h00010006;
 
 assign s_axi_bresp = 2'b00;
 assign s_axi_rresp = 2'b00;
@@ -176,7 +181,7 @@ initial begin
         g_count[p] = 32'd0; g_dst[p] = 48'hFFFF_FFFF_FFFF; g_src[p] = 48'h0200_0000_0000 + p;
         g_etype[p] = 16'h88B5; g_strm[p] = p; g_seq0[p] = 32'd0; g_vlan[p] = 17'd0; c_ctrl[p] = {16'h88B5, 2'b00};
         hi_lat[p] = 32'd0;
-        i_ctrl[p] = {8'd8, 8'd12, 7'd0, 1'b1}; i_thr[p] = {16'd2048, 16'd3072};
+        i_ctrl[p] = {8'd12, 8'd12, 7'd0, 1'b0}; i_thr[p] = {16'd2048, 16'd3072};   // 1.6: shrink off, min 12
         i_hi_lat[p] = 16'd0; flush_cnt[p] = 32'd0;
     end
 end

@@ -373,7 +373,7 @@ module tb_pktrec_m0_path;
 
     // 1. identification and reset values
     expect_reg(R_ID, 32'h504B4D30, "ID");
-    expect_reg(R_VERSION, 32'h00010005, "VERSION");
+    expect_reg(R_VERSION, 32'h00010006, "VERSION");
     expect_reg(R_PATH_CTRL, 32'h0, "PATH_CTRL reset");
     expect_reg(12'h0FC, 32'h0, "unmapped");
 

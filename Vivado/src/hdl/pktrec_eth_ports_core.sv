@@ -276,7 +276,13 @@ taxi_eth_mac_1g_basex_us #(
     .COMBINED_MAC_PCS(1'b1),
     .SGMII_EN(1'b1),
     .AN_EN(1'b1),
-    .DIC_EN(1'b1),
+    // No deficit idle count: every TX gap is at least cfg_tx_ifg (12 B). With DIC the
+    // MAC sends cfg_tx_ifg - 1 = 11 B after an odd-length frame when the next frame is
+    // already waiting (the TAP forward FIFO feeds it back-to-back), and the DP83867
+    // loses frames on the copper side after gaps < 12 B (bench D, 2026-10-14). Without
+    // DIC the gap after an odd-length frame is 13 B (the 16-bit datapath starts a
+    // frame in lane 0 only).
+    .DIC_EN(1'b0),
     .PTP_TS_EN(PTP_TS_EN),
     .PTP_TD_EN(1'b0),
     .PTP_TS_FMT_TOD(PTP_TS_FMT_TOD),
