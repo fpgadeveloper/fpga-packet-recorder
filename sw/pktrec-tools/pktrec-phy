@@ -108,10 +108,11 @@ Commands:
                          ping-pong). On exit, or when the pair leaves TAP mode, every
                          held PHY is released.
                          On every copper link-up, read the PHY's skew FIFO status
-                         (reg 0x0055): non-zero (0x0111 / 0x1011 seen on the 1000BASE-T
-                         master) means this link-up has --skew-ns (8) ns more RX
-                         latency, so the port's SFD RX_OFFSET is set to the calibration
-                         base - 8 ns; zero restores the base (--no-0055-correction: off).
+                         (reg 0x0055): non-zero on a 1000BASE-T master (0x0A[14];
+                         0x0111 / 0x1011 measured) means this link-up has --skew-ns (8)
+                         ns more RX latency, so the port's SFD RX_OFFSET is set to the
+                         calibration base - 8 ns; zero, or a slave port (no measured
+                         basis; logged), restores the base (--no-0055-correction: off).
                          Every action is logged (--json: one JSON object per line);
                          state in $PKTREC_RUN_DIR/phy-watch.json (/run/pktrec).
   mdio <phy> <reg> [val] [--i-accept-lan-loop]   raw PHY register access (phy:
@@ -1096,7 +1097,9 @@ class SkewCorrector:
     always 0 and its RX latency never moved. The datasheet: [7:4] x 8 ns in leader,
     [3:0] x 8 ns in follower mode, constant per link-up. So `ns` (8) of extra RX
     latency is taken off this link-up's timestamps: RX_OFFSET = base - ns while
-    0x0055 != 0, = base otherwise. The raw value is logged; it is not scaled by its
+    0x0055 != 0 AND the port resolved as 1000BASE-T master (0x0A bit 14), = base
+    otherwise. A non-zero 0x0055 on a slave (bench C: P0 0x0001) is logged but not
+    corrected: there is no measurement that it changes the latency. The raw value is logged; it is not scaled by its
     fields (only the two non-zero values above were seen, both meaning +8 ns).
 
     base = the calibrated RX_OFFSET (pktrec-tb apply-calibration, sfd config). A
@@ -1174,7 +1177,8 @@ class SkewCorrector:
             a = PHY_ADDR[n]
             v = self.b.mdio_rd(a, SKEW_FIFO_STS)
             ms = (self.b.mdio_rd(a, STS1) >> 14) & 1
-            corr = -self.ns if v else 0
+            # only where bench A measured it: non-zero 0x0055 on the 1000BASE-T master
+            corr = -self.ns if v and ms else 0
             self.reg55[n], self.master[n] = v, bool(ms)
             old = self.written[n]
             self.corr[n] = corr
@@ -1182,7 +1186,9 @@ class SkewCorrector:
                 self.write(n)
             self.log(n, "rx_skew", f"link-up: 0x0055 = 0x{v:04x} (1000BASE-T "
                      f"{'master' if ms else 'slave'}) -> RX_OFFSET {self.base[n]} {corr:+d} = "
-                     f"{self.written[n]} ns" + ("" if old == self.written[n] else f" (was {old})"),
+                     f"{self.written[n]} ns" + ("" if old == self.written[n] else f" (was {old})")
+                     + (f"; 0x0055=0x{v:04x} on slave, not corrected (no measured basis)"
+                        if v and not ms else ""),
                      reg55=v, master=bool(ms), base=self.base[n], corr=corr,
                      rx_offset=self.written[n])
             changed = True

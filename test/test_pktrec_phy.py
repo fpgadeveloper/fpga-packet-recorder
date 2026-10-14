@@ -39,9 +39,11 @@ run with --i-accept-lan-loop).
    P3 = power-down, P0 with the override = path idle then loopback, linkup
    restores fwd; 'safe' flags the incident state (exit 2) and passes otherwise;
    status --json reports phy_loopback / phy_powered_down.
-4. 0x0055 RX correction: link-up with 0x0055 = 0x0111 -> RX_OFFSET = base - 8;
-   apply-calibration writing a new base -> adopted, correction re-applied;
-   link-up with 0x0055 = 0 -> base; --no-0055-correction leaves RX_OFFSET alone.
+4. 0x0055 RX correction: master link-up with 0x0055 = 0x0111 -> RX_OFFSET =
+   base - 8; apply-calibration writing a new base -> adopted, correction
+   re-applied; link-up with 0x0055 = 0 -> base; slave with 0x0055 = 0x0001 ->
+   base, logged "on slave, not corrected"; --no-0055-correction leaves
+   RX_OFFSET alone.
 5. gen: size + rand mask beyond TX_MAX_LEN + 1 (1522) refused, --force sends;
    --vlan writes GEN_VLAN (EN | PCP | VID), a plain start clears it, --size 1522
    --vlan 100 accepted; maxlen --set 2000 writes RX/TX_MAX_LEN 1999 and raises
@@ -471,6 +473,18 @@ def test_skew():
     check(S["bounce"][2] == -230, f"P2 link-up with 0x0055 = 0 -> base {S['bounce'][2]}")
     st = json.load(open(os.path.join(RUN, "phy-watch.json")))
     check(st["skew"][2]["base"] == -230 and st["skew"][2]["corr"] == 0, "state file: base / corr")
+    # slave with a non-zero 0x0055 (bench C: P0 0x0001 as slave): logged, never corrected
+    W.phy[m.PHY_ADDR[2]][m.SKEW_FIFO_STS] = 0x0001
+    W.phy[m.PHY_ADDR[2]][0x0A] = 0x0000
+    ev, out = watch_scenario([(0.2, "P2 bounce", lambda: W.renegotiate(2))], ["--no-propagate"], 2.5)
+    sk = [e for e in ev if e["event"] == "rx_skew" and e["port"] == 2]
+    check(rx_offset(2) == -230 and sk and sk[-1]["reg55"] == 0x0001 and not sk[-1]["master"]
+          and sk[-1]["corr"] == 0 and "on slave, not corrected (no measured basis)" in sk[-1]["msg"],
+          f"slave, 0x0055 = 0x0001: no correction (RX_OFFSET {rx_offset(2)}), logged")
+    st = json.load(open(os.path.join(RUN, "phy-watch.json")))
+    check(st["skew"][2]["corr"] == 0 and st["skew"][2]["master"] is False,
+          "phy-watch.json: slave P2 corr 0")
+    W.phy[m.PHY_ADDR[2]][0x0A] = 0x4000
     # correction off
     W.phy[m.PHY_ADDR[2]][m.SKEW_FIFO_STS] = 0x1011
     ev, out = watch_scenario([], ["--no-propagate", "--no-0055-correction"], 2.0)
