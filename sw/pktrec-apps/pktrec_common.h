@@ -13,6 +13,7 @@
 
 #include <endian.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -25,6 +26,47 @@
 #include "pktrec_format.h"
 
 #define PKTREC_APPS_VERSION     "1.0"
+
+/*
+ * The recorder device (/dev/fdrec0) has one user at a time: pktrec-cap holds
+ * it for a whole capture, pktrec-replay for a streamed replay or, with
+ * --preload, only while it loads the replay store (well under a second).
+ * Both tools retry a busy (EBUSY) open for PKTREC_DEV_BUSY_WAIT_S, so the
+ * documented "replay during a capture" sequence (pktrec-replay --preload
+ * --wait-capture ... &, then pktrec-cap record) does not depend on which
+ * process reaches the device first.
+ */
+#define PKTREC_DEV_BUSY_WAIT_S  5.0
+
+static inline double pktrec_mono_s(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* open(dev, O_RDWR); while it fails with EBUSY retry every 50 ms for up to
+ * wait_s seconds, saying so once (busy_why: who probably holds it). Returns
+ * the fd, or -1 with errno from the last open(). */
+static inline int pktrec_open_dev(const char *dev, double wait_s, const char *busy_why)
+{
+	double t0 = pktrec_mono_s();
+	bool told = false;
+	int fd;
+
+	for (;;) {
+		fd = open(dev, O_RDWR | O_CLOEXEC);
+		if (fd >= 0 || errno != EBUSY || pktrec_mono_s() - t0 >= wait_s)
+			return fd;
+		if (!told) {
+			fprintf(stderr, "%s: %s is busy (%s); retrying for up to %.0f s\n",
+				prog_name, dev, busy_why, wait_s);
+			told = true;
+		}
+		usleep(50000);
+	}
+}
 
 /* pktrec_file_port.flags */
 #define PKTREC_FPORT_ENABLED    (1u << 0)

@@ -97,13 +97,22 @@ SSD cannot run while a capture records. For the case where both are needed, such
 replaying out of one port and capturing the result on another, `pktrec-replay --preload`
 loads the frames into the replay block's own store (up to 128 KB of frame data or 2048
 frames), releases the recorder, and then plays from the store while `pktrec-cap` records.
-`--wait-capture S` starts the replay once a capture has started:
+`--wait-capture S` starts the replay once a capture has started. Start the replay first,
+in the background, and the capture after it:
 
 ```
 sudo pktrec-replay /mnt/rec/captures/ref.cap --iface P3 --port 2 --preload --wait-capture 30 &
+sleep 2
 sudo pktrec-cap --ports 3 --duration 5 /mnt/rec/captures/replayed.cap
 wait
 ```
+
+The recorder device serves one program at a time, and the replay needs it for a moment to
+load its frames (it then prints `waiting for a capture to start`). `pktrec-cap` waits for
+a `pktrec-replay --preload` that is still loading, and both programs retry a busy recorder
+for up to 5 s, so the commands also work without the `sleep`; the `sleep 2` only keeps
+the two programs' messages apart. A replay without `--preload` holds the recorder for the
+whole replay: a capture started meanwhile stops with "still busy after 5 s".
 
 ## Measured accuracy
 
@@ -144,6 +153,7 @@ wait
 sudo pktrec-phy path 2 idle
 # 2. replay it out of P2 and capture it again on P3
 sudo pktrec-replay /mnt/rec/captures/ref.cap --iface P3 --port 2 --preload --wait-capture 30 &
+sleep 2
 sudo pktrec-cap --ports 3 --duration 5 /mnt/rec/captures/rep.cap
 wait
 # 3. convert both to pcapng
@@ -155,8 +165,11 @@ Copy the two pcapng files to a PC and compare them with the script from the repo
 `test/` folder:
 
 ```
-python3 test/compare_replay.py ref.pcapng --orig-iface P3 rep.pcapng --replay-iface P3
+python3 test/compare_replay.py ref.pcapng rep.pcapng
 ```
+
+The replayed interface is P3 in both files by default; `--orig-iface` and `--replay-iface`
+select others.
 
 Add `--rate X` to both `pktrec-replay` and `compare_replay.py` for a scaled replay, or
 `--topspeed` for a back-to-back one.

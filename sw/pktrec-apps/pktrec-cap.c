@@ -66,6 +66,7 @@
 const char *prog_name = "pktrec-cap";
 
 #define DEF_DEVICE      "/dev/fdrec0"
+#define PKTREC_RELEASE_FILE "/etc/pktrec-release"
 #define DEF_BUFFERS     32
 #define DEF_BUF_SIZE    (8ull << 20)
 #define DEF_QD          8
@@ -155,7 +156,10 @@ static int regs_map(struct regs *r, uint64_t base, size_t size, bool devmem, con
 	}
 	fd = open(dev, O_RDWR | O_SYNC | O_CLOEXEC);
 	if (fd < 0) {
-		perr("open %s (%s registers)", dev, what);
+		if (errno == EACCES || errno == EPERM)
+			err_msg("needs root (sudo): %s: permission denied", dev);
+		else
+			perr("open %s (%s registers)", dev, what);
 		return -1;
 	}
 	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off);
@@ -590,7 +594,8 @@ static void usage_record(FILE *f)
 "                        not a stall.\n"
 "  --device <path>       recorder device (default %s)\n"
 "  --target <name>       target name for the header (default %s)\n"
-"  --design <string>     design version string for the header\n"
+"  --design <string>     design version string for the header (default: from\n"
+"                        " PKTREC_RELEASE_FILE ", written by the Yocto recipe)\n"
 "  --devmem              map registers through /dev/mem instead of generic-uio\n"
 "  -q, --quiet           no live statistics\n"
 "  -h, --help            this help\n"
@@ -1045,6 +1050,124 @@ static int tb_set_realtime(struct rec *r)
 	return 0;
 }
 
+/*
+ * Default header "design" string: PKTREC_RELEASE_FILE (installed by the
+ * pktrec-apps recipe) holds "fpga-packet-recorder <git describe>". The whole
+ * line is used when it fits the 31 characters of the field, else only the
+ * version (second word). No file: left empty ("-").
+ */
+static void release_design(char *out, size_t len)
+{
+	char line[128], *v;
+	FILE *f = fopen(PKTREC_RELEASE_FILE, "r");
+
+	out[0] = 0;
+	if (!f)
+		return;
+	if (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = 0;
+		v = line;
+		if (strlen(line) >= len && (v = strchr(line, ' ')))
+			v++;
+		else
+			v = line;
+		size_t n = strlen(v);
+
+		if (n > len - 1)
+			n = len - 1;
+		memcpy(out, v, n);
+		out[n] = 0;
+	}
+	fclose(f);
+}
+
+/* pid of a running "pktrec-replay ... --preload" (run directly or through
+ * sudo), 0 if none. */
+static pid_t find_preload_replay(void)
+{
+	DIR *d = opendir("/proc");
+	struct dirent *de;
+	pid_t found = 0;
+
+	if (!d)
+		return 0;
+	while (!found && (de = readdir(d))) {
+		char path[300], buf[4096];
+		bool is_rpl = false, preload = false;
+		ssize_t n;
+		size_t i;
+		int fd;
+
+		if (de->d_name[0] < '1' || de->d_name[0] > '9')
+			continue;
+		snprintf(path, sizeof(path), "/proc/%s/cmdline", de->d_name);
+		fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		buf[n] = 0;
+		for (i = 0; i < (size_t)n; i += strlen(buf + i) + 1) {
+			const char *a = buf + i, *b = strrchr(a, '/');
+
+			if (!strcmp(b ? b + 1 : a, "pktrec-replay"))
+				is_rpl = true;
+			else if (is_rpl && !strcmp(a, "--preload"))
+				preload = true;
+		}
+		if (is_rpl && preload)
+			found = (pid_t)atoi(de->d_name);
+	}
+	closedir(d);
+	return found;
+}
+
+/*
+ * "Replay during a capture" (docs/source/replay.md): pktrec-replay --preload
+ * needs /dev/fdrec0 for a moment to load the replay store, then releases it
+ * and waits for this capture. Started together ("pktrec-replay ... &" then
+ * pktrec-cap at once), this capture could take the device first and the
+ * replay would then fail. So, when such a replay is running and has not
+ * finished preloading (replay block not yet ARMED with EXPECT set, nor
+ * RUNNING), wait for it, for up to PKTREC_DEV_BUSY_WAIT_S.
+ */
+static void wait_for_preload_replay(bool devmem)
+{
+	struct regs rpl;
+	pid_t pid = find_preload_replay();
+	double t0 = pktrec_mono_s();
+	bool told = false;
+
+	if (!pid)
+		return;
+	memset(&rpl, 0, sizeof(rpl));
+	if (regs_map(&rpl, PKTREC_RPL_BASE, PKTREC_RPL_SIZE, devmem, "replay"))
+		return;
+	if (rd(&rpl, PKTREC_RPL_ID) == PKTREC_RPL_ID_VALUE) {
+		while (pktrec_mono_s() - t0 < PKTREC_DEV_BUSY_WAIT_S && !g_stop) {
+			unsigned st = rd(&rpl, PKTREC_RPL_STATUS) & PKTREC_RPL_ST_STATE_MASK;
+			uint64_t expect = rd64(&rpl, PKTREC_RPL_EXPECT_LO);
+
+			if (st == PKTREC_RPL_STATE_RUNNING ||
+			    (st == PKTREC_RPL_STATE_ARMED && expect &&
+			     rd64(&rpl, PKTREC_RPL_RECORDS_DONE) >= expect))
+				break;          /* preloaded: the device is (being) released */
+			if (kill(pid, 0) && errno == ESRCH)
+				break;          /* the replay has exited */
+			if (!told) {
+				fprintf(stderr, "%s: waiting for pktrec-replay --preload (pid %d) to load "
+					"its frames (up to %.0f s)\n", prog_name, (int)pid,
+					PKTREC_DEV_BUSY_WAIT_S);
+				told = true;
+			}
+			usleep(20000);
+		}
+	}
+	regs_unmap(&rpl);
+}
+
 static int cmd_record(int argc, char **argv)
 {
 	struct rec rr, *r = &rr;
@@ -1082,10 +1205,18 @@ static int cmd_record(int argc, char **argv)
 		return 1;
 	/* The recorder device is exclusive: holding it means no other capture
 	 * (or fdrec/fdplay) runs, so an ENABLE left set is a killed capture's. */
-	r->dev = open(r->o.device, O_RDWR | O_CLOEXEC);
+	wait_for_preload_replay(r->o.devmem);
+	r->dev = pktrec_open_dev(r->o.device, PKTREC_DEV_BUSY_WAIT_S,
+				 "a pktrec-replay preloading, or another capture?");
 	if (r->dev < 0) {
-		perr("open %s (is the fdrec module loaded? is another capture running?)",
-		     r->o.device);
+		if (errno == EBUSY)
+			err_msg("%s is still busy after %.0f s: the recorder serves one user at a time "
+				"(another capture, or a pktrec-replay without --preload, is running)",
+				r->o.device, PKTREC_DEV_BUSY_WAIT_S);
+		else if (errno == EACCES || errno == EPERM)
+			err_msg("needs root (sudo): %s: permission denied", r->o.device);
+		else
+			perr("open %s (is the fdrec module loaded?)", r->o.device);
 		goto out;
 	}
 	if (rd(&r->hw.cap, PKTREC_CAP_CTRL) & (PKTREC_CAP_CTRL_ENABLE | PKTREC_CAP_CTRL_FILL)) {
@@ -1149,7 +1280,10 @@ static int cmd_record(int argc, char **argv)
 	r->hdr->snaplen = r->o.snaplen;
 	strncpy(r->hdr->target, r->o.target, sizeof(r->hdr->target) - 1);
 	gethostname(r->hdr->hostname, sizeof(r->hdr->hostname) - 1);
-	strncpy(r->hdr->design, r->o.design, sizeof(r->hdr->design) - 1);
+	if (r->o.design[0])
+		strncpy(r->hdr->design, r->o.design, sizeof(r->hdr->design) - 1);
+	else
+		release_design(r->hdr->design, sizeof(r->hdr->design));
 	for (i = 0; i < PKTREC_NUM_PORTS; i++) {
 		struct pktrec_file_port *p = &r->hdr->port[i];
 

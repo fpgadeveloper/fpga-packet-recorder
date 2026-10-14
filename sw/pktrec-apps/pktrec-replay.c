@@ -164,7 +164,10 @@ static int regs_map(struct regs *r, uint64_t base, size_t size, bool devmem, con
 	}
 	fd = open(dev, O_RDWR | O_SYNC | O_CLOEXEC);
 	if (fd < 0) {
-		perr("open %s (%s registers)", dev, what);
+		if (errno == EACCES || errno == EPERM)
+			err_msg("needs root (sudo): %s: permission denied", dev);
+		else
+			perr("open %s (%s registers)", dev, what);
 		return -1;
 	}
 	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off);
@@ -804,11 +807,15 @@ static int open_device(struct rp *p)
 	uint64_t *addrs;
 	unsigned i;
 
-	p->dev = open(p->o.device, O_RDWR | O_CLOEXEC);
+	p->dev = pktrec_open_dev(p->o.device, PKTREC_DEV_BUSY_WAIT_S, "a capture running?");
 	if (p->dev < 0) {
 		if (errno == EBUSY)
-			err_msg("%s is busy: the recorder serves one user at a time (capture running? use --preload to replay during a capture)",
-				p->o.device);
+			err_msg("%s is still busy after %.0f s: the recorder serves one user at a time "
+				"(a capture running? to replay during a capture, start pktrec-replay "
+				"--preload --wait-capture first and pktrec-cap after it)",
+				p->o.device, PKTREC_DEV_BUSY_WAIT_S);
+		else if (errno == EACCES || errno == EPERM)
+			err_msg("needs root (sudo): %s: permission denied", p->o.device);
 		else
 			perr("open %s", p->o.device);
 		return -1;
