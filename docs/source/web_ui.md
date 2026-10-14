@@ -53,17 +53,20 @@ the port's frame FIFO.
   captured.
 * **Monitor.** The ports only receive.
 
-You can't change the mode while a capture is running.
+You can't change the mode while a capture is running. [Port modes](modes) describes what
+the devices on the ports see in each mode.
 
 **Timebase.** The line under the pairs shows the state of the timebase discipline
-(`pktrec-tb`, see the Software page):
+(`pktrec-tb`, see [Timestamping](timestamping.md#timebase-and-absolute-time)):
 
-* **locked to system time (NTP)**: the hardware timestamps follow the board's clock,
-  within the offset shown (normally a few µs);
+* **locked to system time (NTP)**: the hardware timestamps follow the board's system clock,
+  within the offset shown (sub-microsecond once locked, see
+  [Timestamping](timestamping.md#timebase-and-absolute-time));
 * **tracking, not locked yet**: for about a minute after boot, or after the system clock
   jumped;
 * **not disciplined**: `pktrec-tb.service` is not running, so the timestamps drift from
-  wall-clock time (about 10 ppm).
+  wall-clock time at the rate of the board's crystal error (about 10 to 12 ppm on the board
+  that was measured).
 
 It also shows the current offset to the system clock, the frequency trim in ppm, and
 whether the calibration file (`/etc/pktrec/calibration.conf`) was applied at boot.
@@ -87,8 +90,12 @@ capture.
 and drops. Each row has these actions:
 
 * **pcapng** downloads the capture converted to pcapng. The conversion runs while the file
-  downloads, so no second copy is written to the SSD.
-* **raw** downloads the `.cap` file itself. You can convert it later with `pktrec-export`.
+  downloads, so no second copy is written to the SSD. The download runs at up to about
+  110 MB/s for large frames, limited by the board's Gigabit Ethernet port; for small frames
+  the conversion rate of one CPU core sets the speed (see
+  [Performance](performance.md#export-and-download)).
+* **raw** downloads the `.cap` file itself. You can convert it later with `pktrec-export`,
+  or replay it with `pktrec-replay` ([Replay](replay)).
 * **info** shows the capture's header.
 * **delete** removes the capture.
 

@@ -5,11 +5,8 @@ FPGA Packet Recorder
 
 This is the documentation for the FPGA Packet Recorder reference design: lossless,
 hardware-timestamped Gigabit Ethernet packet capture to an NVMe SSD, and replay, on a ZCU106
-fitted with the `Ethernet FMC Max`_ and the `FPGA Drive FMC Gen4`_.
-
-.. note::
-   The design is in development. These pages are placeholders that are filled in as the
-   milestones are completed.
+fitted with the `Ethernet FMC Max`_ and the `FPGA Drive FMC Gen4`_. Captures are controlled
+from a web browser and downloaded as pcapng files that open directly in Wireshark.
 
 .. toctree::
    :maxdepth: 2
@@ -17,12 +14,27 @@ fitted with the `Ethernet FMC Max`_ and the `FPGA Drive FMC Gen4`_.
 
    description
    requirements
+   hardware_setup
    build_instructions
    yocto
-   design
-   software
+   getting_started
    web_ui
+   modes
+   timestamping
+   replay
+   performance
+   known_limitations
+   troubleshooting
    revision_history
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Reference
+
+   design
+   capture_format
+   software
+   testing
 
 
 .. _Ethernet FMC Max: https://docs.opsero.com/op080/datasheet/overview/

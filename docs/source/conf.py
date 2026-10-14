@@ -64,7 +64,9 @@ from jinja2 import Environment, FileSystemLoader
 
 # Load the JSON data
 def load_json():
-    with open('../../config/data.json') as f:
+    # Relative to this file, so the build works from any working directory.
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           '..', '..', 'config', 'data.json')) as f:
         return json.load(f)
 
 # Add the data as a context variable for Jinja2 templates

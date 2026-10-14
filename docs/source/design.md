@@ -1,31 +1,54 @@
-# Design
+# Architecture
 
-## M0 base platform (zcu106)
+This page describes the hardware design and its register maps. The register definitions in C
+are in `include/pktrec_regs.h` (this design's blocks) and `include/fdrec_regs.h` (the
+recorder datapath); the record and file formats are in `include/pktrec_format.h` (see
+[File formats](capture_format)).
 
-* Zynq UltraScale+ PS with the ZCU106 board preset. The board's RJ45 is PS GEM3.
-* PCIe: one DMA/Bridge Subsystem for PCIe (XDMA) in AXI Bridge root-port mode, Gen3 x1, on
-  PCIE40E4_X0Y0 with the HPC1 transceiver (GTH quad 223, channel X0Y3) and the HPC1 GBTCLK0
-  100 MHz reference clock. It serves SSD slot 1 of the FPGA Drive FMC Gen4; SSD slot 2's
-  3.3 V supply is switched off (`disable_ssd2_pwr`).
-* Recording datapath (from the FPGA Drive Recorder): `user_data_source` (test pattern
-  generator), `fdrec_core` (ingest FIFO,
-  packetizer, egress FIFO, register block), AXI DMA (scatter-gather, S2MM record and MM2S
-  playback) on `S_AXI_HP2_FPD`, and `user_data_sink` (playback checker).
+## Overview
+
+The block design (`Vivado/src/bd/`) consists of:
+
+| Hierarchy / block | Function |
+|-------------------|----------|
+| Zynq UltraScale+ PS | Linux, DDR, the board's RJ45 (GEM3), the clocks of the PL |
+| `xdma_0` (DMA/Bridge Subsystem for PCIe, AXI Bridge root port) | PCIe Gen3 x1 to the SSD in slot 1 of the FPGA Drive FMC Gen4 on HPC1 |
+| `eth_ports` | the four Ethernet ports: `pktrec_eth_ports` (Taxi MAC/PCS/transceivers, MDIO, PHY resets) and `pktrec_m0_path` (per-port transmit source: idle, loopback, forward to the pair partner, generator, replay) |
+| `capture` | `pktrec_capture`: timebase, SFD sampling and matching, per-port capture front ends, record merge |
+| `replay` | `pktrec_replay`: record parser, frame store and scheduler for replay |
+| recorder datapath | `fdrec_core` (packetizer, egress FIFO, registers), the AXI DMA (S2MM for capture, MM2S for replay), and the recorder's test pattern generator and checker (`user_data_source`, `user_data_sink`), from the [FPGA Drive Recorder](https://recorder.fpgadrive.com) |
+
+The datapath is shown in the [Description](description.md#how-it-works).
+
+### Clocks
 
 | Clock | Source | Frequency | Use |
 |-------|--------|-----------|-----|
-| `pl_clk0` | PS | 100 MHz | AXI-Lite masters (HPM0), PCIe data to HP0 |
-| `pl_clk1` | PS | 250 MHz | `dp_clk`: AXI DMA, packetizer, recorder registers, HP2 |
-| `pl_clk2` | PS | 200 MHz | `src_clk`: data source and sink |
+| `pl_clk0` | PS | 100 MHz | AXI-Lite register blocks, `ctrl_clk` of the Ethernet ports (MDIO master, transceiver reset/DRP logic), PCIe data to HP0 |
+| `pl_clk1` | PS | 250 MHz (249.975 MHz) | `dp_clk`: timebase, capture merge, SFD matching, replay scheduler, AXI DMA, packetizer, HP2 |
+| `pl_clk2` | PS | 200 MHz | `src_clk`: the recorder's test pattern source and playback sink, replay input |
+| GT reference clock | Ethernet FMC Max, GBTCLK0 | 125 MHz | QPLL0 of the four Ethernet transceivers; transmit clocks `tx_clk_n` (62.5 MHz) |
+| recovered clocks | each Ethernet transceiver | 62.5 MHz | receive clocks `rx_clk_n` |
+| SFD sampler clocks | MMCM from `dp_clk` | ~500 / ~250 MHz | ISERDESE3 sampling of the SFD pins |
+| PCIe reference clock | FPGA Drive FMC Gen4, HPC1 GBTCLK0 | 100 MHz | PCIe root port |
+
+### Address map
 
 | Slave | Address | Size |
 |-------|---------|------|
 | PCIe BAR window (`xdma_0` S_AXI_B) | `0x00_A000_0000` | 256 MB |
-| PCIe root-port config (`xdma_0` S_AXI_LITE) | `0x04_0000_0000` | 512 MB |
+| PCIe root-port configuration (`xdma_0` S_AXI_LITE) | `0x04_0000_0000` | 512 MB |
 | AXI DMA registers | `0x04_2000_0000` | 64 KB |
 | Recorder registers (`fdrec_core`) | `0x04_2001_0000` | 4 KB |
-| M0 path registers (`eth_ports/pktrec_m0_path_0`) | `0x04_2002_0000` | 4 KB |
-| Port registers + GT APB (`eth_ports/pktrec_eth_ports_0`) | `0x04_2008_0000` | 512 KB |
+| Port paths (`eth_ports/pktrec_m0_path_0`) | `0x04_2002_0000` | 4 KB |
+| Capture (`capture/pktrec_capture_0`) | `0x04_2003_0000` | 4 KB |
+| Replay (`replay/pktrec_replay_0`) | `0x04_2004_0000` | 4 KB |
+| Ethernet ports + GT APB (`eth_ports/pktrec_eth_ports_0`) | `0x04_2008_0000` | 512 KB |
+
+The AXI DMA and `fdrec_core` are bound to the `fdrec` kernel driver; the other four
+`pktrec_*` blocks are bound to `generic-uio` and mapped by the tools from user space.
+
+### Interrupts
 
 | Interrupt | `pl_ps_irq0` bit | GIC SPI |
 |-----------|------------------|---------|
@@ -34,244 +57,338 @@
 | AXI DMA S2MM | 6 | 95 |
 | AXI DMA MM2S | 7 | 96 |
 
-## Ethernet port subsystem (M0)
+### Implementation
 
-The Ethernet FMC Max (OP080) on HPC0 carries four TI DP83867 PHYs, each connected to the
-FPGA over SGMII on one GTH transceiver. The block-design hierarchy `eth_ports` holds two
-module references.
+Vivado 2025.2, XCZU7EV-2FFVC1156E, the design as released: all timing constraints met
+(worst negative slack +0.404 ns, worst hold slack +0.009 ns), no critical warnings; 26.6 % of
+the LUTs, 24.1 % of the flip-flops and 156 block RAM tiles (50 %).
 
-**`pktrec_eth_ports`** is the MAC/PCS/transceiver shell (`Vivado/src/hdl/pktrec_eth_ports.v`
-and `pktrec_eth_ports_core.sv`), built on the open-source Taxi library
-(`submodules/taxi`, CERN-OHL-S-2.0, used unmodified).
+## PCIe and recorder datapath
+
+* One DMA/Bridge Subsystem for PCIe in AXI Bridge root-port mode, Gen3 x1, on PCIE40E4_X0Y0
+  with the HPC1 transceiver (GTH quad 223, channel X0Y3) and the HPC1 GBTCLK0 100 MHz
+  reference clock. It serves SSD slot 1 of the FPGA Drive FMC Gen4; the 3.3 V supply of slot
+  2 is switched off (`disable_ssd2_pwr`).
+* The recording datapath is the FPGA Drive Recorder's `fdrec_core` and AXI DMA
+  (scatter-gather, S2MM record and MM2S playback, on `S_AXI_HP2_FPD`). Its documentation
+  describes the register map, the driver and the ring of hugepage buffers.
+* This design adds a second source to the recorder's packetizer: with `CTRL.SRC_SEL` = 1 in
+  the capture block, the packetizer takes the capture's record stream (`S_AXIS_CAP`) **with
+  back-pressure**, bypassing the recorder's ingest FIFO (which drops 16-byte beats when full
+  and would cut records). When the SSD or the DMA stalls, the back-pressure reaches the
+  per-port frame FIFOs of the capture, and drops happen there, as whole, counted frames.
+  `fdrec_core` register map 1.2 adds `PKT_SRC` (0x050), which reads the selected source back.
+  With `SRC_SEL` = 0 (the reset value) the recorder's test pattern generator path works as in
+  the FPGA Drive Recorder, so `fdrec --rate` benchmarks run on this design.
+* The DMA contract is unchanged: `TLAST` every `PKT_LEN` beats, `TKEEP` all ones. Record
+  boundaries and DMA buffer boundaries are unrelated.
+
+## Ethernet ports (`eth_ports`)
+
+### MAC, PCS and transceivers (`pktrec_eth_ports`)
+
+`Vivado/src/hdl/pktrec_eth_ports.v` (a Verilog shell, as required for a block-design module
+reference) over `pktrec_eth_ports_core.sv`, built on the Taxi library (`submodules/taxi`,
+used unmodified):
 
 * Taxi `taxi_eth_mac_1g_basex_us` drives four 1000BASE-X/SGMII MAC+PCS channels on GTH quad
-  226 (`GTHE4_CHANNEL_X0Y12`..`X0Y15`). Channel placement follows the package pins: port
-  n = FMC DPn.
-* The transceivers run from QPLL0 with the card's 125 MHz reference clock (GBTCLK0_M2C).
-  They use Taxi's low-latency (buffer-bypass) variant.
-* Each port has a 16-bit stream at 62.5 MHz:
-  * TX runs on `tx_clk_n` (QPLL).
-  * RX runs on `rx_clk_n`, the lane's recovered clock. RX has no back-pressure.
-* SGMII auto-negotiation runs in the PCS. It reports the PHY's copper link, speed and
-  duplex, and 10/100 rate adaptation is automatic.
-* A Taxi MDIO master drives the shared management bus. The PHYs are at MDIO addresses
-  0x01, 0x03, 0x0C and 0x0F.
-* Software controls the four PHY reset pins.
-* TX padding is off, so frames are forwarded as they were received.
+  226 (`GTHE4_CHANNEL_X0Y12`..`X0Y15`); the package pins place them, port n = FMC DPn.
+* The transceivers run at 1.25 Gb/s from QPLL0 with the card's 125 MHz reference clock, in
+  Taxi's low-latency (buffer-bypass) variant. The receivers use LPM equalisation
+  (`GT_RX_LPM_EN` = 1 on all lanes): with the default DFE mode, received frames were
+  intermittently corrupted by bit errors on these short channels.
+* Each port has a 16-bit stream at 62.5 MHz: transmit on `tx_clk_n`, receive on `rx_clk_n`
+  (the lane's recovered clock). The receive stream has no back-pressure; the MAC checks and
+  strips the FCS and flags bad frames on the last beat.
+* SGMII auto-negotiation runs in the PCS and reports the PHY's copper link, speed and
+  duplex.
+* A Taxi MDIO master drives the shared management bus. The PHYs are at MDIO addresses 0x01,
+  0x03, 0x0C and 0x0F. Software controls the four PHY reset pins.
+* Transmit padding is off, so frames are forwarded and replayed as they were received.
 * The 64-bit MAC timestamp inputs are fed by the capture block's timebase (see
-  [Capture path](#capture-path-m1)).
+  [Timebase](#timebase)).
+* The transmit inter-frame gap of each MAC comes from `pktrec_m0_path` (`EXT_TX_IFG` = 1), for
+  the dynamic inter-frame gap of TAP mode.
 
-**`pktrec_m0_path`** is the bring-up datapath (`Vivado/src/hdl/pktrec_m0_path.v`).
+### Port paths (`pktrec_m0_path`)
 
-* For each port, `PATH_CTRL` selects what the TX MAC sends:
-  * nothing (IDLE),
-  * the port's own received frames (LOOP),
-  * or the received frames of its pair partner (FWD), where P0 pairs with P1 and P2 with
-    P3. Setting FWD on both ports of a pair makes a two-port TAP.
-* Every TX port and source pair has its own store-and-forward asynchronous frame FIFO
-  (Taxi `taxi_axis_async_fifo`; 4 KB for LOOP, 16 KB for FWD since M3). Frames are
-  switched only between frames, so they are never cut. TAP mode, the dynamic
-  inter-frame gap and the map 1.2 registers are described in
-  [TAP mode (M3)](#tap-mode-m3).
-* A frame that does not fit in its FIFO is dropped whole and counted.
-* Frames that arrive with an error (bad FCS, framing error) are forwarded with the error
-  flag set. The TX MAC then ends them with an error code, so the far end still sees a bad
-  frame.
-* Forwarding is store-and-forward, so latency grows with frame size.
-* The PHY GPIO_0/GPIO_1 inputs (RX/TX start-of-frame-delimiter pulses once configured) and
-  the card's power-good signals can be read back. Their rising edges are counted.
-* It also passes a plain copy of every RX stream (`m_axis_mon_n`) to the capture path.
-  The RX streams have no back-pressure, so this fan-out does not affect forwarding.
+`Vivado/src/hdl/pktrec_m0_path.v` selects, per port, what the transmit MAC sends
+(`PATH_CTRL`, overridden by `PATH_RPL`):
 
-`ctrl_clk` is the PS `pl_clk0` (100 MHz). It clocks both register blocks, the MDIO master
-and Taxi's transceiver reset/DRP logic. The GT wizard IP declares 62.5 MHz for this clock.
-Taxi's reset sequencers count fixed cycle numbers, so a faster clock only shortens their
-waits.
+| Path | Code | Transmit source |
+|------|------|-----------------|
+| IDLE | 0 | nothing (idles only) |
+| LOOP | 1 | the port's own received frames (4 KB FIFO) |
+| FWD | 2 | the received frames of the pair partner (P0↔P1, P2↔P3), through a 16 KB forward FIFO; FWD on both ports of a pair makes a TAP |
+| GEN | 3 | the port's traffic generator |
+| REPLAY | 4 (`PATH_RPL`) | the replay block |
 
-### Register maps
+* Every FIFO is a store-and-forward asynchronous frame FIFO (Taxi `taxi_axis_async_fifo`):
+  a frame is sent only once it has been received completely, and the source is switched only
+  between frames, so frames are never cut. A frame that does not fit is dropped whole and
+  counted (`DROP_LOOP`, `DROP_FWD`).
+* Frames that arrive with an error are forwarded with the MAC's bad-frame flag (Taxi TX
+  `tuser[0]`); the Taxi PCS then sends `/V/` code groups in place of the FCS (see
+  [Port modes](modes.md#what-the-devices-see)).
+* When a port switches source, frames left in a FIFO that it no longer reads are discarded
+  and counted (`FLUSH`).
+* `pktrec_m0_path` passes a copy of every receive stream (`m_axis_mon_n`) to the capture
+  block. The receive streams have no back-pressure, so this fan-out cannot affect forwarding.
+* It reads back the PHY GPIO pins (SFD indications) and the card's power-good signals and
+  counts the rising edges of the GPIO pins.
 
-The full definitions are in `include/pktrec_regs.h`.
+**Dynamic inter-frame gap.** Per transmit port, the gap is `IFG_NOM` (12 bytes) normally and
+`IFG_MIN` (8 bytes) while the forward FIFO holds more than `IFG_HI` (3072 bytes), until it
+falls below `IFG_LO` (2048 bytes). The two devices on a TAP pair transmit with their own
+clocks (±100 ppm), the board with its own: if a device sends at 100 % utilisation and its
+clock is faster, frames arrive faster than they can be sent (at a +200 ppm worst case, 25 KB
+per second). Saving 4 bytes per frame catches up 0.26 % (2600 ppm) with 1518-byte frames and
+4.8 % with 64-byte frames. The FIFO fill includes the frame being received, so `IFG_LO` must
+stay above the largest frame. Below 100 % utilisation the gap stays at 12 bytes.
 
-`pktrec_eth_ports` (`0x04_2008_0000`):
+**Traffic generator and checker.** Each port has a generator (`pktrec_gen`, path GEN) and a
+receive checker (`pktrec_gen_chk`):
 
-| Offset | Name | Description |
-|--------|------|-------------|
-| `0x000` | ID | `0x504B5245` |
-| `0x008` | GCTRL | [0] hold the transceivers in reset, [11:8] PHY `RESET_N` pins (reset `0xF`, released) |
-| `0x00C` | GSTATUS | [0] GT power good, [1] QPLL0 lock, [7:4] link up per port |
-| `0x010` | MDIO_CMD | write to start a frame: [31:30] `01`, [29:28] op (`01` write, `10` read), [27:23] PHY, [22:18] register, [15:0] data |
-| `0x014` | MDIO_RDATA | data of the last read |
-| `0x018` | MDIO_STATUS | [0] busy, [1] read data valid, [2] command dropped |
-| `0x01C` | MDIO_DIV | MDC half period - 1 in `ctrl_clk` cycles (49: 1 MHz) |
-| `0x100 + n*0x40` | port n | CTRL, STATUS (PCS sync, AN, SGMII link/speed/duplex, link up), LP_ADV, STICKY, IFG and length limits |
-| `0x40000 + n*0x10000` | GT lane n | Taxi transceiver control registers |
+* Format 0 (default): byte-identical to `test/gen_seq.py`: Ethernet, IPv4 192.0.2.1 to
+  192.0.2.2, UDP 50000 to 50001, payload `"PRSQ"`, a stream id (u32) and a sequence number
+  (u64), zeros, so `test/check_pcap.py` verifies captures of generator traffic.
+* Format 1 (raw): destination, source, EtherType (`GEN_ETYPE`, default `0x88B5`), a u32
+  sequence number, zeros.
+* Length 60..16383 bytes without the FCS (the MAC appends it), optionally random
+  (`LEN + (LFSR & LEN_MASK)`). Frames above the MAC's `TX_MAX_LEN` (1518 bytes including
+  the FCS) are cut by the MAC and arrive as bad frames.
+* Rate: a frame starts at most every `ceil((LEN + 4 + 8 + IFG) / 2)` transmit clock cycles
+  (IFG in bytes; 12 = line rate, 1.488 Mframes/s at 64 bytes).
+* `COUNT` frames (0 = until stopped); `GEN_CTRL.BAD` sends every frame error-terminated.
+* The checker counts generator frames, lost frames (sum of sequence gaps), duplicates or
+  reordering, and frames with a MAC error.
 
-`pktrec_m0_path` (`0x04_2002_0000`):
+## Capture (`pktrec_capture`)
 
-| Offset | Name | Description |
-|--------|------|-------------|
-| `0x000` | ID | `0x504B4D30` |
-| `0x008` | PATH_CTRL | [2n+1:2n] TX source of port n: 0 IDLE, 1 LOOP, 2 FWD, 3 GEN (M2) |
-| `0x00C` | CNT_CTRL | write 1 to clear all counters |
-| `0x010` | IO_STATUS | [3:0] GPIO_0, [7:4] GPIO_1, [8] PG_1V0, [9] PG_2V5, [19:16] link up |
-| `0x014` | IO_STICKY | rising edge seen on GPIO_0 [3:0] / GPIO_1 [7:4] (write 1 to clear) |
-| `0x100 + n*0x40` | port n counters | RX_GOOD, RX_BAD, TX_GOOD, TX_UNDERFLOW, DROP_LOOP, DROP_FWD, GPIO0_EDGES, GPIO1_EDGES (32 bit) |
+`Vivado/src/hdl/pktrec_capture.v` (implementation in `pktrec_capture_core.sv` and the
+`pktrec_cap_*.sv`, `pktrec_sfd_*.sv` and `pktrec_timebase.sv` modules) records what every
+port receives and hands the records to the recorder.
 
-### Software
-
-Both blocks are bound to `generic-uio` in the device tree. The `pktrec-phy` tool
-(`sw/pktrec-tools`, installed by `Yocto/meta-pktrec`) maps them and provides these commands:
-
-| Command | What it does |
-|---------|--------------|
-| `pktrec-phy init [--1000-only] [--reset]` | configures every PHY (see below), then watches the links for a few seconds |
-| `pktrec-phy status` | shows per port the copper link, speed and duplex, the SGMII/PCS state and the GPIO levels |
-| `pktrec-phy path <port\|all> idle\|loop\|fwd` | selects the M0 datapath |
-| `pktrec-phy counters [--clear]` | shows the frame counters |
-| `pktrec-phy watch` | resends the SGMII status word on every copper link change |
-| `pktrec-phy mdio <phy> <reg> [val]` | raw PHY register access (registers above 0x1F through the extended-register window) |
-
-`pktrec-phy init` configures each PHY as follows:
-
-* mirror mode on,
-* SGMII with SGMII auto-negotiation,
-* SFD indications on GPIO_0 (RX) and GPIO_1 (TX): GPIO_MUX_CTRL (0x0172) = 0x0012,
-  RXFCFG (0x0134) = 0x1080, SYNC_FIFO_CTRL (0x00E9) = 0xDF22. Verified on the bench:
-  GPIO_0 edges equal RX_GOOD and GPIO_1 edges equal TX_GOOD on every port,
-* a soft restart.
-
-The DP83867 sends its SGMII status word to the MAC only once after a restart. The
-image runs `pktrec-phy-watch.service` (systemd, enabled by default): it runs
-`pktrec-phy init --1000-only` at boot and then `pktrec-phy watch`, which re-triggers the
-status word on every copper link change. All MDIO accesses of `pktrec-phy` hold an
-flock on `/run/lock/pktrec-mdio`, so the service and command-line calls never
-interleave on the single MDIO master. To use other advertisement settings, stop the
-service (`systemctl stop pktrec-phy-watch`) and run `pktrec-phy init` by hand.
-
-The OP080 has no bypass relays. If the board is unpowered or reconfiguring, every port
-link is broken, including a TAP pair (see [TAP mode (M3)](#tap-mode-m3)).
-
-## Capture path (M1)
-
-The block-design hierarchy `capture` holds one module reference, **`pktrec_capture`**
-(`Vivado/src/hdl/pktrec_capture.v`, implementation in `pktrec_capture_core.sv` and the
-`pktrec_cap_*.sv` / `pktrec_timebase.sv` modules). It records what every port receives, in
-monitor mode, and hands the records to the recorder datapath (`fdrec_core`), which writes
-them to the SSD exactly like the recorder's test data.
-
-```
-eth_ports RX n (rx_clk_n, 16 bit) ──> pktrec_cap_port n ─┐
-   x4                                  frame FIFO 16 KB   ├─> pktrec_cap_merge ─> fdrec_core
-                                       + record header    ┘   (round robin,       S_AXIS_CAP
-pktrec_timebase (dp_clk) ─ cycle count ─> MAC timestamp inputs   whole records)   -> packetizer
-                         ─ ns, cycles ──> record headers                          -> AXI DMA
+```none
+eth_ports RX n (rx_clk_n, 16 bit) ──► pktrec_cap_port n ──┐
+   x4          SFD pins ─► pktrec_sfd_io/edge ─► queue ─┘ │  frame FIFO 16 KB + record header
+                                                           ▼
+pktrec_timebase (dp_clk) ── cycle count ─► MAC timestamps   pktrec_cap_merge (round robin,
+                         ── ns ──────────► headers, SFD      whole records) ─► fdrec_core
 ```
 
 ### Per port (`pktrec_cap_port`)
 
-* A frame is captured if capture is enabled (`CTRL.ENABLE` and `PORT_EN[n]`) when its
-  first byte arrives. A frame already in progress when the enable changes is taken or
-  ignored whole.
+* A frame is captured if capture is enabled (`CTRL.ENABLE` and `PORT_EN[n]`) when its first
+  byte arrives; a frame in progress when the enable changes is taken or ignored whole.
 * Every frame that starts while the port is enabled gets the port's next 16-bit sequence
-  number, including frames that are then dropped. A gap in a port's sequence numbers in
-  a capture file is therefore exactly the number of frames the hardware dropped there.
-* `SNAPLEN` (0 = off) limits the bytes stored per frame. Truncated records carry the
-  TRUNC flag and the original length.
-* The frame is stored whole in a 16 KB per-port frame FIFO (Taxi
-  `taxi_axis_async_fifo_adapter`: 16-to-128-bit conversion and the clock crossing into
-  `dp_clk`). When a frame does not fit, the FIFO drops it **whole**, and the port counts
-  it in `FRAMES_DROP` / `BYTES_DROP`. A frame larger than the FIFO is dropped the same
-  way. Nothing is ever dropped in the middle of a frame or a record.
-* The frame's metadata waits until the FIFO has committed the frame, then goes into a
-  small metadata FIFO. The record reader in `dp_clk` builds the 16-byte header, then
-  copies the frame's data beats, zeroing the unused bytes of the last one.
-* Counters (frames received, bad, dropped, truncated, bytes received and dropped) are
-  kept in the port's receive clock and copied to `dp_clk` as one coherent snapshot.
+  number, including frames that are then dropped, so a sequence gap equals the number of
+  frames the hardware dropped.
+* `SNAPLEN` (0 = off) limits the bytes stored; truncated records carry the TRUNC flag and the
+  original length.
+* The frame is stored whole in a 16 KB frame FIFO (Taxi `taxi_axis_async_fifo_adapter`:
+  16-to-128-bit conversion and the crossing into `dp_clk`). A frame that does not fit, or is
+  larger than the FIFO, is dropped **whole** and counted (`FRAMES_DROP`, `BYTES_DROP`).
+  Nothing is ever dropped in the middle of a frame or a record.
+* The record reader in `dp_clk` builds the 16-byte header once the FIFO has committed the
+  frame, then copies the frame's beats, zeroing the unused bytes of the last one.
+* The counters live in the receive clock and are copied to `dp_clk` as one coherent snapshot.
 
-### Merge and recorder
+### Merge
 
-* `pktrec_cap_merge` grants the four ports round robin, one **whole record** at a time,
-  and produces one 128-bit stream at up to 4 GB/s, well above the 500 MB/s of four ports
-  at line rate.
-* The stream goes straight into the `fdrec_core` packetizer, with back-pressure, while
-  `CTRL.SRC_SEL` = 1. The recorder's ingest FIFO, which drops 16-byte beats when it is
-  full, is bypassed. When the SSD or the DMA stalls, the back-pressure reaches the
-  per-port frame FIFOs, and drops happen there as whole, counted frames.
-* The DMA contract is unchanged: `TLAST` every `PKT_LEN` beats, `TKEEP` all ones. Record
-  boundaries and DMA buffer boundaries are unrelated: records span buffers.
-* `fdrec_core` register map 1.2 adds `PKT_SRC` (0x050), which reads the source back.
-  With `SRC_SEL` = 0 (the reset value) the test pattern generator path works as before,
-  so `fdrec --rate` benchmarks still run on this design.
-* **Fill:** with `CTRL.FILL` set, the merge sends all-zero 16-byte fill units whenever it
-  has no record. At the end of a capture, fill pushes the last records through the DMA
-  (whose buffers only complete when full), so the fdrec driver's STOP drain completes at
-  once.
-* A recorder soft reset (every `FDREC_IOC_START`) while a record is in progress cuts that
-  record (`SRST_ABORTS`); the merge then discards its remainder, so a recording always
-  starts on a record boundary.
+`pktrec_cap_merge` grants the four ports round robin, one **whole record** at a time, and
+produces one 128-bit stream at up to 4 GB/s (well above the 500 MB/s of four ports at line
+rate), which goes into the packetizer with back-pressure.
 
-### Record format v1
-
-Defined in `include/pktrec_format.h`. Each record is a 16-byte header, the frame bytes
-(FCS excluded; the MAC strips it), and zero padding to a multiple of 16 bytes.
-
-| Bytes | Field | Description |
-|-------|-------|-------------|
-| 0-7 | `ts_ns` | timebase value at the start of frame, ns |
-| 8-9 | `cap_len` | bytes stored (FCS excluded, at most `SNAPLEN` and 16384) |
-| 10-11 | `orig_len` | length on the wire including the FCS |
-| 12 | `port` | 0..3 (OP080 P0..P3) |
-| 13 | `flags` | [0] bad frame (FCS/framing error or too long), [1] truncated, [2] timestamp from the MAC (always 1 in M1), [3] SFD mismatch (M2), [7:4] marker `0xA` |
-| 14-15 | `seq` | per-port frame sequence number |
-
-All fields are little-endian. A capture file is a 4 KB header (`struct
-pktrec_file_header`) followed by the record stream.
+* **Fill:** with `CTRL.FILL` set, the merge sends all-zero 16-byte units when it has no
+  record. At the end of a capture this pushes the last records through the DMA, whose
+  buffers only complete when full.
+* A recorder soft reset (at every recorder start) while a record is in progress cuts that
+  record (`SRST_ABORTS`); the merge discards its remainder, so a recording always starts on a
+  record boundary.
 
 ### Timebase
 
-`pktrec_timebase` is a PHC-style clock in `dp_clk` (249.975 MHz): a 64-bit nanosecond
-counter plus a 32-bit fraction, advanced every cycle by a 32.32 increment (`INC`,
-reset 1e9 / `DP_CLK_HZ` = 4.0004 ns). Software can set it (`TB_SET`), step it by a
-signed offset (`TB_ADJ`) and trim its rate (`TB_INC_*`), so it can be slaved to system
-time. `pktrec-cap` sets it from `CLOCK_REALTIME` before every capture.
+`pktrec_timebase` is a PHC-style clock in `dp_clk`: a 64-bit nanosecond counter plus a 32-bit
+fraction, advanced every cycle by a 32.32 increment (`INC`, reset 1e9 / `DP_CLK_HZ` =
+4.0004 ns). Software can set it (`TB_SET`), step it by a signed offset (`TB_ADJ`) and trim its
+rate (`TB_INC_*`). See [Timestamping](timestamping.md#timebase-and-absolute-time) for the
+discipline.
 
-The four MAC receive clocks are recovered from the network and are not related to
-`dp_clk`. Instead of copying the time into each of them, the timebase counts `dp_clk`
-cycles and carries that count, Gray-coded (`xpm_cdc_gray`), into every MAC clock
-domain. The MAC latches the count at the start of frame. When the header is built, in
-`dp_clk`, the count is turned back into time:
+The four MAC receive clocks are recovered from the network and unrelated to `dp_clk`. Instead
+of copying the time into each of them, the timebase counts `dp_clk` cycles and carries that
+count, Gray-coded (`xpm_cdc_gray`), into every MAC clock domain; the MAC latches it at the
+start of frame, and the header builder converts it back:
 
-    ts_ns = TB_NOW - (cycles now - cycles at SFD) * INC + MAC_OFFSET
+    ts_mac = TB_NOW − (cycles now − cycles at SFD) × INC + MAC_OFFSET
 
-`MAC_OFFSET` (reset 52 ns) removes the constant synchronisation delay of the copy.
+This MAC timestamp is the fallback of the SFD timestamp. (Taxi's PTP clock-domain-crossing
+module, a digital PLL per domain, was evaluated first: in simulation, with the 125 to 250 ppm
+offsets expected between a recovered clock and `dp_clk`, its output wandered by up to
+±30 ns. The cycle-count scheme has no lock time and only a constant offset.)
 
-| Contribution | Size |
-|--------------|------|
-| timebase resolution | 4 ns (one `dp_clk` cycle) |
-| MAC timestamp quantisation | 16 ns (one 62.5 MHz MAC clock) |
-| sampling jitter of the cycle-count copy | at most 8 ns (simulation: 12..14 cycles of delay) |
-| PHY, PCS and transceiver latency | constant, not calibrated in M1 |
+### SFD sampling and matching
 
-Since M2 the record timestamp normally comes from the PHYs' SFD pins instead (see
-[SFD timestamping](#sfd-timestamping-m2)); the MAC timestamp remains the fallback.
+* `pktrec_sfd_io`: the eight SFD pins (GPIO_0 = receive, GPIO_1 = transmit of each PHY) come
+  through the Ethernet FMC Max's level translators (LVCMOS18, banks 67/68) straight into
+  ISERDESE3 primitives. An MMCM makes a ~500 MHz and a ~250 MHz clock from one VCO, phase
+  aligned to each other and to `dp_clk`; the ISERDESE3s sample DDR on the 500 MHz clock, four
+  samples per `dp_clk` cycle. (A BUFGCE_DIV for the slow clock was avoided: its edge can come
+  up on either fast edge, which would shift the samples by 2 ns between configurations.) The
+  build parameter `SFD_SAMPLER = "IDDR"` selects a 2 ns sampler without the MMCM.
+* `pktrec_sfd_edge`: edge detection with the glitch filter (`MIN_LOW`, `MIN_HIGH`); timestamp
+  = timebase of the cycle + sample index − `SFD_PIPE_NS` (16).
+* Receive: a 16-entry queue per port, matched in `pktrec_cap_port` against every frame's MAC
+  cycle stamp with the window `RX_WIN_MIN..RX_WIN_MAX`. Frames that are dropped or not enabled
+  consume their entry too. The rules are in [Timestamping](timestamping.md#matching-sfd-indications-to-frames).
+* Transmit: edges are paired in order with the MAC's transmit completions within
+  `TX_WIN_MIN..TX_WIN_MAX`, giving the MAC-to-pin transmit latency. Transmit timestamps are not
+  stored in records; they serve the calibration and the TAP latency measurement.
+* Per port, `RX_LAST_TS` / `TX_LAST_TS` hold the latest timestamps, and with `SFD_CTRL.LOG_EN`
+  16-entry log FIFOs keep the last receive and transmit timestamps for software.
 
-Taxi's PTP clock-domain-crossing module (`taxi_ptp_clock_cdc`, a digital PLL per clock
-domain) was tried first. In simulation, with the 125..250 ppm frequency offsets expected
-between a recovered clock and `dp_clk`, its output wandered up to ±30 ns (rms about 9 ns)
-around the master. The cycle-count scheme has no lock time and only a constant offset.
+## Replay (`pktrec_replay`)
 
-### Capture register map
+```none
+capture file ─(pktrec-replay: one interface's records)─► hugepage ring ─► AXI DMA MM2S
+  ─► fdrec_core egress FIFO (64 KB, src_clk)
+  ─► pktrec_replay:  SEL = 0: passed on to the recorder's checker (fdplay works unchanged)
+                     SEL = 1: async FIFO ─► dp_clk: record parser ─► frame store
+                              (128 KB data + 2048 frames) ─► scheduler (timebase) ─► 128→16 bit
+  ─► pktrec_m0_path replay FIFO of the port (cut-through, dp_clk → tx_clk) ─► TX MAC ─► PHY
+```
 
-`pktrec_capture` (`0x04_2003_0000`, 4 KB, `generic-uio`), register map 1.2 (1.1 plus the
-SFD block at `0x400`..`0xBFF`, see [SFD timestamping](#sfd-timestamping-m2)). The full
-definitions, including the start and stop protocol with the fdrec driver, are in
-`include/pktrec_regs.h`. 64-bit counters are `_LO`/`_HI` pairs: reading `_LO` latches
-the matching `_HI`.
+* **Parser.** Reads record format v1, skips fill units, checks every header like
+  `pktrec-export` (marker, port, lengths, TRUNC flag). A unit that is neither counts
+  `PARSE_ERRORS`, and the parser tests every following unit until a header passes. A port
+  filter (set by `pktrec-replay` as a safety net) and the bad-frame policy skip records
+  (`SKIPPED`).
+* **Frame store.** A frame's metadata is written with its last beat, so the scheduler never
+  sees an incomplete frame and no partial frame is ever released. When the store is full, the
+  parser stops and the back-pressure stalls the DMA; nothing is lost.
+* **Scheduler.** TIMED: `target_i = T0 + ((ts_i − ts_first) × RATE_INV) >> 16` (16.16;
+  `0x10000` = original timing). BACK-TO-BACK: as soon as the MAC takes the frame. FIXED:
+  `target_i = T0 + i × GAP_NS`. `T0 = TB_NOW + START_DELAY` is latched by GO. The comparison
+  runs every `dp_clk` cycle against `timebase + floor(INC)` and the release follows in the
+  next cycle, so a frame is never early and at most one timebase step late. The frame is
+  written at `dp_clk`, four times faster than the MAC reads it, from a store that holds the
+  whole frame, so its output is never interrupted (the MAC would abort a stalled frame).
+* **Lateness and underruns** are counted, never corrected: `LATE` (released more than
+  `LATE_THRESH` after the target; `MAX_LATE`, `LAST_LATE`, `LATE_SUM`), `UNDERRUNS` (the store
+  ran empty and the next frame arrived after its target, or, back to back, before the end of
+  the stream; `STATUS.UNDERRUN` is sticky).
+* **Bad frames** (`CTRL.BAD_MODE`): 2 = skipped, 1 = sent error-terminated, 0 = sent with a
+  valid FCS.
+* **Run control.** ARM (clears the counters; the parser fills the store) → GO (T0 latched) →
+  DONE when `EXPECT` records were processed, or after STOP once the input has been idle for
+  256 cycles and everything is sent. ABORT completes the frame on the wire, drops everything
+  buffered and returns to idle. While SEL = 1 and the block is not armed or running, input is
+  accepted and discarded (`DISCARD`) so the DMA can always drain.
+
+The recorder's DMA path serves one direction at a time (`/dev/fdrec0` opens once, and
+stopping either AXI DMA channel resets the whole AXI DMA), so a streamed replay cannot run
+during a capture; `--preload` plays from the frame store instead (see
+[Replay](replay.md#replay-and-capture-at-the-same-time)).
+
+## Register maps
+
+All registers are 32 bits. 64-bit values are `_LO`/`_HI` pairs: reading `_LO` latches the
+matching `_HI`.
+
+### Ethernet ports: `pktrec_eth_ports` (`0x04_2008_0000`)
 
 | Offset | Name | Description |
 |--------|------|-------------|
-| `0x000` | ID | `0x504B4350` |
-| `0x004` | VERSION | `0x00010002` |
+| `0x000` | ID | `0x504B5245` ("PKRE") |
+| `0x004` | VERSION | `0x00010000` |
+| `0x008` | GCTRL | [0] hold the transceivers and QPLL in reset, [11:8] PHY `RESET_N` pins (reset `0xF`, released) |
+| `0x00C` | GSTATUS | [0] GT power good, [1] QPLL0 lock, [7:4] link up per port |
+| `0x010` | MDIO_CMD | write to start a frame: [31:30] `01`, [29:28] op (`01` write, `10` read), [27:23] PHY, [22:18] register, [15:0] data |
+| `0x014` | MDIO_RDATA | data of the last read |
+| `0x018` | MDIO_STATUS | [0] busy, [1] read data valid, [2] command dropped |
+| `0x01C` | MDIO_DIV | MDC half period − 1 in `ctrl_clk` cycles (49: 1 MHz) |
+| `0x100 + n*0x40` | port n | see below |
+| `0x40000 + n*0x10000` | GT lane n | Taxi transceiver control registers (16-bit APB) |
+
+Port n (`0x100 + n*0x40`):
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `+0x00` | CTRL | [0] TX enable, [1] RX enable, [2] TX padding (0), [3] SGMII AN enable, [4] AN restart, [5] SGMII mode, [6] SGMII speed from AN, [8] GT TX reset, [9] GT RX reset |
+| `+0x04` | STATUS | [0] PCS sync, [1] AN complete, [2] AN running, [3] AN timeout, [4] SGMII mode, [5] PHY copper link, [7:6] speed (00 10M, 01 100M, 10 1G), [8] full duplex, [11] link up |
+| `+0x08` | LP_ADV | SGMII configuration word from the PHY |
+| `+0x0C` | STICKY | write 1 to clear: [0] link down, [1] bad FCS, [2] bad frame, [3] TX underflow, [4] AN interrupt |
+| `+0x10` | TX_IFG | not used in this design (the gap comes from `pktrec_m0_path`) |
+| `+0x14` | TX_MAX_LEN | maximum transmit frame length including FCS, minus 1 (1517) |
+| `+0x18` | RX_MAX_LEN | maximum receive frame length including FCS, minus 1 (1517); longer frames are flagged bad |
+| `+0x1C` | TX_MIN_LEN | minimum transmit length without FCS, minus 1 (59) |
+
+### Port paths: `pktrec_m0_path` (`0x04_2002_0000`, map 1.3)
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `0x000` | ID | `0x504B4D30` ("PKM0") |
+| `0x004` | VERSION | `0x00010003` |
+| `0x008` | PATH_CTRL | [2n+1:2n] transmit source of port n: 0 IDLE, 1 LOOP, 2 FWD, 3 GEN |
+| `0x00C` | CNT_CTRL | write 1: clear all counters and IO_STICKY |
+| `0x010` | IO_STATUS | [3:0] GPIO_0, [7:4] GPIO_1, [8] PG_1V0, [9] PG_2V5, [19:16] link up |
+| `0x014` | IO_STICKY | rising edge seen on GPIO_0 [3:0] / GPIO_1 [7:4] (write 1 to clear) |
+| `0x018` | PAIR_MODE | [2p+1:2p] pair p: 0 monitor, 1 TAP (informational, written by the tools, copied into the capture file header) |
+| `0x01C` | EFF_PATH | [2n+1:2n] transmit source port n uses now; [8+n] port n sends replay frames now |
+| `0x020` | PATH_RPL | [n] port n in path REPLAY (overrides PATH_CTRL) |
+| `0x100 + n*0x40` | port n | below |
+| `0x200 + n*0x80` | generator / checker n | below |
+
+Port n (`0x100 + n*0x40`):
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `+0x00` | RX_GOOD | frames received OK |
+| `+0x04` | RX_BAD | frames received with an error |
+| `+0x08` | TX_GOOD | frames transmitted |
+| `+0x0C` | TX_UNDERFLOW | frames aborted by a transmit underflow (expect 0) |
+| `+0x10` | DROP_LOOP | frames dropped by the LOOP FIFO |
+| `+0x14` | DROP_FWD | frames dropped by the forward FIFO |
+| `+0x18` | GPIO0_EDGES | rising edges of GPIO_0 (receive SFD) |
+| `+0x1C` | GPIO1_EDGES | rising edges of GPIO_1 (transmit SFD) |
+| `+0x20` | IFG_CTRL | [0] dynamic gap enable (1), [15:8] IFG_NOM (12), [23:16] IFG_MIN (8) |
+| `+0x24` | IFG_THRESH | [15:0] IFG_HI (3072), [31:16] IFG_LO (2048), bytes of forward FIFO fill |
+| `+0x28` | FWD_FILL | [15:0] forward FIFO fill now, [31:16] maximum since the last clear |
+| `+0x2C` | IFG_STATUS | [0] reduced gap active, [15:8] gap in use |
+| `+0x30` / `+0x34` | IFG_RED_CYC | 48-bit count of 16 ns cycles with the reduced gap |
+| `+0x38` | IFG_RED_ENTRIES | number of reduced-gap episodes |
+| `+0x3C` | FLUSH | frames discarded from a FIFO the port no longer selects |
+
+Generator and checker n (`0x200 + n*0x80`):
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `+0x00` | GEN_CTRL | [0] ENABLE (0→1 starts: reloads SEQ_FIRST, clears the counters; 0 stops after the current frame), [1] raw format, [2] random length, [3] send error-terminated |
+| `+0x04` | GEN_STATUS | [0] running, [1] done (COUNT reached) |
+| `+0x08` | GEN_LEN | [13:0] bytes without FCS (60) |
+| `+0x0C` | GEN_LEN_MASK | [13:0] random length mask (0) |
+| `+0x10` | GEN_IFG | [15:0] gap in bytes (12) |
+| `+0x14` | GEN_COUNT | frames per start, 0 = until stopped |
+| `+0x18` / `+0x1C` | GEN_DST | destination MAC (bytes 2..5 / 0..1; reset broadcast) |
+| `+0x20` / `+0x24` | GEN_SRC | source MAC (reset `02:00:00:00:00:0n`) |
+| `+0x28` | GEN_ETYPE | raw-format EtherType (`0x88B5`) |
+| `+0x2C` | GEN_STREAM | stream id (n) |
+| `+0x30` | GEN_SEQ_FIRST | first sequence number |
+| `+0x34` / `+0x38` | GEN_FRAMES | frames sent since the start (64) |
+| `+0x3C` / `+0x40` | GEN_BYTES | bytes sent including FCS (64) |
+| `+0x48` | CHK_CTRL | [0] ENABLE (0→1 clears), [1] raw format, [31:16] EtherType |
+| `+0x4C` | CHK_FRAMES | generator frames received |
+| `+0x50` | CHK_LOST | sum of sequence gaps |
+| `+0x54` | CHK_ERRORS | duplicate or out-of-order sequence numbers |
+| `+0x58` | CHK_BAD | generator frames with a MAC error |
+| `+0x5C` / `+0x60` | CHK_LAST_SEQ | highest sequence number seen (64) |
+
+### Capture: `pktrec_capture` (`0x04_2003_0000`, map 1.2)
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `0x000` | ID | `0x504B4350` ("PKCP") |
+| `0x004` | VERSION | `0x00010002` (register map 1.2, record format v1) |
 | `0x008` | CTRL | [0] ENABLE, [1] FILL, [2] SRC_SEL (recorder source: 1 = capture), [8] CLEAR (self-clearing) |
 | `0x00C` | STATUS | [0] IDLE, [1] merge busy, [11:8] port idle, [15:12] port receiving a captured frame, [23:16] MAC clock domains out of reset |
 | `0x010` | PORT_EN | [3:0] per-port enable (reset `0xF`) |
@@ -291,539 +408,48 @@ the matching `_HI`.
 | `0x098` | TB_SET (64) | value loaded by SET |
 | `0x0A0` | TB_ADJ (64) | signed offset added by ADJ |
 | `0x0A8` | MAC_OFFSET | signed ns added to MAC timestamps (reset 52) |
-| `0x100 + n*0x40` | port n | FRAMES_RX, FRAMES_BAD, FRAMES_DROP, BYTES_RX, BYTES_DROP, FRAMES_TRUNC, RECORDS (64 bit each), FIFO_HWM (0x38, bytes, write clears), SEQ_NEXT (0x3C) |
+| `0x100 + n*0x40` | port n | below |
+| `0x400`..`0xBFF` | SFD | below |
+
+Port n (`0x100 + n*0x40`, 64-bit counters):
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| `+0x00` | FRAMES_RX | frames seen while enabled (good + bad, including dropped) |
+| `+0x08` | FRAMES_BAD | of which flagged bad by the MAC |
+| `+0x10` | FRAMES_DROP | dropped whole (FIFO full or oversize) |
+| `+0x18` | BYTES_RX | bytes of FRAMES_RX, including FCS |
+| `+0x20` | BYTES_DROP | bytes of FRAMES_DROP |
+| `+0x28` | FRAMES_TRUNC | frames cut by SNAPLEN |
+| `+0x30` | RECORDS | records handed to the merge |
+| `+0x38` | FIFO_HWM | frame FIFO high-water mark in bytes (32 bit, write clears) |
+| `+0x3C` | SEQ_NEXT | [15:0] sequence number of the next frame |
 
 Once `STATUS.IDLE` = 1, `FRAMES_RX` = `RECORDS` + `FRAMES_DROP` on every port.
+`include/pktrec_regs.h` documents the start and stop protocol with the recorder driver.
 
-### Verification
-
-Self-checking testbenches (`Vivado/scripts/sim.tcl`):
-
-* `tb_pktrec_cap_port`: headers, data and padding of every record, snaplen, whole-frame
-  drops under back-pressure with exact counters and sequence gaps, the port enable,
-  minimum-size frames at line rate with no drops, the timestamp conversion across the
-  32-bit wrap of the cycle counter.
-* `tb_pktrec_cap_merge`: whole records only, per-port order, round-robin fairness, fill,
-  soft-reset cut.
-* `tb_pktrec_timebase`: increment, set, adjust, rate change, and the delay window of the
-  cycle-count copies at +125 / -250 ppm.
-* `tb_pktrec_capture`: the four ports, the merge, the registers and `fdrec_core` in
-  capture mode with a DMA model. It follows the start and stop protocol and checks the
-  recorded stream frame by frame, then cuts records in flight with a recorder soft reset.
-
-## SFD timestamping (M2)
-
-Each DP83867 raises its GPIO_0 when it receives a start-of-frame delimiter on the cable
-and keeps it high until the end of the frame; GPIO_1 does the same for transmitted
-frames (`pktrec-phy init` sets `GPIO_MUX_CTRL` = `0x0012`). The reference point is the
-MDI (cable) side of the PHY, which is what a capture timestamp should describe: the
-PHY, SGMII, transceiver and PCS latencies, and their variation, are all behind it.
-
-### Sampling and resolution
-
-The eight pins reach the FPGA through the OP080's SN74AVC4T245 translators (LVCMOS18,
-HP banks 67/68) and go straight from their input buffers into ISERDESE3 primitives
-(`pktrec_sfd_io`):
-
-* An MMCM takes `dp_clk` (249.975 MHz) and makes, from one VCO (4 x `dp_clk`), a 2x
-  clock (~500 MHz, BUFGCE) and a 1x clock (~250 MHz, BUFGCE). The two are phase
-  aligned by construction, and to `dp_clk` by the MMCM's feedback compensation.
-  (A BUFGCE_DIV for the 1x clock was avoided: its divided edge can come up on either
-  2x edge, which would shift the samples by 2 ns from one configuration to the next.)
-* ISERDESE3 in component mode, DATA_WIDTH 4, DDR on the 2x clock: four samples per
-  `dp_clk` cycle, one every ~1.0 ns. The 4-bit words cross into `dp_clk` as an
-  ordinary timed path (same frequency, phase locked).
-* `pktrec_sfd_edge` finds the first high sample after a low one: the timestamp is the
-  timebase value of that cycle plus the sample index (ns), minus the fixed sampler
-  pipeline (`SFD_PIPE_NS` = 16).
-
-**Resolution: 1 ns** (`SFD_RES_PS` = 1000). In simulation with the real ISERDESE3 and
-MMCME4 models, 8 pins x 150 edges at random sub-ns phases gave a timestamp error
-uniformly within (-1, 0] ns (the timestamp is the first sample at or after the edge).
-The IDDR fallback (`SFD_SAMPLER = "IDDR"`, no MMCM, 2 samples per cycle) gives 2 ns.
-The DP83867 itself adds a receive SFD variation of up to +-8 ns that changes with every
-link-up (it is constant while the link stays up; register `0x0055` reports it in 8 ns
-steps) and none on transmit at 1000 Mb/s.
-
-Glitch filter: an edge counts only if the pin was low for at least `SFD_MIN_LOW`
-cycles before (reset 25 = 100 ns; real frames are at least 160 ns apart at 1 Gb/s) and
-stays high for `SFD_MIN_HIGH` cycles after (reset 8 = 32 ns; a minimum frame keeps it
-high for 512 ns). Rejected edges are counted (`RX_GLITCH`, `TX_GLITCH`).
-
-### Matching receive SFDs to frames
-
-Each accepted receive edge goes into a 16-entry queue in the port's capture front end
-(`pktrec_cap_port`, dp_clk to rx_clk). From the first beat of every frame - captured,
-dropped by the FIFO or not enabled alike, since every frame had an SFD - the oldest
-entry is compared with the frame's MAC timestamp (the cycle stamp the Taxi MAC took at
-its own SFD detection):
-
-    d = MAC_raw - t_sfd        (ns; MAC_raw = MAC cycle stamp x 4 ns, no MAC_OFFSET)
-
-| Condition | Action |
-|-----------|--------|
-| `d` > `RX_WIN_MAX` | stale entry (a pulse without a frame): dropped, `RX_STALE`, record flag bit3; try the next |
-| `RX_WIN_MIN` <= `d` <= `RX_WIN_MAX` | match: record ts = `t_sfd` + `RX_OFFSET`, flag bit2 (TS_MAC) = 0 |
-| `d` < `RX_WIN_MIN` | the entry belongs to a later frame: kept; this frame falls back |
-| queue empty | wait until the frame's last beat, then fall back |
-
-A frame without a match gets the MAC timestamp (`+ MAC_OFFSET`, flag bit2 = 1) and
-counts `RX_MISMATCH`. A missing pulse costs only its own frame and an extra one is
-discarded at the next frame: nothing ever shifts. The window (reset 100..700 ns)
-must stay narrower than a minimum frame time (672 ns at 1 Gb/s), so that the SFDs of
-neighbouring frames can never fall inside it. `RX_DELTA_LAST/MIN/MAX` record `d` of
-the matches, `RX_HEAD_DELTA` the `d` of the last entry evaluated whatever the outcome
-(use it to place the window when nothing matches). In simulation, with the pin pulsed
-350 ns before the frame entered the MAC model, `d` was 303 ns.
-
-Record flags (`include/pktrec_format.h`): bit2 TS_MAC = 1 when the frame fell back to
-the MAC timestamp; bit3 SFD_RESYNC (`PKTREC_REC_FLAG_SFD_MISMATCH`) = 1 when stale
-entries were discarded while this frame was matched (independent of bit2).
-
-### Transmit SFDs and latency
-
-Transmit edges are paired, in order, with the MAC's TX completions of the same port
-(one per frame sent, with the MAC's cycle stamp): `lat` = `t_sfd` - `cpl_raw` within
-`TX_WIN_MIN`..`TX_WIN_MAX` (reset 0..900 ns) pairs, older completions are stale
-(`TX_CPL_STALE`), an edge without a completion counts `TX_UNPAIRED`. `TX_LAT_LAST/MIN/MAX`
-give the MAC-to-cable transmit latency (raw cycle stamp, no offsets); `TX_EDGES` versus
-`TX_CPL` checks the counts. The transmit timestamps are not stored in records; they are
-for calibration and for TAP latency measurements.
-
-`RX_LAST_TS` / `TX_LAST_TS` hold the latest timestamps of each port (with the port's
-offset). With `SFD_CTRL.LOG_EN`, per-port log FIFOs keep the last 16 receive and 16
-transmit timestamps (transmit with its latency) for software (`pktrec-phy sfd log`).
-
-### SFD registers
-
-Capture block offsets (`include/pktrec_regs.h` `PKTREC_SFD_*`):
+SFD block:
 
 | Offset | Name | Description |
 |--------|------|-------------|
 | `0x400` | SFD_CTRL | [0] MATCH_EN (reset 1), [1] LOG_EN, [8] CLEAR (also cleared by CTRL.CLEAR) |
 | `0x404` | SFD_STATUS | [0] sampler locked, [1] ISERDES sampler, [11:8] RX levels, [15:12] TX levels |
 | `0x408` / `0x40C` | SFD_RES_PS / SFD_PIPE_NS | 1000 / 16 |
-| `0x410` / `0x414` | RX_WIN_MIN / MAX | signed ns (100 / 700) |
-| `0x418` / `0x41C` | TX_WIN_MIN / MAX | signed ns (0 / 900) |
+| `0x410` / `0x414` | RX_WIN_MIN / MAX | signed ns (reset 100 / 700) |
+| `0x418` / `0x41C` | TX_WIN_MIN / MAX | signed ns (reset 0 / 900) |
 | `0x420` / `0x424` | MIN_LOW / MIN_HIGH | glitch filter, `dp_clk` cycles (25 / 8) |
 | `0x800 + n*0x100` | port n, receive | +0x00 RX_EDGES (64), +0x08 RX_GLITCH, +0x0C RX_FIFO_OVF, +0x10 RX_MATCHED (64), +0x18 RX_STALE, +0x1C RX_MISMATCH, +0x20..0x28 RX_DELTA_LAST/MIN/MAX, +0x2C RX_HEAD_DELTA, +0x30 RX_LAST_TS (64), +0x38 RX_OFFSET (RW), +0x3C RX_LOG_STATUS, +0x40 RX_LOG_TS (64, LO read pops) |
 | `0x880 + n*0x100` | port n, transmit | +0x00 TX_EDGES (64), +0x08 TX_GLITCH, +0x0C TX_CPL_OVF, +0x10 TX_CPL (64), +0x18 TX_PAIRED, +0x1C TX_CPL_STALE, +0x20 TX_UNPAIRED, +0x24..0x2C TX_LAT_LAST/MIN/MAX, +0x30 TX_LAST_TS (64), +0x38 TX_OFFSET (RW), +0x3C TX_LOG_STATUS, +0x40 TX_LOG_TS (64, LO read pops), +0x48 TX_LOG_LAT, +0x4C TX_HEAD_LAT |
 
-Deltas and latencies are signed ns; `0x80000000` means "none yet".
+Deltas and latencies are signed ns; `0x80000000` means "none yet". `RX_DELTA` is
+`MAC_raw − t_sfd` of the matched frames; `RX_HEAD_DELTA` is the delta of the last entry
+evaluated whatever the outcome (use it to place the window when nothing matches).
 
-### Calibration
-
-What a timestamp means: the time the PHY's SFD indication reached the FPGA sampler, on
-the shared timebase. Between the cable and that point are the PHY's SFD detection, the
-translator and the routing; they are constant per port (apart from the PHY's per-link
-receive variation of up to +-8 ns) and are removed with `RX_OFFSET` / `TX_OFFSET`.
-With P2 and P3 connected by a short cable (both run by the same 25 MHz PHY clock tree):
-
-1. `pktrec-phy init --1000-only`, `pktrec-phy sfd config --log on`,
-   `pktrec-phy sfd status --clear`.
-2. Generate on P2, receive on P3: `pktrec-phy gen 2 start --size 64 --rate 1000
-   --count 10000` (and `pktrec-phy chk 3 start`).
-3. `pktrec-phy sfd log 2 --dir tx` and `pktrec-phy sfd log 3 --dir rx` (repeat while
-   running, 16 entries per read): for the same frames, `RX_SFD(P3) - TX_SFD(P2)` =
-   cable delay (about 5 ns/m) + (receive indication delay - transmit indication delay,
-   including both translators). Record its mean and spread; the spread is the PHY's
-   receive SFD variation plus the 1 ns sampling. Repeat in the other direction (gen 3,
-   log tx 3 / rx 2). Setting `TX_OFFSET` of both ports to 0 and `RX_OFFSET(p)` =
-   `-(mean - cable delay)` makes a frame's receive timestamp equal its transmit
-   timestamp plus the cable delay. TI defines the transmit indication as "symbol
-   presented on the line", so the transmit SFD is taken as the cable-side reference;
-   only its (small, constant) translator and routing delay remains unknown, and it
-   cancels in every difference between two ports of this board.
-   Re-measure after a link-up to see the per-link variation (read register `0x0055`).
-4. `RX_DELTA_MIN/MAX` (P3) give the spread of `MAC_raw - t_sfd`. Center the receive
-   window on it with generous margin but keep it narrower than 672 ns, e.g.
-   `sfd config --rx-win <min-150> <max+150>`. Likewise `TX_LAT_MIN/MAX` for
-   `--tx-win`.
-5. MAC fallback: set `MAC_OFFSET` = `RX_OFFSET` - median(`RX_DELTA`) so that a frame that
-   falls back to its MAC timestamp lands on the same scale (within the MAC's 16 ns
-   quantisation).
-6. TAP latency (M3): with P0/P1 forwarding, the latency of a frame received on P0 and
-   sent on P1 is `TX_SFD(P1) - RX_SFD(P0)` from the two log FIFOs (or
-   `TX_LAST_TS(P1) - RX_LAST_TS(P0)` at low rates).
-
-Repeat at 100 Mb/s if needed: the PHY latencies differ there, so the windows and
-offsets must be re-measured (registers, no rebuild).
-
-## Traffic generator (M2)
-
-Each port's TX path has a fourth source (`PATH_CTRL` mode 3, `gen`): `pktrec_gen`
-sends sequence-numbered test frames from the fabric at up to line rate, so P2 and P3
-can drive each other (and the bench can load P0/P1) without external equipment. A
-receive checker (`pktrec_gen_chk`) on every port counts the sequence numbers it sees.
-
-* Format 0 (PRSQ, default): byte-identical to `test/gen_seq.py` - Ethernet, IPv4
-  192.0.2.1 to 192.0.2.2, UDP 50000 to 50001, payload `"PRSQ"`, stream id (u32),
-  sequence number (u64), zeros - so `test/check_pcap.py` verifies captures of
-  generator traffic unchanged (stream key `prsq:<stream>`).
-* Format 1 (raw): destination, source, EtherType (`GEN_ETYPE`, default `0x88B5`), a u32
-  sequence number at payload offset 0, zeros.
-* Length 60..16383 bytes without the FCS (the MAC appends it); optional random
-  lengths `LEN + (LFSR & LEN_MASK)`. Frames above the MAC's `TX_MAX_LEN` (1518 incl.
-  FCS by default) need `PKTREC_ETH_P_TX_MAX_LEN` raised.
-* Rate: a frame starts at most every `ceil((LEN + 4 + 8 + IFG) / 2)` `tx_clk` cycles
-  (IFG in bytes; 12 = line rate: 1.488 Mframes/s at 64 bytes).
-* `COUNT` frames (0 = until stopped); `GEN_CTRL.ENABLE` 0 to 1 starts (reloading
-  `SEQ_FIRST`, clearing `GEN_FRAMES` / `GEN_BYTES`), 0 stops after the current frame.
-  Frames are never cut.
-* Checker: `CHK_FRAMES`, `CHK_LOST` (sum of sequence gaps), `CHK_ERRORS` (duplicates or
-  reordering), `CHK_BAD` (MAC errors), `CHK_LAST_SEQ`; enabling it clears them.
-
-Registers: `pktrec_m0_path` (`0x04_2002_0000`, map 1.1) at `0x200 + n*0x80`
-(`PKTREC_M0_GEN_*`, `PKTREC_M0_CHK_*` in `include/pktrec_regs.h`). Command line:
-
-    pktrec-phy gen 2 start --size 64 --count 0       # line rate, P2 path = gen
-    pktrec-phy chk 3 start; pktrec-phy chk 3 status
-    pktrec-phy gen 2 stop
-
-### Verification (M2)
-
-* `tb_pktrec_sfd`: the real ISERDESE3/MMCME4 models and timebase; resolution over 8 pins
-  x 150 random-phase edges (error within (-1, 0] ns; IDDR within 2 ns), queue overflow,
-  glitch filter, TX pairing with missing and extra completions, log FIFOs and offsets.
-* `tb_pktrec_sfd_match`: normal matching with exact timestamps, missing pulses, extra
-  pulses, entries too young / too old, frames dropped by the FIFO and frames on a
-  disabled port consuming their entries, `MATCH_EN` = 0, a 1-beat runt, queue overflow;
-  all counters and delta statistics exact.
-* `tb_pktrec_capture` test 5: SFD pulses on a pin through the whole capture block and
-  recorder: every record SFD-stamped, timestamp differences equal to the pin time
-  differences within 1 ns.
-* `tb_pktrec_gen`: frame content byte for byte against a `gen_seq.py` model, line-rate
-  spacing, IFG spacing, random lengths, count, stop, and the checker (loss, duplicate,
-  bad frames).
-
-## TAP mode (M3)
-
-```{warning}
-**The Ethernet FMC Max has no bypass relays.** The TAP forwards in the FPGA fabric, so the
-link between the two devices on a TAP pair is **broken whenever the board is unpowered,
-booting, or the FPGA is being reconfigured** (a new bitstream, a reboot, a crash of the
-PL). Insert the TAP only where a short outage at power-up is acceptable, and expect
-both devices to see a link-down event whenever the board restarts.
-```
-
-A pair (P0/P1 or P2/P3) is either in **TAP** mode, where each port forwards everything
-it receives out of its partner so the two devices on either side talk to each other
-through the board, or in **monitor** mode, where both ports only receive. Capture is
-the same in both modes: each port records what it *receives*, so in TAP mode the two
-directions of the link are the two ports' interfaces (`P0` = traffic from the device on
-P0 to the device on P1) and nothing is recorded twice.
-
-### Forwarding
-
-* **Store-and-forward.** Every TX port has a 16 KB forward FIFO (`FWD_FIFO_DEPTH`,
-  `pktrec_m0_path`) fed by its partner's RX MAC; a frame is sent once it has been
-  received completely. The latency therefore grows with the frame size (see
-  [Latency](#forwarding-latency)). Cut-through forwarding (start sending after the
-  header) is deferred: it would make the latency fixed but adds complexity (underrun
-  handling when the partner's clock is slower) without changing what the devices see.
-* **Frames are forwarded unmodified** except for the FCS, which the RX MAC checks and
-  strips and the TX MAC regenerates (a correct frame comes out bit-identical). TX
-  padding is off, so runts stay runts.
-* **Errored frames are forwarded as errored frames.** A frame that arrives with a bad
-  FCS or a receive error is forwarded with the MAC's bad-frame flag (Taxi TX
-  `tuser[0]`); the Taxi PCS then sends `/V/` (error propagation) code groups in place
-  of the FCS, the DP83867 turns them into a transmit error on the copper side, and the
-  device on the other side counts a receive error and drops the frame, as it would
-  with the original errored frame. The original wrong FCS value is not preserved, and
-  a receiver that meets `/V/` ends the frame a few bytes early (6 bytes for the Taxi
-  receiver in simulation) - so the far device sees *a* receive error, not the same
-  bytes. The capture records the frame as received, with the bad-frame flag.
-* **Frames never get cut.** The TX side changes source only between frames; frames that
-  do not fit are dropped whole and counted (`DROP_FWD`).
-
-### Clock mismatch and the dynamic inter-frame gap
-
-The two devices on a TAP pair each transmit with their own clock, up to +-100 ppm off
-nominal, while our TX MAC sends with the board's 125 MHz reference. If the device on P0
-sends at 100 % utilisation and its clock is faster than ours, frames arrive faster than
-P1 can send them, and any FIFO eventually overflows: at a +200 ppm worst case that is
-25 KB per second of traffic.
-
-The standard fix, applied here, is to shorten the inter-frame gap while the FIFO fills
-up. Per TX port, `pktrec_m0_path` drives the Taxi MAC's `cfg_tx_ifg`
-(`pktrec_eth_ports` parameter `EXT_TX_IFG` = 1):
-
-* normally `IFG_NOM` = 12 bytes (the IEEE 802.3 gap),
-* `IFG_MIN` = 8 bytes while the forward FIFO holds more than `IFG_HI` = 3072 bytes, until
-  it falls below `IFG_LO` = 2048 bytes (hysteresis; IEEE 802.3 receivers must accept
-  gaps down to 64 bit times, i.e. 8 bytes).
-
-Saving 4 bytes per frame catches up 4 / 1538 = 0.26 % (2600 ppm) with 1518-byte frames
-and 4.8 % with 64-byte frames, far more than the 200 ppm needed. The FIFO fill counts
-the frame that is being received, so while forwarding 1518-byte frames at 100 % it sits
-at about one frame (~1.5 KB) even with no backlog; `IFG_LO` must stay above the largest
-frame or the reduced gap only ends when the traffic pauses. Below 100 % utilisation the
-FIFO never fills and the gap stays at 12 bytes. The worst-case extra latency from the
-backlog is `IFG_HI` (3 KB, 25 us); the 13 KB above it absorb bursts.
-
-Counters per TX port (`pktrec-phy ifg`): FWD fill now and its maximum, time spent with
-the reduced gap (`IFG_RED_CYC`, 16 ns units) and the number of episodes.
-
-Speed: the forward FIFO cannot bridge two different link speeds. `pktrec-phy init
---1000-only` (what `pktrec-phy-watch.service` runs at boot) advertises only 1000BASE-T
-full duplex on all four PHYs, so both devices link at 1 Gb/s or not at all, and `pktrec-phy
-mode <pair> tap` warns when the two ports of a pair report different speeds. Tapping a
-100 Mb/s link needs both PHYs of the pair restricted to 100 Mb/s instead (Should #10,
-not done yet).
-
-### Pair mode and switching
-
-`pktrec-phy mode <pair> tap|monitor` sets the two ports' `PATH_CTRL` fields (tap = FWD
-on both, monitor = IDLE on both) and the informational `PAIR_MODE` register, which
-`pktrec-cap` copies into the capture file header (`pair_mode`, bit p = pair p in TAP mode)
-and `pktrec-export` reports in each pcapng interface description ("TAP pair 0
-(P0<->P1), forwarded to P1" or "monitor mode"). `pktrec-phy path` and `gen` keep
-`PAIR_MODE` consistent (a pair is "tap" exactly when both its ports forward).
-`pktrec-phy mode` refuses to switch while a capture is running (capture `CTRL.ENABLE`),
-unless `--force` is given.
-
-Exact behaviour of a switch while traffic flows (verified in `tb_pktrec_tap`):
-
-* **RX side:** the new mode takes effect for frames whose first byte arrives after the
-  register write has crossed into the port's receive clock (a few cycles); a frame that
-  is being received keeps the decision taken at its first byte.
-* **TX side:** the port finishes the frame it is sending, then switches source.
-* **Frames already in a FIFO** that the port no longer selects (for example the forward
-  FIFO when going from TAP to monitor) are discarded and counted per port in `FLUSH`. At
-  most the FIFO contents are lost (in practice the one or two frames in flight); no
-  frame is ever truncated, corrupted, duplicated or reordered, and every frame that
-  entered a FIFO is either sent or counted in `FLUSH` or `DROP_*`.
-
-In **monitor mode** the PHYs still link up normally (with the advertisement from `pktrec-phy
-init`, 1000BASE-T full duplex only by default) so that the devices on each side keep
-their link; the ports send nothing but idles.
-
-### Link-state propagation
-
-On a direct cable, when one device's link goes down the other device sees it too. Through
-the TAP it would not: the PHY on the other port keeps its link to the other device. The
-link watcher (`pktrec-phy watch`, run by `pktrec-phy-watch.service`) therefore propagates
-the copper link state for pairs in TAP mode:
-
-* when a port's copper link has been down for 0.5 s (`--debounce`), its partner PHY is
-  powered down (DP83867 `BMCR[11]`), so the device on the partner's side sees link down;
-* when the port's link has been up again for 0.5 s, the partner PHY is powered up (its
-  registers are kept) and the SGMII status word re-triggered once its copper link
-  returns;
-* a port whose link is down *because we powered it down* never propagates (no
-  ping-pong), and a PHY that was just powered up gets 6 s (`--grace`) to auto-negotiate
-  before its own link-down counts. If its far device is really gone, the first port is
-  powered down after the grace time: the device on that side sees its link come up
-  for up to ~6 s, then go down again;
-* when the pair leaves TAP mode, when the watcher stops (SIGTERM), or when someone else
-  powers the PHY up (`pktrec-phy init`), the watcher releases every PHY it powered down.
-
-Every action is logged with a timestamp (`journalctl -u pktrec-phy-watch`; `--json` gives
-one JSON object per line); `--no-propagate` disables propagation.
-
-### Forwarding latency
-
-Simulated (`tb_pktrec_tap`, Taxi MAC/PCS models, no transceiver or PHY), from the
-start-of-frame on the incoming 1000BASE-X stream to the start-of-frame of the forwarded
-frame:
-
-| Frame (incl. FCS) | 64 B | 256 B | 512 B | 1024 B | 1518 B |
-|---|---|---|---|---|---|
-| Latency (simulation) | 735 ns | 2271 ns | 4319 ns | 8415 ns | 12367 ns |
-
-That is `8 ns x frame length + 223 ns`: the frame time plus a fixed MAC/FIFO/PCS
-pipeline. On the hardware the GTH transceivers and the two DP83867s (RX and TX) add their
-fixed latencies. **Hardware latency is measured with the SFD timestamps** (M2): for a
-frame received on port A and forwarded out of port B, latency = TX SFD(B) - RX SFD(A),
-i.e. from the start-of-frame delimiter on the incoming wire to the one on the outgoing
-wire (the PHYs' own SFD indications, 1 ns sampling; with `RX_OFFSET`/`TX_OFFSET`
-calibrated, wire to wire). `pktrec-phy latency` pairs the two ports' SFD log FIFOs
-(time window 30 us, so the traffic must be paced: at most one frame in flight per
-direction) and prints min / median / max per direction:
-
-    # on the board (pair 0 in TAP mode)
-    pktrec-phy latency --pair 0 --count 300 --label "64 B"
-    # meanwhile on the device behind P1: echo traffic of one size through the TAP
-    ping -I <if> -i 0.01 -c 400 -s 18 <host behind P0>     # 64-byte frames
-
-ICMP payload sizes for the standard frame sizes (Ethernet + IPv4 + ICMP = 42 bytes of
-headers, plus the 4-byte FCS): 64 B `-s 18`, 256 B `-s 210`, 512 B `-s 466`, 1024 B
-`-s 978`, 1518 B `-s 1472`. The echo request gives the P1 to P0 direction and the reply the
-P0 to P1 direction. Background frames of other sizes fall outside the "main cluster"
-(median +- 500 ns) that the tool also reports.
-
-### Registers (pktrec_m0_path map 1.2)
-
-New in map 1.2 (`VERSION` = `0x00010002`; full list in `include/pktrec_regs.h`):
+### Replay: `pktrec_replay` (`0x04_2004_0000`, map 1.0)
 
 | Offset | Name | Description |
 |--------|------|-------------|
-| `0x018` | PAIR_MODE | [2p+1:2p] pair p: 0 monitor, 1 TAP (informational, see above) |
-| `0x01C` | EFF_PATH | [2n+1:2n] TX source port n is using now (PATH_CTRL coding) |
-| port + `0x20` | IFG_CTRL | [0] dynamic IFG enable (1), [15:8] IFG_NOM (12), [23:16] IFG_MIN (8) |
-| port + `0x24` | IFG_THRESH | [15:0] IFG_HI (3072), [31:16] IFG_LO (2048), bytes of FWD FIFO fill |
-| port + `0x28` | FWD_FILL | [15:0] FWD FIFO fill now, [31:16] maximum since `CNT_CTRL` clear |
-| port + `0x2C` | IFG_STATUS | [0] reduced gap active, [15:8] gap in use |
-| port + `0x30/0x34` | IFG_RED_CYC | 48-bit count of 16 ns cycles with the reduced gap (LO read latches HI) |
-| port + `0x38` | IFG_RED_ENTRIES | number of reduced-gap episodes |
-| port + `0x3C` | FLUSH | frames discarded from a FIFO the port no longer selects |
-| GEN + `0x00` | GEN_CTRL[3] | BAD: generator frames sent error-terminated (bad-frame forwarding test) |
-
-(port = `0x100 + n*0x40`, GEN = `0x200 + n*0x80`.) The shell's `TX_IFG` register is not
-used any more (`EXT_TX_IFG` = 1). The block keeps its historical name `pktrec_m0_path`.
-
-### Commands
-
-| Command | What it does |
-|---------|--------------|
-| `pktrec-phy mode <0\|1> tap\|monitor [--force]` | sets the pair's mode (PATH_CTRL + PAIR_MODE) |
-| `pktrec-phy mode status [--json]` | mode, path and effective path per pair |
-| `pktrec-phy ifg <port\|all> [--enable on\|off] [--nom B] [--min B] [--hi B] [--lo B] [--json]` | dynamic-IFG settings and counters, FWD fill, FLUSH |
-| `pktrec-phy latency --pair P \| --in A --out B [--count N] [--json]` | forwarding latency from the SFD logs |
-| `pktrec-phy watch [--no-propagate] [--debounce S] [--grace S] [--json]` | SGMII re-trigger and link-state propagation |
-| `pktrec-phy gen <port> start --bad ...` | generator frames sent as errored frames |
-
-### Verification (M3)
-
-`tb_pktrec_tap` puts real Taxi 1000BASE-X MAC/PCS cores (`taxi_axis_basex_tx_16` /
-`_rx_16`) on both sides of the P0/P1 pair, wired at the 8b/10b level, with sources at
-100 % utilisation and sequence-numbered frames checked at the far ends:
-
-* **Bad frames:** frames sent error-terminated and frames hit by a bit error on the line
-  leave the partner port error-terminated; the far receiver flags exactly those 130 of
-  400 frames bad, the others arrive intact; RX_BAD / TX_GOOD exact.
-* **Dynamic IFG:** 1514-byte frames from a source +2000 ppm fast: the reduced gap starts
-  only above `IFG_HI` and ends only below `IFG_LO` (4 episodes in 1200 frames), the wire
-  carries only 12- and 8-byte gaps, no frame lost.
-* **Clock mismatch:** 64-byte frames, source +4 % fast (a scaled stand-in for +200 ppm
-  over more than 1 s: 233 us of accumulated excess against 200 us): 9000 of 9000 frames
-  delivered with the dynamic IFG; without it the FIFO overflows and 75 frames are dropped
-  whole, `DROP_FWD` = 75 = the frames missing at the far end.
-* **Mode switching:** both directions at 100 %, PATH_CTRL toggled 12 times between TAP,
-  monitor and loopback mid-traffic: 1335 frames entered FIFOs, 1232 delivered + 103 in
-  `FLUSH`, none corrupted, truncated or reordered; lossless after the last switch.
-
-The other testbenches (`tb_pktrec_m0_path`, `tb_pktrec_gen`, ...) pass unchanged.
-
-## Replay (M6)
-
-A capture can be played back out of a port with its original timing, scaled, at a fixed
-interval or back to back at line rate. The data path is the recorder's playback path; the
-timing is decided in hardware, against the same timebase that stamped the frames.
-
-```
-capture file --(pktrec-replay: selects one interface, copies its records)--> hugepage ring
-  --> AXI DMA MM2S --> fdrec_core egress FIFO (64 KB, src_clk)
-  --> replay/pktrec_replay_0:  SEL = 0: passed on to user_data_sink (fdrec_check, fdplay)
-                               SEL = 1: async FIFO --> dp_clk:
-        record parser --> frame store (128 KB data + 2048 frames metadata)
-        --> scheduler (timebase from capture/tb_now) --> 128 -> 16 bit, tdest = port
-  --> eth_ports/pktrec_m0_path: replay FIFO of the port (64 B, cut-through, dp_clk -> tx_clk)
-      --> TX source "path mode 4 REPLAY" (PATH_RPL) --> Taxi MAC --> PHY
-```
-
-### Parser and frame store
-
-The parser reads the record stream exactly as written by the capture (record format v1:
-16-byte header + frame bytes padded to 16, all-zero fill units skipped). Every header is
-checked like in `pktrec-export` (marker nibble `0xA`, port < 4, 1 <= cap_len <= 16384,
-cap_len + 4 <= orig_len, TRUNC flag consistent). A unit that is neither a header nor fill
-counts one `PARSE_ERRORS` and the parser tests every following unit until a header passes
-(resynchronisation). Optional filters: a port filter (pktrec-replay sets it to the
-selected interface as a safety net) and the bad-frame policy (below); filtered records
-count as `SKIPPED`.
-
-A frame's bytes go into the data FIFO; its metadata (timestamp, length, bad flag) is
-written only with its last beat. The scheduler therefore never sees a frame that is not
-complete: **no partial frame is ever released**. When the store is full, the parser stops
-reading and the back-pressure stalls the DMA; nothing is lost.
-
-### Scheduler
-
-| Mode | Release of frame i |
-|------|--------------------|
-| TIMED (default) | `target_i = T0 + ((ts_i - ts_first) * RATE_INV) >> 16`; `RATE_INV` 16.16, `0x10000` = original timing, `0x8000` = twice as fast, `0x20000` = half speed |
-| BACK-TO-BACK (`--topspeed`) | as soon as the MAC takes it (line rate, 12-byte gaps) |
-| FIXED (`--gap`) | `target_i = T0 + i * GAP_NS` |
-
-`T0 = TB_NOW + START_DELAY` is latched by the GO command; `ts_first` is the first frame's
-timestamp. The comparison runs every dp_clk cycle against `timebase + floor(INC)` and the
-release (first 16-bit word into the port's replay FIFO) happens in the next cycle, so a
-frame is **never released early and at most one timebase step (about 4 ns) late** when the
-TX path is free. The output of a frame is never interrupted: it is written at dp_clk, four
-times faster than the MAC reads it, from a store that holds the whole frame (the Taxi TX
-MAC aborts a frame whose input stalls).
-
-From release to the wire the delay is constant except for the 62.5 MHz MAC clock: the
-replay FIFO crosses into `tx_clk` and the MAC starts a frame on a 16-ns cycle. The
-expected wire timing error is therefore about +-16 ns per frame (simulation: max 15 ns,
-mean 4..7 ns). It does not accumulate: every target is absolute.
-
-The timebase discipline (`pktrec-tb`) only trims `INC` during a replay (pktrec-replay
-creates `/run/pktrec/tb-hold.<pid>`, so the daemon does not step the timebase). A step
-(TB_SET / TB_ADJ) during a run would move every later release by the step.
-
-### Underruns and lateness
-
-Timing is never corrected: a frame that could not be sent at its target is sent late
-and counted.
-
-* **LATE** counts frames released more than `LATE_THRESH` (100 ns) after their target;
-  `MAX_LATE`, `LAST_LATE` and `LATE_SUM` (mean = LATE_SUM / FRAMES) describe the lateness.
-  A frame is late when the stream starved (below) or when the capture holds frames closer
-  together than the replay port can send them (for example original line-rate traffic
-  from a sender whose clock was faster than our TX clock, or `--rate` above what the line
-  carries).
-* **UNDERRUNS** counts the times the store ran empty and the next frame then arrived
-  after its target (TIMED / FIXED), or, back to back, the store ran empty before the end
-  of the stream. STATUS.UNDERRUN is sticky; pktrec-replay exits with code 2.
-
-The playback path is much faster than one port's 125 MB/s (an NVMe SSD reads several
-hundred MB/s, the DMA/egress path runs at GB/s), and the 128 KB store + 64 KB egress FIFO cover the
-DMA's descriptor restart gaps (13-15 us), so underruns indicate a slow disk or a busy CPU.
-
-### Frame content, bad frames, runts
-
-* The frame sent is the captured bytes (`cap_len`, FCS excluded); the MAC appends a new
-  FCS. MAC padding is off on all ports, so frames shorter than 60 bytes go out as runts,
-  as captured. Records truncated by a snap length go out truncated.
-* Records with the BAD flag (`CTRL.BAD_MODE`): 2 = skipped (pktrec-replay default),
-  1 = sent error-terminated (TX `tuser[0]`: the PCS sends /V/ in place of the FCS, the
-  receiver counts an RX error; `--keep-bad`), 0 = sent as good frames with a valid FCS
-  (`--bad-as-good`). The original FCS value cannot be reproduced (the MAC strips it on
-  receive), see "Bad frames" in the TAP section.
-* Frames longer than the MAC's `TX_MAX_LEN` (1518 incl. FCS by default) are cut by the MAC.
-
-### Ports, directions and TAP mode
-
-One capture interface (port Pn: the frames received on Pn) is replayed out of one port at
-a time; the replay block has one scheduler. A TAP-mode capture has two interfaces per pair
-(P0 = received on P0 = the direction P0 -> P1, P1 = the other direction): replay one
-direction per run. Replaying both directions of a pair at the same time is not
-implemented (it would need a second scheduler and a merged, time-ordered record stream).
-
-The output port is put into **path mode 4 REPLAY** (`PATH_RPL` bit n, map 1.3), which
-overrides PATH_CTRL. **Replay and TAP forwarding on the same pair are mutually
-exclusive**: pktrec-replay refuses a port whose pair is in TAP mode (or whose partner
-forwards), `pktrec-phy path n replay` refuses likewise, and `pktrec-phy mode p tap` /
-`path m fwd` are refused while a port of the pair is in replay. The other pair is not
-affected (it may forward or capture).
-
-### Replay and capture at the same time
-
-The recorder's DMA path has one user at a time (`/dev/fdrec0` opens once, one direction
-per session, and terminating either AXI DMA channel resets the whole AXI DMA). A replay
-streamed from the SSD therefore cannot run while `pktrec-cap` records. For the timing
-test (replay out of P2, capture on P3) pktrec-replay `--preload` loads up to 128 KB /
-2048 frames into the replay store, stops the DMA and closes the device; `pktrec-cap` then
-records while the store is played out (`--wait-capture` starts the replay once the
-capture runs). A capture's START (recorder soft reset) does not touch the replay store.
-
-### Registers (pktrec_replay, 0x4_2004_0000, map 1.0)
-
-| Offset | Name | Description |
-|--------|------|-------------|
-| `0x000` | ID | `0x504B5250` "PKRP" |
+| `0x000` | ID | `0x504B5250` ("PKRP") |
 | `0x004` | VERSION | `0x00010000` |
 | `0x008` | CTRL | [0] SEL, [2:1] MODE (0 timed, 1 back-to-back, 2 fixed), [5:4] BAD_MODE, [6] FILTER_EN, [9:8] FILTER_PORT, [13:12] TX_PORT |
 | `0x00C` | CMD | write 1: [0] ARM, [1] GO, [2] STOP, [3] ABORT |
@@ -832,41 +458,50 @@ capture runs). A capture's START (recorder soft reset) does not touch the replay
 | `0x018` | START_DELAY | ns from GO to T0 (1 ms) |
 | `0x01C` | LATE_THRESH | ns (100) |
 | `0x020` | GAP_NS | FIXED mode interval (672) |
-| `0x024/0x028` | EXPECT | records that will be streamed (0 = unknown: end with STOP) |
+| `0x024` / `0x028` | EXPECT | records that will be streamed (0 = unknown: end with STOP) |
 | `0x02C` | STORE_LEVEL | [15:0] data beats, [31:16] frames |
 | `0x030` / `0x034` | STORE_BEATS / MAX_CAP | 8192 (128 KB) / 16384 |
-| `0x038` / `0x040` / `0x048` | T0 / TS_FIRST / LAST_TARGET | 64-bit |
+| `0x038` / `0x040` / `0x048` | T0 / TS_FIRST / LAST_TARGET | 64 bit |
 | `0x050` / `0x054` | MAX_LATE / LAST_LATE | ns |
-| `0x080..0x0E4` | counters (64-bit, LO latches HI) | RECORDS, FRAMES, BYTES, PARSE_ERRORS, FILL, SKIPPED, UNDERRUNS, LATE, LATE_SUM, BEATS_IN, DISCARD, BAD_SENT, RECORDS_DONE |
+| `0x080`..`0x0E4` | counters (64 bit) | RECORDS, FRAMES, BYTES, PARSE_ERRORS, FILL, SKIPPED, UNDERRUNS, LATE, LATE_SUM, BEATS_IN, DISCARD, BAD_SENT, RECORDS_DONE |
 
-Run control: ARM (from idle/done: clears counters, the parser fills the store) -> GO
-(T0 latched, releases start) -> DONE when EXPECT records have been processed, or after
-STOP once the input has been idle for 256 cycles and everything is sent. ABORT completes
-the frame on the wire, drops everything buffered and returns to idle. While SEL = 1 and
-the block is not armed/running, input is accepted and discarded (`DISCARD`), so the DMA
-can always drain.
+The capture block exports its timebase (`tb_now`, `tb_inc_ns`) to the replay block.
 
-`pktrec_m0_path` map **1.3** (`VERSION` = `0x00010003`): `0x020` PATH_RPL ([n] = port n in
-replay), `EFF_PATH` [8+n] = port n sends replay frames now. `pktrec_capture` exports its
-timebase (`tb_now`, `tb_inc_ns`) to the replay block; its register map is unchanged.
+### Recorder: `fdrec_core` (`0x04_2001_0000`, map 1.2)
 
-### Verification (M6)
+The register map of the FPGA Drive Recorder (`include/fdrec_regs.h`, documented on the
+recorder's [register map page](https://recorder.fpgadrive.com/en/latest/register_map.html)),
+plus `PKT_SRC` (0x050), which reads back the packetizer source selected by the capture
+block's `CTRL.SRC_SEL`.
 
-`tb_pktrec_replay` drives the record stream at src_clk (random stalls, pauses) through
-`pktrec_replay_top` and the real `pktrec_m0_path` into Taxi 1000BASE-X TX MACs and far-end
-receivers (`taxi_axis_basex_tx_16` / `_rx_16`), with a timebase model:
+## Verification
 
-* TIMED 1x, 150 frames of 60..1514 bytes, port-3 records mixed in (filtered), fill units,
-  one corrupted unit (`PARSE_ERRORS` = 1, resynchronised), bad frames sent errored: every
-  frame complete and in order; **release - target 0..3 ns (mean 1.5)**; wire start
-  intervals vs the schedule max 15 ns (one MAC clock); all counters exact; DONE.
-* Rate 0.5x and 2x: release max 2-3 ns late, wire max 10-11 ns.
-* Back to back, 600 x 64-byte frames: every start exactly 672 ns apart (line rate).
-* Fixed gap 2500 ns (on P1): exact.
-* Underrun: source paused 150 us mid-stream: `UNDERRUNS` and LATE counted and flagged,
-  frames still complete; back to back with EXPECT and a pause: `UNDERRUNS` > 0.
-* ABORT while a 1514-byte frame is on the wire: that frame completes, nothing after it,
-  store empty, the rest of the stream discarded; STOP-terminated run: DONE.
-* SEL = 0: the stream reaches the fdrec_check port unchanged.
+The custom RTL has self-checking testbenches in `Vivado/src/sim/` (run with
+`Vivado/scripts/sim.tcl`, see [Testing](testing.md#rtl-testbenches)):
 
-`tb_pktrec_m0_path` and `tb_pktrec_tap` pass with the replay input idle (VERSION 1.3).
+| Testbench | Checks |
+|-----------|--------|
+| `tb_pktrec_m0_path` | IDLE/LOOP/FWD paths, whole-frame drops and counters |
+| `tb_pktrec_gen` | generator frames byte for byte against a `gen_seq.py` model, line-rate and IFG spacing, random lengths, count, stop; checker loss, duplicate and bad counts |
+| `tb_pktrec_tap` | real Taxi 1000BASE-X MAC/PCS on both sides of a pair at 100 % utilisation: bad-frame propagation (130 of 400 frames flagged bad exactly), the dynamic gap's hysteresis, clock mismatch (source +4 % fast: 9000 of 9000 frames with the dynamic gap, 75 dropped and counted without it), 12 mode switches mid-traffic with no corrupted, truncated or reordered frame; simulated forwarding latency 8 ns × frame length + 223 ns |
+| `tb_pktrec_cap_port` | headers, data and padding of every record, snap length, whole-frame drops under back-pressure with exact counters and sequence gaps, port enable, minimum-size frames at line rate, timestamp conversion across the cycle counter wrap |
+| `tb_pktrec_cap_merge` | whole records only, per-port order, round-robin fairness, fill, soft-reset cut |
+| `tb_pktrec_timebase` | increment, set, adjust, rate change, the delay window of the cycle-count copies at +125 / −250 ppm |
+| `tb_pktrec_sfd` | the real ISERDESE3/MMCME4 models: resolution over 8 pins × 150 random-phase edges (error within (−1, 0] ns; IDDR within 2 ns), queue overflow, glitch filter, transmit pairing with missing and extra completions, logs and offsets |
+| `tb_pktrec_sfd_match` | matching with exact timestamps, missing and extra pulses, entries too young or too old, dropped and disabled frames consuming their entries, `MATCH_EN` = 0, a 1-beat runt, queue overflow |
+| `tb_pktrec_capture` | the four ports, the merge, the registers and `fdrec_core` in capture mode with a DMA model, following the start and stop protocol; recorded stream checked frame by frame; records cut by a recorder soft reset; SFD pulses through the whole block (timestamp differences equal to the pin time differences within 1 ns) |
+| `tb_pktrec_replay` | record stream with random stalls through the replay block, the real `pktrec_m0_path` and Taxi MACs: timed 1x (release − target 0..3 ns, wire within 15 ns of the schedule), 0.5x and 2x, back to back (exactly 672 ns at 64 bytes), fixed gap, underruns, a corrupted unit (resynchronised), ABORT and STOP, pass-through with SEL = 0 |
+| `tb_fdrec_*` | the recorder datapath (from the FPGA Drive Recorder) |
+
+## Origin of the sources
+
+* The recorder datapath (`Vivado/src/hdl/fdrec_*.v`), its testbenches, `include/fdrec_*.h`,
+  the `fdrec` kernel driver (`sw/fdrec-driver`), the recorder apps (`sw/fdrec-apps`) and the
+  `Yocto/meta-fdrec` layer come from the
+  [FPGA Drive Recorder](https://github.com/fpgadeveloper/fpga-drive-recorder) and keep their
+  `fdrec` names.
+* The PCIe root-port configuration for the FPGA Drive FMC Gen4 on the ZCU106 HPC1 connector
+  follows [fpga-drive-aximm-pcie](https://github.com/fpgadeveloper/fpga-drive-aximm-pcie)
+  (`zcu106_hpc1`).
+* The Ethernet MAC, PCS, transceiver wrapper, MDIO master and AXI-Stream FIFOs are from
+  [Taxi](https://github.com/fpganinja/taxi) (git submodule, CERN-OHL-S-2.0).

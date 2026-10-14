@@ -1,25 +1,85 @@
 # Software
 
-The capture software runs on the board's Linux image. Its main parts are:
+The software runs on the board's Linux image. All commands that touch the hardware need
+root (`sudo`): they use the recorder device, the register maps of the capture blocks and
+2 MB hugepages.
 
-* **`pktrec-cap`** controls the capture hardware and records its record stream to the NVMe
-  SSD.
-* **`pktrec-export`** converts a capture file to pcapng for Wireshark.
-* **`pktrec-tb`** keeps the hardware timebase on the system clock (NTP) and applies the
-  persistent calibration at boot. See [Timebase discipline](#timebase-discipline-pktrec-tb)
-  and [Calibration](#calibration).
+| Program | Language, source | What it does |
+|---------|------------------|--------------|
+| `pktrec-phy` | Python, `sw/pktrec-tools` | PHY configuration, link status, port modes and paths, SFD timestamping, generator and checker, forwarding latency, link watcher |
+| `pktrec-cap` | C, `sw/pktrec-apps` | configures the capture, records it to the SSD, statistics |
+| `pktrec-export` | C, `sw/pktrec-apps` | converts a capture file to pcapng (streaming) |
+| `pktrec-replay` | C, `sw/pktrec-apps` | replays one interface of a capture out of a port |
+| `pktrec-tb` | Python, `sw/pktrec-tools` | timebase discipline and calibration |
+| `pktrec-web` | Python, `sw/pktrec-web` | web interface and JSON API ([Web interface](web_ui)) |
+| `fdrec`, `fdplay`, `fdverify`, `fdsetup-raid0.sh`, `fdbench.sh` | `sw/fdrec-apps` | the FPGA Drive Recorder's tools: raw recording and playback with the test pattern generator, SSD formatting, SSD benchmark |
+| `pktrec-pktgen`, `pktrec-check-pcap`, `pktrec-pcapng-lint` | `test/` | test traffic and checkers ([Testing](testing)) |
 
-Both are C programs in `sw/pktrec-apps`. The recipe `Yocto/meta-pktrec/recipes-apps/pktrec-apps`
-installs them in the image. They reuse the FPGA Drive Recorder's kernel driver (`fdrec.ko`,
-`/dev/fdrec0`) and its zero-copy recording loop:
+The C programs reuse the FPGA Drive Recorder's kernel driver (`fdrec.ko`, `/dev/fdrec0`) and
+its zero-copy loop: the AXI DMA fills buffers in hugepage memory, io_uring writes the same
+buffers to the file with `O_DIRECT` (or reads them, for replay), and the CPU only does the
+bookkeeping. Only one program can use the recorder at a time.
 
-* the AXI DMA fills buffers in hugepage memory,
-* io_uring writes the same buffers to the file with `O_DIRECT`,
-* the CPU only does the bookkeeping.
+## Services
 
-The test tools are described in [Testing](#testing) below and in `test/README.md`.
+| Unit | Started | What it does |
+|------|---------|--------------|
+| `pktrec-phy-watch.service` | at boot | `pktrec-phy init --1000-only`, then `pktrec-phy watch` (SGMII re-trigger on link changes, TAP link-state propagation) |
+| `mnt-rec.mount` | at boot | mounts `/dev/nvme0n1` (XFS) at `/mnt/rec`; gives up after 20 s without blocking the boot |
+| `pktrec-calibration.service` | at boot, once | `pktrec-tb apply-calibration`: writes `/etc/pktrec/calibration.conf` into the registers |
+| `pktrec-tb.service` | at boot | `pktrec-tb daemon`: disciplines the timebase to the system clock |
+| `pktrec-web.service` | at boot | the web server on `end0` port 8080 |
+| `pktrec-banner.service` | at boot, once | prints the web interface URL on the console once the board has an address |
 
-## Capturing: pktrec-cap
+Logs: `journalctl -u <unit>`.
+
+## pktrec-phy
+
+`pktrec-phy` maps the Ethernet port, path and capture register blocks (`generic-uio`) and
+drives the PHYs over the fabric MDIO master. Every MDIO access holds a lock
+(`/run/lock/pktrec-mdio`), so the watcher service and command-line calls never interleave.
+Most commands accept `--json`.
+
+| Command | What it does |
+|---------|--------------|
+| `pktrec-phy init [--1000-only] [--reset] [--no-sfd]` | configures the four PHYs (below); the boot service runs it with `--1000-only` |
+| `pktrec-phy status` | per port: copper link, speed, duplex, SGMII/PCS state, SFD pin levels; pair modes |
+| `pktrec-phy mode <0\|1> tap\|monitor [--force]` | sets a pair's mode ([Port modes](modes)); refused during a capture unless `--force` |
+| `pktrec-phy mode status` | mode, path and effective path per pair |
+| `pktrec-phy path <port\|all> idle\|loop\|fwd\|gen\|replay` | selects what a port transmits: nothing, its own received frames, its partner's (TAP), the generator, or the replay block |
+| `pktrec-phy counters [--clear]` | per-port frame counters of the MACs and the forward path (RX good/bad, TX good, underflow, drops, SFD pin edges) |
+| `pktrec-phy sfd status [--clear]` | SFD timestamping counters per port: edges, matches, stale entries, mismatches, MAC−SFD deltas, transmit latency |
+| `pktrec-phy sfd config [--rx-win MIN MAX] [--tx-win MIN MAX] [--rx-offset P NS] [--tx-offset P NS] [--match on\|off] [--log on\|off] ...` | SFD windows, offsets, matching and logging ([Timestamping](timestamping)) |
+| `pktrec-phy sfd log <port> [--dir rx\|tx]` | reads the port's SFD log FIFO (last 16 timestamps) |
+| `pktrec-phy gen <port> start [--size B] [--count N] [--ifg B \| --rate PPS] [--rand-mask M] [--bad] ...` | starts the port's hardware traffic generator (`--size` includes the FCS; sizes that can exceed the MAC's 1518-byte limit are refused unless `--force`) |
+| `pktrec-phy gen <port> stop\|status` | stops it / shows its counters |
+| `pktrec-phy chk <port> start\|stop\|status` | receive checker for generator traffic: frames, lost, duplicates or reordered, bad |
+| `pktrec-phy ifg <port\|all> [...]` | dynamic inter-frame gap settings and counters of the TAP forward path, forward FIFO fill, flushed frames |
+| `pktrec-phy latency --pair P [--count N]` | TAP forwarding latency per direction from the SFD logs (needs paced traffic: one frame in flight) |
+| `pktrec-phy watch [--no-propagate] [--debounce S] [--grace S]` | the link watcher (normally run by the service) |
+| `pktrec-phy mdio <phy> <reg> [val]` | raw PHY register access (`p0`..`p3` or the MDIO address; registers above 0x1F through the extended-register window) |
+
+`pktrec-phy init` configures each DP83867 (MDIO addresses 0x01, 0x03, 0x0C, 0x0F for P0..P3):
+
+* mirror mode on (needed on Rev-A Ethernet FMC Max cards, harmless on later ones),
+* SGMII with SGMII auto-negotiation,
+* with `--1000-only`: advertise 1000BASE-T full duplex only,
+* SFD indications on GPIO_0 (receive) and GPIO_1 (transmit): `GPIO_MUX_CTRL` (0x0172) =
+  0x0012, `RXFCFG` (0x0134) = 0x1080, `SYNC_FIFO_CTRL` (0x00E9) = 0xDF22,
+* a soft restart.
+
+The DP83867 sends its SGMII status word to the MAC only once after a restart; the watcher
+re-triggers it on every copper link change, otherwise the MAC's view of the link goes stale.
+To use other advertisement settings, stop the service (`systemctl stop pktrec-phy-watch`) and
+run `pktrec-phy init` by hand.
+
+```{note}
+On the Ethernet FMC Max, the DP83867 of P0 supplies the clock of the other three PHYs.
+`pktrec-phy` therefore refuses any MDIO write that would power down P0's PHY or change its
+clock output, including through `pktrec-phy mdio`.
+```
+
+## pktrec-cap
 
 ```
 pktrec-cap [record] [options] <output-file>
@@ -78,7 +138,7 @@ With `--stats-json`, the same information comes as JSON lines (the web UI uses t
 
 At the start, `pktrec-cap` prints the timebase state, for example
 `timebase disciplined by pktrec-tb (locked), offset +1.204 us vs CLOCK_REALTIME, trim +10.412 ppm`,
-and records it in the file header (see [Capture file format](#capture-file-format)).
+and records it in the file header (see [File formats](capture_format.md#capture-file-header)).
 
 | Exit code | Meaning |
 |-----------|---------|
@@ -136,7 +196,7 @@ while a capture runs. `--json` prints the same fields as one JSON object per lin
 `pktrec-cap info <file>` prints the file header. `--records <n>` also lists the first record
 headers.
 
-## Converting: pktrec-export
+## pktrec-export
 
 ```
 pktrec-export [options] <capture-file|-> [-o <out.pcapng|->]
@@ -176,92 +236,99 @@ At the end it prints a summary to stderr:
 | 2 | Written, but with anomalies: corrupt stretches skipped, records later than the reorder window, a truncated tail, or recorder data loss recorded in the header. |
 | 1 | Error. |
 
-### Timestamp order and the reorder window
+The reorder window, the header checks and resynchronisation, and the pcapng mapping are
+described in [File formats](capture_format.md#pcapng-mapping).
 
-The hardware merges the records of the four ports round robin, as whole records, in the
-order the frames complete. The stream is therefore not in timestamp order. For example,
-a 64-byte frame on P0 that started after a 1518-byte frame on P1 is recorded first.
+## pktrec-replay
 
-The exporter restores the order with a min-heap on the timestamp. A record is written once
-the window holds more than `--window-records` records or `--window-bytes` bytes. At the
-end of the file, the window is flushed in order.
+`pktrec-replay` (C, `sw/pktrec-apps`) plays the frames one interface received in a
+capture file back out of a port, with the original timing, scaled, at a fixed interval
+or back to back. The timing is done by the replay block in the FPGA (see [Replay](replay) and
+[Architecture](design)); the program selects the records, streams them through the recorder's
+playback path (io_uring `O_DIRECT` reads of the file, hugepage ring, AXI DMA MM2S, the
+fdrec driver's `PLAY_*` ioctls like `fdplay`) and reports.
 
-**How far out of order the stream can be.** A record leaves its port at most one per-port
-FIFO's worth of data (16 KB at 1 Gb/s, about 131 µs) after its frame ended, plus the
-recorder's back-pressure time. With four ports, at most 4 × 16 KB = 64 KB of records can
-overtake a frame. For minimum-size frames that is about 820 records (80 bytes each).
+```
+pktrec-replay <capture.cap> --iface P<n> --port <m>
+              [--rate X | --topspeed | --gap NS] [--loop N] [--start-delay MS]
+              [--keep-bad | --bad-as-good] [--late-thresh NS]
+              [--preload [--wait-capture S]] [--force] [--keep-path]
+              [--buffers N] [--buf-size B] [--device D] [--devmem] [--json] [-q] [--dry-run]
+```
 
-**Defaults.** The defaults, 65536 records and 4 MB, are 64 times that bound. A deeper FIFO
-in a later design does not need a new option. The memory cost is the bytes held plus about
-48 bytes per held record.
-
-**If the window is too small.** A record older than the last one written can no longer be
-put in order. It is still written, the summary counts it, and the exit code is 2. The
-summary also reports the largest reorder distance seen; use it to size the window.
-
-### Corruption and resynchronisation
-
-Every record header is checked against the rules in `include/pktrec_format.h`:
-
-* the marker nibble is `0xA`,
-* the port is captured,
-* `cap_len` ≥ 1,
-* `cap_len + 4` ≤ `orig_len`, `cap_len + 4` ≤ `--max-frame` (and `orig_len` ≤ `--max-frame` unless truncated),
-* the truncated flag is set exactly when `cap_len + 4 < orig_len`,
-* `cap_len` ≤ snaplen.
-
-If a header fails these checks, the exporter scans forward in 16-byte steps. It accepts a
-header that passes the checks, whose timestamp is not more than 1 s older than the newest
-timestamp seen, and which either continues its port's sequence number or is followed by
-another valid header (or by fill, or by the end of the data).
-
-The skipped bytes and resyncs are counted and reported. Sequence gaps across a resync are
-reported as lost in a corrupt stretch, not as hardware drops.
-
-All-zero 16-byte units are fill and are skipped silently.
-
-### pcapng mapping
-
-| pcapng | Content |
+| Option | Meaning |
 |--------|---------|
-| SHB | `shb_hardware`: design, target, capture block and recorder versions. `shb_os`: the exporter's OS. `shb_userappl`: `pktrec-export <version>`. `opt_comment`: host, pair modes, ports, snaplen, start time, and how timestamps were produced. |
-| IDB, one per captured port | `LINKTYPE_ETHERNET`. `snaplen`: the capture's snaplen, or 65535. `if_name`: `P0`..`P3`. `if_description`: port, mode and direction (inbound). `if_tsresol` = 9 (nanoseconds). `if_fcslen` = 0. `if_speed`: link speed at start. |
-| EPB, one per frame, in timestamp order | 64-bit nanosecond timestamp split high/low. `caplen` = the stored bytes. `len` = `orig_len`. `epb_flags`: see below. `epb_dropcount`: frames the port dropped since the previous captured frame. |
-| ISB, one per interface, at the end | `isb_starttime` / `isb_endtime` (capture start and stop). `isb_ifrecv` = frames that started on the port while it was enabled (`FRAMES_RX`, including bad and dropped frames). `isb_ifdrop` = frames the hardware dropped (`FRAMES_DROP`). `isb_filteraccept` = records written for the port. `isb_usrdeliv` = packets in this file. |
+| `--iface P<n>` | capture interface to replay: the frames received on port Pn |
+| `--port <m>` | output port 0..3; put into path mode 4 REPLAY for the run and restored afterwards (`--keep-path` leaves it) |
+| (default) | original timing: frame i leaves `ts_i - ts_first` after the first |
+| `--rate X` | intervals divided by X (2 = twice as fast, 0.5 = half speed; 1/65536..65536) |
+| `--topspeed` | back to back at line rate, timestamps ignored |
+| `--gap NS` | fixed start-to-start interval, timestamps ignored |
+| `--loop N` | play the selection N times; the timestamps continue (one mean interval between the last frame and the next loop) |
+| `--start-delay MS` | first frame this long after the start (default 10 ms) |
+| `--keep-bad` / `--bad-as-good` | frames captured with an error: sent errored (the receiver counts an RX error) / sent with a valid FCS. Default: skipped |
+| `--late-thresh NS` | lateness above which a frame counts as LATE (default 100 ns) |
+| `--preload` | load the frames into the replay store (128 KB / 2048 frames; the rest is ignored with a note), release the recorder, then play: a capture can run during the replay |
+| `--wait-capture S` | with `--preload`: start once `pktrec-cap` has started a capture (at most S seconds) |
+| `--force` | replay although the pair is in TAP mode, the port has no link, or the replay block is busy (aborts it) |
+| `--dry-run` | only read the file: records selected, bytes, time span |
+| `--json` | one JSON summary object on stdout |
 
-**`len` includes the FCS.** pcapng defines `len` as the original packet length on the
-wire, and the record's `orig_len` includes the 4-byte FCS. The FCS itself is never stored
-(`if_fcslen` = 0), so an untruncated frame has `caplen` = `len` − 4. Wireshark shows, for
-example, "64 bytes on wire, 60 bytes captured" for a minimum-size frame. This is expected
-and is not a truncation.
+Only capture files (`pktrec-cap`) can be replayed, not pcapng: the record headers carry
+the hardware timestamps, port and flags, and the exporter direction is one-way.
 
-**`epb_flags`** has these fields:
+**Interfaces and TAP captures.** Each record belongs to the port that received it. In
+monitor mode Pn is the traffic seen on port n; in a TAP-mode capture P0 is the direction
+P0 -> P1 and P1 the direction P1 -> P0. One interface is replayed out of one port per run;
+to replay both directions of a TAP capture, run pktrec-replay twice (one direction each);
+replaying both at the same time is not implemented.
 
-* **Direction:** always inbound. A frame is always "received on port n". In TAP mode the
-  partner port's TX carries the same frame, so one interface per port is enough.
-* **Reception type:** broadcast or multicast from the destination MAC; otherwise
-  promiscuous (the capture ports have no address).
-* **Bit 24, CRC error:** set for records with the bad-frame flag. The MAC flags FCS
-  errors, framing or symbol errors, and oversize frames this way; they are all reported
-  through this bit.
+**Mutual exclusion with TAP mode.** pktrec-replay refuses an output port whose pair is
+in TAP mode or whose partner forwards (`pktrec-phy mode <pair> monitor` first, or
+`--force`). While a port is in replay, `pktrec-phy mode <pair> tap` and `pktrec-phy path
+<partner> fwd` are refused (`mode ... tap --force` takes the port out of replay).
+`pktrec-phy path <m> replay` selects the path by hand.
 
-**Timestamps.**
+**Sequence.** Checks (replay block present and idle, m0 map >= 1.3, TAP, link) ->
+`/run/pktrec/tb-hold.<pid>` (the timebase daemon does not step the timebase while the
+file exists; removed on exit) -> output port into REPLAY -> CTRL (SEL, mode, bad-frame
+policy, port filter, TX port), RATE_INV, START_DELAY -> ARM -> `PLAY_START` (without the
+checker: no recorder soft reset) -> the selected records are copied into the ring and
+submitted; once the ring is full the store has primed -> GO -> streaming continues while
+the hardware sends -> STOP after the last buffer -> wait for DONE -> counters ->
+`PLAY_STOP`, SEL = 0, path restored, hold file removed. Ctrl-C aborts cleanly (ABORT: the
+frame on the wire is completed).
 
-* When `pktrec-cap` set the timebase from `CLOCK_REALTIME` (the default), the timestamps
-  are UTC.
-* Otherwise, the exporter adds (start wall-clock time − timebase at start) to each
-  timestamp.
-* `--raw-ts` writes the timebase values unchanged.
+**Output.** A progress line (frames sent, frames in the store, underruns, late, max
+lateness) and the summary: frames and bytes sent, errored frames sent, skipped, underruns,
+lateness (max, mean, count above the threshold), parse errors, duration.
+Exit code 0 = every selected frame sent, no underrun, no parse error; 2 = completed with
+underruns, parse errors or frames missing; 1 = error.
 
-In M1, timestamps are taken by the MAC at the start of frame delimiter. They have a 16 ns
-quantisation plus a fixed, uncalibrated PHY/PCS latency. M2 adds PHY SFD timestamps.
+**Replay and capture at the same time.** The recorder serves one direction at a time,
+so a streamed replay cannot run while `pktrec-cap` records. Use `--preload`:
 
-## Timebase discipline: pktrec-tb
+```
+pktrec-replay /mnt/rec/captures/p3.cap --iface P3 --port 2 --preload --wait-capture 30 &
+pktrec-cap record --ports 3 --duration 5 /mnt/rec/captures/replayed.cap
+wait
+pktrec-export /mnt/rec/captures/p3.cap -o p3.pcapng
+pktrec-export /mnt/rec/captures/replayed.cap -o replayed.pcapng
+python3 test/compare_replay.py p3.pcapng --orig-iface P3 replayed.pcapng --replay-iface P3
+```
+
+`test/compare_replay.py` pairs the frames by their bytes and reports lost, extra and
+reordered frames and the inter-frame interval error (mean, standard deviation, max) of
+the replay against the original (`--rate X` for a scaled replay, `--topspeed` for a
+back-to-back one). Expected accuracy: within about +-16 ns per interval (MAC clock) plus
+the receiving side's timestamp spread.
+
+## pktrec-tb
 
 All timestamps come from one 64-bit nanosecond timebase in the capture block. It runs
 on `dp_clk` (249.975 MHz) and adds `INC` (32.32 fixed point, about 4.0004 ns) on every
 cycle. `dp_clk` comes from the PS PLL, so the timebase is only as accurate as the board's
-crystal. The M1 bench board ran about 10.4 ppm slow: 0.9 s per day.
+crystal (the measured board's ran 10 to 12 ppm slow, about 1 s per day).
 
 `pktrec-tb` (Python, `sw/pktrec-tools`, recipe `Yocto/meta-pktrec/recipes-apps/pktrec-tb`)
 keeps the timebase on `CLOCK_REALTIME`. `systemd-timesyncd` keeps that on NTP through the
@@ -348,26 +415,15 @@ timestamps stay monotonic.
 journal: the start-up, every `TB_SET`, lock changes, and a summary once a minute
 (`journalctl -u pktrec-tb`).
 
-**Accuracy.**
+**Accuracy.** The measured tracking and absolute accuracy are in
+[Timestamping](timestamping.md#timebase-and-absolute-time). In short: the timebase follows
+`CLOCK_REALTIME` within a few hundred ns once locked, and absolute time is only as good as
+the system clock's NTP synchronisation. Relative timing (between frames and between ports)
+does not depend on any of this. When the daemon stops, `INC` keeps its last trim, so the
+timebase free-runs at the learned frequency (holdover). A Linux PTP hardware clock
+(`/dev/ptpN`) driver is not provided.
 
-* **Timebase vs `CLOCK_REALTIME`.** A few µs, set by the userspace measurement jitter.
-  The lock criterion is 10 µs.
-* **Frequency after lock.** The averaged frequency (the integrator) settles within about
-  0.1 ppm of the system clock's. The applied `INC` moves around it by kp × the read jitter
-  per second: 0.2 ppm for 1 µs of jitter. In the simulation with 1 µs rms jitter it stays
-  within ±0.3 ppm. The bench criterion is < 1 ppm of drift.
-* **Absolute time.** Bounded by NTP. `systemd-timesyncd` (SNTP) on a LAN keeps
-  `CLOCK_REALTIME` within roughly 1 ms of UTC; through the internet it is a few ms. The
-  disciplined timestamps are absolute to that accuracy.
-* **Relative timing** (between frames and between ports) does not depend on any of this.
-  It stays at the SFD timestamping resolution (about 1 ns).
-* **Holdover.** When the daemon stops, `INC` keeps its last trim, so the timebase
-  free-runs at the learned frequency.
-
-A Linux PTP hardware clock (`/dev/ptpN`) driver is not provided (Should #12 "plus",
-deferred).
-
-## Calibration
+## Calibration file
 
 The capture block's calibration registers reset on every bitstream load. Their values are
 kept in **`/etc/pktrec/calibration.conf`**, an INI file. `pktrec-calibration.service`
@@ -398,8 +454,8 @@ port.
 * **Package updates.** The file is a `CONFFILE`, so an image or package update never
   overwrites a tuned file.
 
-To persist a calibration that the bench measured (the procedure in `design.md`, "SFD
-timestamping (M2)"):
+To persist a calibration that you measured (the procedure is in
+[Timestamping](timestamping.md#calibration-procedure)):
 
 1. Set the registers, for example with
    `pktrec-phy sfd config --rx-win … --rx-offset 3 … --tx-offset …`, a write of
@@ -410,166 +466,14 @@ timestamping (M2)"):
    previous one as `.bak`. When the daemon is locked, it saves the daemon's frequency
    estimate rather than the momentary `INC`.
 
-`save-calibration --defaults --stdout` prints the design defaults. The shipped file is
-exactly that.
+`save-calibration --defaults --stdout` prints the design defaults (the register reset
+values). The shipped file holds the values measured on a ZCU106 with an Ethernet FMC Max
+Rev-B instead (see [Timestamping](timestamping.md#calibration)).
 
 Calibrate again after every bitstream change. The SFD sampler's clock phase can move
 between builds.
 
-## Replaying: pktrec-replay
+## pktrec-web
 
-`pktrec-replay` (C, `sw/pktrec-apps`) plays the frames one interface received in a
-capture file back out of a port, with the original timing, scaled, at a fixed interval
-or back to back. The timing is done by the replay block in the FPGA (see "Replay (M6)" in
-the design notes); the program selects the records, streams them through the recorder's
-playback path (io_uring `O_DIRECT` reads of the file, hugepage ring, AXI DMA MM2S, the
-fdrec driver's `PLAY_*` ioctls like `fdplay`) and reports.
+The web server and its JSON API are described in [Web interface](web_ui).
 
-```
-pktrec-replay <capture.cap> --iface P<n> --port <m>
-              [--rate X | --topspeed | --gap NS] [--loop N] [--start-delay MS]
-              [--keep-bad | --bad-as-good] [--late-thresh NS]
-              [--preload [--wait-capture S]] [--force] [--keep-path]
-              [--buffers N] [--buf-size B] [--device D] [--devmem] [--json] [-q] [--dry-run]
-```
-
-| Option | Meaning |
-|--------|---------|
-| `--iface P<n>` | capture interface to replay: the frames received on port Pn |
-| `--port <m>` | output port 0..3; put into path mode 4 REPLAY for the run and restored afterwards (`--keep-path` leaves it) |
-| (default) | original timing: frame i leaves `ts_i - ts_first` after the first |
-| `--rate X` | intervals divided by X (2 = twice as fast, 0.5 = half speed; 1/65536..65536) |
-| `--topspeed` | back to back at line rate, timestamps ignored |
-| `--gap NS` | fixed start-to-start interval, timestamps ignored |
-| `--loop N` | play the selection N times; the timestamps continue (one mean interval between the last frame and the next loop) |
-| `--start-delay MS` | first frame this long after the start (default 10 ms) |
-| `--keep-bad` / `--bad-as-good` | frames captured with an error: sent errored (the receiver counts an RX error) / sent with a valid FCS. Default: skipped |
-| `--late-thresh NS` | lateness above which a frame counts as LATE (default 100 ns) |
-| `--preload` | load the frames into the replay store (128 KB / 2048 frames; the rest is ignored with a note), release the recorder, then play: a capture can run during the replay |
-| `--wait-capture S` | with `--preload`: start once `pktrec-cap` has started a capture (at most S seconds) |
-| `--force` | replay although the pair is in TAP mode, the port has no link, or the replay block is busy (aborts it) |
-| `--dry-run` | only read the file: records selected, bytes, time span |
-| `--json` | one JSON summary object on stdout |
-
-Only capture files (`pktrec-cap`) can be replayed, not pcapng: the record headers carry
-the hardware timestamps, port and flags, and the exporter direction is one-way.
-
-**Interfaces and TAP captures.** Each record belongs to the port that received it. In
-monitor mode Pn is the traffic seen on port n; in a TAP-mode capture P0 is the direction
-P0 -> P1 and P1 the direction P1 -> P0. One interface is replayed out of one port per run;
-to replay both directions of a TAP capture, run pktrec-replay twice (one direction each);
-replaying both at the same time is not implemented.
-
-**Mutual exclusion with TAP mode.** pktrec-replay refuses an output port whose pair is
-in TAP mode or whose partner forwards (`pktrec-phy mode <pair> monitor` first, or
-`--force`). While a port is in replay, `pktrec-phy mode <pair> tap` and `pktrec-phy path
-<partner> fwd` are refused (`mode ... tap --force` takes the port out of replay).
-`pktrec-phy path <m> replay` selects the path by hand.
-
-**Sequence.** Checks (replay block present and idle, m0 map >= 1.3, TAP, link) ->
-`/run/pktrec/tb-hold.<pid>` (the timebase daemon does not step the timebase while the
-file exists; removed on exit) -> output port into REPLAY -> CTRL (SEL, mode, bad-frame
-policy, port filter, TX port), RATE_INV, START_DELAY -> ARM -> `PLAY_START` (without the
-checker: no recorder soft reset) -> the selected records are copied into the ring and
-submitted; once the ring is full the store has primed -> GO -> streaming continues while
-the hardware sends -> STOP after the last buffer -> wait for DONE -> counters ->
-`PLAY_STOP`, SEL = 0, path restored, hold file removed. Ctrl-C aborts cleanly (ABORT: the
-frame on the wire is completed).
-
-**Output.** A progress line (frames sent, frames in the store, underruns, late, max
-lateness) and the summary: frames and bytes sent, errored frames sent, skipped, underruns,
-lateness (max, mean, count above the threshold), parse errors, duration.
-Exit code 0 = every selected frame sent, no underrun, no parse error; 2 = completed with
-underruns, parse errors or frames missing; 1 = error.
-
-**Replay and capture at the same time.** The recorder serves one direction at a time,
-so a streamed replay cannot run while `pktrec-cap` records. Use `--preload`:
-
-```
-pktrec-replay /mnt/rec/captures/p3.cap --iface P3 --port 2 --preload --wait-capture 30 &
-pktrec-cap record --ports 3 --duration 5 /mnt/rec/captures/replayed.cap
-wait
-pktrec-export /mnt/rec/captures/p3.cap -o p3.pcapng
-pktrec-export /mnt/rec/captures/replayed.cap -o replayed.pcapng
-python3 test/compare_replay.py p3.pcapng --orig-iface P3 replayed.pcapng --replay-iface P3
-```
-
-`test/compare_replay.py` pairs the frames by their bytes and reports lost, extra and
-reordered frames and the inter-frame interval error (mean, standard deviation, max) of
-the replay against the original (`--rate X` for a scaled replay, `--topspeed` for a
-back-to-back one). Expected accuracy: within about +-16 ns per interval (MAC clock) plus
-the receiving side's timestamp spread.
-
-## Capture file format
-
-A capture file is a 4096-byte header followed by the record stream:
-
-* **Header** (`struct pktrec_file_header`, little-endian, in `include/pktrec_format.h`):
-  * magic `PKTRCAP`, header and record-format versions,
-  * pair modes, port mask, snaplen,
-  * start and stop time, both as `CLOCK_REALTIME` and as timebase values, and the timebase
-    increment,
-  * stream bytes and record count,
-  * recorder drop and DMA-error counts,
-  * target, host name and design string,
-  * per port: frames, bad frames, drops, bytes, truncated frames, records, link speed at
-    start, and the interface name,
-  * the timebase discipline at the start (`tb_disc_*`, taken from bytes that were reserved,
-    so the layout of the other fields is unchanged and older files read as "not
-    recorded"): flags (daemon running, locked, system clock NTP-synchronised, `TB_SET` done
-    by `pktrec-cap`), the timebase - `CLOCK_REALTIME` offset measured right before the
-    capture was enabled, the `INC` trim in ppb, and how long the daemon had been locked.
-    `pktrec-cap info` prints them as `tb discipline`.
-* **Header writes:** `pktrec-cap` writes the header at the start without the COMPLETE flag
-  and rewrites it at the stop.
-* **Interrupted captures:** a file without COMPLETE (power loss, crash) can still be
-  exported. The exporter reads to the end of the file and leaves the counters out of the
-  ISBs.
-
-Each **record** is:
-
-* a 16-byte header (`ts_ns`, `cap_len`, `orig_len`, `port`, `flags`, `seq`),
-* the frame bytes (FCS excluded),
-* padding to a multiple of 16 bytes.
-
-**Records and buffers.** Records follow each other with no regard to the recorder's
-buffer boundaries.
-
-**Sequence numbers.** Every frame that starts on an enabled port gets the next per-port
-sequence number, including frames the hardware then drops. A sequence gap is therefore
-exactly the number of frames the hardware dropped.
-
-## Testing
-
-**On a PC, without hardware**, `test/selftest_export.py` builds `pktrec-export` and runs it
-on synthetic capture files that `test/make_synth_capture.py` writes in the hardware's
-format. The capture files contain:
-
-* four ports,
-* out-of-order timestamps,
-* a bad-FCS frame,
-* a snaplen-truncated frame,
-* fill units.
-
-It checks the results with the stdlib validators:
-
-* the clean file exports with exit code 0, passes `pcapng_lint.py`, and `check_pcap.py`
-  finds every sequence number exactly once and in order;
-* a damaged file (a corrupted stretch plus a truncated tail) exports with exit code 2 and
-  one resync, and exactly the destroyed frames are missing;
-* hardware drops show up as `isb_ifdrop` = the sum of `epb_dropcount` = the missing frames;
-* a reorder window that is too small is detected.
-
-**On the board**, the M1 acceptance tests use sequence-numbered traffic:
-
-* `test/gen_seq.py` (Python, raw socket or a pcap for `tcpreplay`),
-* `test/board_pktgen.sh` (kernel pktgen; installed on the board as `pktrec-pktgen`).
-
-**`test/test_pktrec_tb.py`** (PC, no hardware) tests `pktrec-tb`: the controller in
-virtual time against a simulated timebase (start-up, lock, frequency estimate, no step
-during a capture, system-clock steps, an INC changed by someone else), the calibration file
-round trip and its validation, and every command end to end with `--sim`.
-
-`test/check_pcap.py` compares what was sent with what was captured. It reports loss,
-duplicates, reordering, intervals and the ISB drop counters. The procedure, including the
-zero-drop criterion, is in `test/README.md`.
