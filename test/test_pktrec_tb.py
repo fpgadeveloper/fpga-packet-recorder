@@ -6,7 +6,7 @@
   test/test_pktrec_tb.py [-v]
 
 1. Controller, in virtual time against a simulated timebase (SimHw): start-up
-   from timebase 0 with the M1 bench's -10.4 ppm oscillator and 1 us rms read
+   from timebase 0 with a -10.4 ppm oscillator (measured on a ZCU106) and 1 us rms read
    jitter -> locked, frequency estimate, residual drift; no TB_SET/TB_ADJ while
    a capture runs; a 2 s system-clock step (idle) -> one TB_SET and re-lock; a
    5 ms step during a capture -> slewed (<= 200 ppm), never stepped; an INC
@@ -263,7 +263,7 @@ def test_seeded(tb):
     check(ppb is not None and abs(ppb / 1e3 - 10.4) < 0.3, f"after 12 min: {(ppb or 0) / 1e3:+.3f} ppm ({why})")
     check(ppb is not None and "moved" in why and "limit 0.500 ppm" in why, f"movement printed on success ({why})")
     check(st["freq_est_window_s"] >= 590, f"history window {st['freq_est_window_s']} s")
-    # bench C (chrony): 0.561 ppm over 600 s -> refused; 0.45 ppm -> accepted
+    # measured with chrony: 0.561 ppm over 600 s -> refused; 0.45 ppm -> accepted
     st2 = dict(st, freq_est_max_ppb=st["freq_est_min_ppb"] + 561)
     ppb, why = tb.timebase_save_verdict(st2, clock.realtime_ns(), 600, 500)
     check(ppb is None and "not stable" in why and "moved 0.561 ppm" in why,

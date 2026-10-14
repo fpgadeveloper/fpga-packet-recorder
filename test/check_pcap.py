@@ -186,7 +186,7 @@ class Stream:
             self.bad_fcs += 1
         if self.maxseq is not None and abs(seq - self.maxseq) > WILD_JUMP:
             # a corrupted sequence number (typically a bad-FCS frame): tracking it
-            # would grow the bitmap to 2^60 bits (MemoryError, bench C M5 export)
+            # would grow the bitmap to 2^60 bits (MemoryError)
             self.wild += 1
             return
         if self.first is None:

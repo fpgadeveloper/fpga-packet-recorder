@@ -5,7 +5,7 @@
 SUMMARY = "FPGA Packet Recorder Ethernet port tools: pktrec-phy"
 DESCRIPTION = "pktrec-phy configures the four DP83867 PHYs of the Ethernet FMC \
 Max (OP080) through the fabric MDIO master (mirror mode, SGMII, 1588 SFD on \
-GPIO_0/1), shows PHY and SGMII link status, selects the M0 datapath \
+GPIO_0/1), shows PHY and SGMII link status, selects the port datapath \
 (idle/loopback/forward/generator) and reads its counters, drives the per-port \
 hardware traffic generator and checker, and reports the PHY SFD timestamping \
 (capture block). It maps the register blocks through generic-uio (or /dev/mem). \

@@ -515,8 +515,7 @@ class Backend:
     # ---- per-pair mode ----
     def set_mode(self, pair, mode):
         """tap = both ports of the pair forward to each other (path fwd),
-        monitor = both ports idle (receive only). M3 replaces this mapping by
-        pktrec-phy's own per-pair mode command; the API stays the same."""
+        monitor = both ports idle (receive only)."""
         with self.lock:
             if self.proc is not None:
                 raise ApiError(409, "a capture is running; stop it before changing the mode")

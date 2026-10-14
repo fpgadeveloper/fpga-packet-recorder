@@ -1145,7 +1145,7 @@ static int cmd_record(int argc, char **argv)
 	r->hdr->fdrec_version = r->info.hw_version;
 	r->hdr->num_ports = PKTREC_NUM_PORTS;
 	r->hdr->port_mask = r->o.ports;
-	r->hdr->pair_mode = pair_mode(&r->hw);   /* M3: from PAIR_MODE (pktrec-phy mode) */
+	r->hdr->pair_mode = pair_mode(&r->hw);   /* from PAIR_MODE (pktrec-phy mode) */
 	r->hdr->snaplen = r->o.snaplen;
 	strncpy(r->hdr->target, r->o.target, sizeof(r->hdr->target) - 1);
 	gethostname(r->hdr->hostname, sizeof(r->hdr->hostname) - 1);

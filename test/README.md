@@ -8,10 +8,10 @@ sequence-numbered traffic. Everything is Python 3 with the standard library only
 |------|---------|------|--------------|
 | `gen_seq.py` | PC | raw/scapy: yes; pcap: no | Sequence-numbered UDP frames ("PRSQ" payload): sends them through an AF_PACKET socket, through scapy, or writes a pcap for `tcpreplay`. Writes a JSON summary of what was sent. |
 | `board_pktgen.sh` | board (`pktrec-pktgen`) or PC | yes | Drives the kernel packet generator (pktgen) for 64..1518-byte frames at a given rate and count. Every frame carries pktgen's sequence number. |
-| `check_pcap.py` | PC or board (`pktrec-check-pcap`) | no | Verifies a pcapng per interface and per stream: every sequence number exactly once, in order, the count matches what was sent, timestamps never go backwards. Reports loss, duplicates, reordering, intervals, bad-FCS/truncated frames and the ISB drop counters. |
+| `check_pcap.py` | PC (or board: `pktrec-check-pcap`, slow) | no | Verifies a pcapng per interface and per stream: every sequence number exactly once, in order, the count matches what was sent, timestamps never go backwards. Reports loss, duplicates, reordering, intervals, bad-FCS/truncated frames and the ISB drop counters. |
 | `pcapng_lint.py` | PC or board (`pktrec-pcapng-lint`) | no | Strict structural pcapng validator (stand-in for Wireshark where `tshark` is not installed). |
 | `make_synth_capture.py` | PC | no | Writes a synthetic capture file (the hardware's record format) for testing the exporter without hardware. |
-| `selftest_export.py` | PC | no | Builds `pktrec-export` and runs it with the validators on synthetic captures (clean, damaged, with drops, with too small a reorder window). |
+| `selftest_export.py` | PC | no | Builds `pktrec-export` and runs it with the validators on synthetic captures (clean, damaged, with drops, with too small a reorder window), and compares `pktrec-export --check` with `check_pcap.py`. |
 | `pcapng_reader.py` | - | - | The pcapng parser used by the checkers. |
 
 ## Self-test on a PC (no hardware)
@@ -45,52 +45,63 @@ At 1 Gb/s, line rate is:
 
 | Source | Line rate? |
 |--------|------------|
+| On-board generator (`pktrec-phy gen`) | Yes, any size up to 1518 bytes, on every port. |
 | Python (`gen_seq.py --mode raw`) | No. It reaches roughly 100-300 kframes/s, which is enough for functional tests. |
 | PC kernel pktgen (`board_pktgen.sh` run on the PC, as root) | Yes, both sizes. |
 | `tcpreplay --topspeed` with a `gen_seq.py --mode pcap` file | Yes, both sizes. |
 | Board GEM (`pktrec-pktgen`) | Expected to reach line rate for 1518-byte frames but not for 64-byte frames: without `clone_skb`, one A53 core builds every skb. The script prints the rate it achieved. |
 
-## M1 acceptance procedure (monitor-mode capture to SSD)
+## Acceptance procedure (monitor-mode capture to SSD)
+
+The user guide's [Testing](../docs/source/testing.md) page has the full procedure; this is
+the short form.
 
 ### Setup
 
-* The board runs the M1 image. The SSD is mounted at `/mnt/rec`, for example with
-  `fdsetup-raid0.sh`.
-* The ports are initialised with `pktrec-phy init`.
-* The test PC's 1G port is cabled to OP080 **P1**. P0 is cabled to the router. P2 and P3
-  are cabled to each other.
-* Criterion for every run: `pktrec-cap` exits with 0 (no frame dropped anywhere).
-  `pktrec-export` exits with 0. `check_pcap.py` reports PASS, meaning every sequence
-  number arrived exactly once, in order, with the counts matching what was sent, and
-  `isb_ifdrop` is 0. The pcapng opens in Wireshark without warnings.
+* The SSD is mounted at `/mnt/rec` (the image mounts it at boot once it is formatted with
+  `fdsetup-raid0.sh --single`). The ports are initialised at boot (`pktrec-phy init`).
+* P2 and P3 are cabled to each other; the test PC's port is cabled to a free port (here P1).
+* Criterion for every run: `pktrec-cap` exits with 0 (no frame dropped anywhere),
+  `pktrec-export` exits with 0, and the sequence check (`pktrec-export --check` or
+  `check_pcap.py`) reports PASS: every sequence number arrived exactly once, in order, with
+  the counts matching what was sent, and `isb_ifdrop` is 0. The pcapng opens in Wireshark
+  without warnings.
 
-### 1. Single port, P1, from the test PC
+### 1. Line rate from the on-board generators (no external equipment)
+
+```
+sudo pktrec-phy chk 3 start
+sudo pktrec-cap --ports 3 --duration 60 /mnt/rec/captures/lr64.cap &
+sudo pktrec-phy gen 2 start --size 64 --count 85000000
+wait
+sudo pktrec-phy chk 3 status
+sudo pktrec-phy path 2 idle
+sudo pktrec-export --check --expect 85000000 /mnt/rec/captures/lr64.cap -o /dev/null
+```
+
+The generator frames carry the `gen_seq.py` payload, so `--check` and `check_pcap.py`
+both verify them.
+
+### 2. From the test PC
 
 Board:
 
 ```
-pktrec-cap --ports 1 --duration 30 /mnt/rec/m1_p1_64.cap      # start first
+sudo pktrec-cap --ports 1 --duration 30 /mnt/rec/captures/p1_64.cap      # start first
 ```
 
-PC, during the 30 s. Use a destination MAC that no switch knows, and the PC interface
-cabled to P1:
+PC, during the 30 s. Use a destination MAC that no switch knows:
 
 ```
 sudo test/board_pktgen.sh -i <pc-if> -d 02:00:00:00:00:99 -s 64 -c 10000000 -o sent64.json
 ```
 
-Board, after `pktrec-cap` has finished:
+PC, after `pktrec-cap` has finished (the export streams over SSH; no copy needed):
 
 ```
-pktrec-export /mnt/rec/m1_p1_64.cap -o /mnt/rec/m1_p1_64.pcapng
-```
-
-PC:
-
-```
-scp amd-edf@<board>:/mnt/rec/m1_p1_64.pcapng .
-test/check_pcap.py m1_p1_64.pcapng --sent sent64.json --interface P1
-test/pcapng_lint.py m1_p1_64.pcapng
+ssh amd-edf@<board> pktrec-export --port 1 -o - /mnt/rec/captures/p1_64.cap > p1_64.pcapng
+test/check_pcap.py p1_64.pcapng --sent sent64.json --interface P1
+test/pcapng_lint.py p1_64.pcapng
 ```
 
 Repeat with `-s 1518 -c 1000000`. Without root on the PC, use `tcpreplay`:
@@ -100,43 +111,19 @@ test/gen_seq.py --mode pcap -o seq64.pcap --size 64 --count 10000000 --summary s
 sudo tcpreplay -i <pc-if> --topspeed seq64.pcap
 ```
 
-### 2. Four ports
+### 3. Checking large captures
 
-* P1 gets line-rate traffic from the PC, as in step 1.
-* P0 gets traffic from the board itself: `pktrec-pktgen` on `end0` with an unknown
-  destination MAC. The router floods it to P0.
-* P2 and P3 are cabled to each other. With nothing transmitting on them, they carry no
-  test traffic: they are captured (idle) but not checked. A sequence-numbered load on
-  P2/P3 needs a transmit source on one of them, such as the M6 replay path or a second
-  PC NIC.
+`check_pcap.py` checks about 6 500 records/s on the board's CPU (`pktrec-check-pcap`), which
+is hours for a line-rate capture. Use `pktrec-export --check` on the board (export speed), or
+stream the export to the PC and check there:
 
 ```
-pktrec-cap --duration 60 /mnt/rec/m1_4p.cap
-sudo pktrec-pktgen -i end0 -d 02:00:00:00:00:98 -s 1518 -c 2000000 -o /tmp/sent_p0.json
+ssh amd-edf@<board> pktrec-export --port 0 -o - /mnt/rec/captures/run1.cap \
+    | test/check_pcap.py /dev/stdin --expect 87000000
 ```
 
-Check each interface against its own sender summary:
-
-```
-test/check_pcap.py m1_4p.pcapng --sent sent64.json --interface P1
-test/check_pcap.py m1_4p.pcapng --sent sent_p0.json --interface P0
-```
-
-On P0, frames from the router itself (ARP, LLDP, ...) are counted as "other" and are not
-checked.
-
-### 3. Lossless envelope (M1 extract)
-
-Run the 4-port test at 64 B and 1518 B for at least 60 s each. Record the following from
-the `RESULT` line of `pktrec-cap`, the per-port FIFO high-water marks, and the `bp`
-(merge back-pressure) column of the live statistics:
-
-* frames
-* drops
-* MB/s
-
-Any drop fails the run. `pktrec-cap` then exits with 2, `check_pcap.py` reports the
-missing sequence numbers, and `isb_ifdrop` equals the sum of the `epb_dropcount` values.
+Any drop fails a run: `pktrec-cap` then exits with 2, the checkers report the missing
+sequence numbers, and `isb_ifdrop` equals the sum of the `epb_dropcount` values.
 
 ## Root and permissions
 

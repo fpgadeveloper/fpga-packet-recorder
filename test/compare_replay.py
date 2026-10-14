@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Opsero Electronic Design Inc.
-"""compare_replay.py - replay timing accuracy (M6), standard library only.
+"""compare_replay.py - replay timing accuracy, standard library only.
 
 Compares the frames of one interface of an ORIGINAL capture (pcapng from
 pktrec-export) with the frames captured on the receiving port while that

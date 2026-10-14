@@ -3,7 +3,7 @@
  * Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
  *
  * pktrec_format.h -- capture record stream and capture file format of the
- * FPGA Packet Recorder (record format v1, M1).
+ * FPGA Packet Recorder (record format v1).
  *
  * RECORD STREAM
  * -------------
@@ -55,14 +55,14 @@
  *
  * Timestamps: ts_ns is the value of the shared 64-bit nanosecond timebase
  * (pktrec_timebase, registers PKTREC_CAP_TB_*) at the frame's start of frame
- * delimiter. Since capture register map 1.2 (M2) it is the time at which the
+ * delimiter. Since capture register map 1.2 it is the time at which the
  * PHY indicated the SFD on its RX SFD pin (PKTREC_REC_FLAG_TS_MAC = 0; ~1 ns
  * resolution, + PKTREC_SFD_P_RX_OFFSET, see PKTREC_SFD_* in pktrec_regs.h).
  * A frame without a matching SFD indication falls back to the Taxi MAC
  * timestamp (TS_MAC = 1): 16 ns quantisation (one 62.5 MHz MAC clock) plus
  * MAC_OFFSET; with MAC_OFFSET calibrated (= RX_OFFSET - median RX_DELTA) it is
- * on the same scale as the SFD timestamps, within ~+-16 ns. (In M1 images
- * every record has TS_MAC = 1.) If software set the timebase to
+ * on the same scale as the SFD timestamps, within ~+-16 ns. (Capture register
+ * map 1.1 had no SFD timestamps: every record has TS_MAC = 1.) If software set the timebase to
  * CLOCK_REALTIME (TB_SET), ts_ns is nanoseconds since the Unix epoch.
  *
  * Byte order: all multi-byte fields are little-endian (beat byte k = TDATA bits
@@ -105,7 +105,7 @@
                                                       framing/symbol error or oversize */
 #define PKTREC_REC_FLAG_TRUNC           (1u << 1)  /* truncated by SNAPLEN */
 #define PKTREC_REC_FLAG_TS_MAC          (1u << 2)  /* ts source: 1 = MAC (fallback /
-                                                      M1), 0 = PHY SFD (M2) */
+                                                      map 1.1), 0 = PHY SFD */
 #define PKTREC_REC_FLAG_SFD_MISMATCH    (1u << 3)  /* SFD resync: while this frame was
                                                       matched, one or more queued SFD
                                                       indications older than the window
@@ -113,7 +113,7 @@
                                                       discarded (PKTREC_SFD_P_RX_STALE).
                                                       Independent of bit2: the frame
                                                       itself may still have its SFD
-                                                      timestamp. 0 in M1. */
+                                                      timestamp. 0 in map 1.1. */
 #define PKTREC_REC_FLAG_SFD_RESYNC      PKTREC_REC_FLAG_SFD_MISMATCH
 #define PKTREC_REC_MARKER_MASK          0xF0u
 #define PKTREC_REC_MARKER               0xA0u      /* flags[7:4] == 0xA in every header */

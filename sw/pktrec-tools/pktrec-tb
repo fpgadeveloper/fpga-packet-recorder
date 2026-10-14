@@ -817,7 +817,7 @@ CAL_BODY = """
 # the nominal increment 1e9/DP_CLK_HZ: INC = nominal x (1 + ppm / 1e6);
 # > 0 = the timebase runs faster. pktrec-tb.service starts from this value and
 # keeps disciplining it to CLOCK_REALTIME (NTP); a good value makes it lock
-# sooner and is the holdover frequency when the daemon is stopped. The M1 bench
+# sooner and is the holdover frequency when the daemon is stopped. A ZCU106
 # board needed about +10.4 ppm.
 ppm = {ppm}
 

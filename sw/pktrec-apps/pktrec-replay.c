@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /*
- * pktrec-replay -- FPGA Packet Recorder: replay a capture out of a port (M6).
+ * pktrec-replay -- FPGA Packet Recorder: replay a capture out of a port.
  *
  * Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
  *

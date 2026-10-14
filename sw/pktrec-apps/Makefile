@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
 #
 # FPGA Packet Recorder apps: pktrec-cap (capture control + recording),
-# pktrec-export (capture file -> pcapng), pktrec-replay (capture -> port, M6).
+# pktrec-export (capture file -> pcapng), pktrec-replay (capture -> port).
 #
 #   make                         build with the system compiler (+ liburing)
 #   make pktrec-export           only the exporter (no liburing needed: it

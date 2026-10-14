@@ -10,16 +10,16 @@
  *                 PS address 0x4_2008_0000, 512 KB
  *   PKTREC_M0_*   pktrec_m0_path (Vivado/src/hdl/pktrec_m0_regs.v): port datapath
  *                 (per-port idle / loopback / forward = TAP / generator), frame
- *                 counters, TAP pair mode and dynamic IFG (map 1.2, M3), PHY
+ *                 counters, TAP pair mode and dynamic IFG (map 1.2), PHY
  *                 GPIO_0/1 and power-good inputs. ("m0" is historical: the block
- *                 started as the M0 bring-up path.)
+ *                 started as the bring-up datapath.)
  *                 PS address 0x4_2002_0000, 4 KB
  *   PKTREC_CAP_*  pktrec_capture (Vivado/src/hdl/pktrec_cap_regs.sv; hierarchy
  *                 capture): capture control, per-port capture counters, record
  *                 merge statistics and the shared timebase (PHC)
  *                 PS address 0x4_2003_0000, 4 KB
  *   PKTREC_RPL_*  pktrec_replay (Vivado/src/hdl/pktrec_replay.sv; hierarchy
- *                 replay, M6): capture replay - record parser, frame store,
+ *                 replay): capture replay - record parser, frame store,
  *                 scheduler against the timebase, output into one port's TX
  *                 PS address 0x4_2004_0000, 4 KB
  *
@@ -139,7 +139,7 @@
                                               IFG, FWD FIFO 16 KB + fill, FLUSH, GEN BAD) */
 #define PKTREC_M0_VERSION_1_1      0x00010001
 #define PKTREC_M0_VERSION_1_2      0x00010002
-#define PKTREC_M0_VERSION_1_3      0x00010003   /* 1.3 (M6): PATH_RPL, EFF_PATH[11:8] */
+#define PKTREC_M0_VERSION_1_3      0x00010003   /* 1.3: PATH_RPL, EFF_PATH[11:8] */
 #define PKTREC_M0_VERSION_1_4      0x00010004   /* 1.4: GEN_VLAN, checker skips a tag */
 #define PKTREC_M0_VERSION_1_5      0x00010005   /* 1.5: checker fix (untagged PRSQ counted) */
 #define PKTREC_M0_VERSION_1_6      0x00010006   /* 1.6: IFG_CTRL reset 0x000C0C00 (shrink off) */
@@ -185,7 +185,7 @@
 #define PKTREC_M0_P_DROP_FWD       0x14    /* frames for TX n dropped by the FWD FIFO */
 #define PKTREC_M0_P_GPIO0_EDGES    0x18    /* rising edges of GPIO_0 (RX SFD) */
 #define PKTREC_M0_P_GPIO1_EDGES    0x1C    /* rising edges of GPIO_1 (TX SFD) */
-/* TAP forwarding / dynamic inter-frame gap of TX port n (map 1.2, M3). The TX
+/* TAP forwarding / dynamic inter-frame gap of TX port n (map 1.2). The TX
  * MAC's inter-frame gap is IFG_NOM, or IFG_MIN while the reduced gap is active:
  * it starts when the FWD FIFO fill (bytes, counting the frame being received)
  * exceeds IFG_HI and ends when it falls below IFG_LO. Keep IFG_LO above the
@@ -194,7 +194,7 @@
  * longer frames (pktrec-phy maxlen does this). The shell's TX_IFG register is
  * not used (EXT_TX_IFG = 1).
  * Map 1.6: reset DYN_EN 0, IFG_MIN 12 - the reduced gap is retired (the DP83867
- * loses frames after SGMII gaps < 12 B, bench D 2026-10-14) and kept only for
+ * loses frames after SGMII gaps < 12 B, measured 2026-10-14) and kept only for
  * experiments; a partner faster than the board at sustained 100 % utilisation
  * fills the FWD FIFO and its excess is dropped and counted (DROP_FWD). */
 #define PKTREC_M0_P_IFG_CTRL       0x20    /* RW [0] DYN_EN (0), [15:8] IFG_NOM (12),
@@ -212,7 +212,7 @@
 #define PKTREC_M0_P_FLUSH          0x3C    /* RO frames discarded from a FIFO the port no
                                               longer selects (PATH_CTRL change) */
 #define PKTREC_M0_FWD_FIFO_BYTES   16384   /* FWD FIFO per TX port (LOOP: 4096) */
-/* (since M2 the GPIO levels and edges come from the SFD sampler in the capture
+/* (since capture map 1.2 the GPIO levels and edges come from the SFD sampler in the capture
  * block -- pktrec_sfd_io, sampled at ~1 ns -- re-synchronised into ctrl_clk;
  * IO_STATUS / IO_STICKY / GPIOn_EDGES behave as before) */
 
@@ -389,8 +389,8 @@
  * SET / ADJ / INC take effect on the next dp_clk cycle: nothing to wait for.
  * Change them before a capture starts (frames that wait in the capture FIFOs
  * across a SET/ADJ would get timestamps on the wrong side of the step).
- * Accuracy of a MAC timestamp (M1): 16 ns MAC clock quantisation + <= 8 ns
- * sampling jitter + a constant PHY/PCS/GT latency (not calibrated in M1);
+ * Accuracy of a MAC timestamp: 16 ns MAC clock quantisation + <= 8 ns
+ * sampling jitter + a constant PHY/PCS/GT latency;
  * MAC_OFFSET removes the constant latency of the cycle-counter copy (52 ns,
  * from simulation).
  */
@@ -434,7 +434,7 @@
 #define PKTREC_CAP_P_SEQ_NEXT        0x3C  /* RO [15:0] seq of the next frame */
 
 /* ------------------------------------------------------------------------- */
-/* pktrec_capture: PHY SFD timestamping (M2, pktrec_sfd), capture block      */
+/* pktrec_capture: PHY SFD timestamping (map 1.2, pktrec_sfd), capture block */
 /* offsets 0x400..0xBFF (dp_clk)                                             */
 /* ------------------------------------------------------------------------- */
 /*
@@ -531,7 +531,7 @@
 #define PKTREC_SFD_NONE            0x80000000u
 
 /* ------------------------------------------------------------------------- */
-/* pktrec_replay: capture replay (M6, dp_clk), PS 0x4_2004_0000              */
+/* pktrec_replay: capture replay (dp_clk), PS 0x4_2004_0000                   */
 /* ------------------------------------------------------------------------- */
 /*
  * The recorder plays a capture's record stream (include/pktrec_format.h) back

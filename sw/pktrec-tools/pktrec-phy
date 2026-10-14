@@ -3,9 +3,9 @@
 # Copyright (c) 2026 Opsero Electronic Design Inc.
 """pktrec-phy - bring-up tool for the Ethernet FMC Max (OP080) port subsystem of the
 FPGA Packet Recorder: DP83867 PHY configuration over the fabric MDIO master, link
-status, path selection and counters (M0), PHY SFD timestamping and the per-port
-hardware traffic generator / checker (M2), TAP mode: per-pair mode, dynamic
-inter-frame gap, link-state propagation and forwarding latency (M3).
+status, path selection and counters, PHY SFD timestamping and the per-port
+hardware traffic generator / checker, TAP mode: per-pair mode, dynamic
+inter-frame gap, link-state propagation and forwarding latency.
 
 Hardware (include/pktrec_regs.h):
   eth_ports/pktrec_eth_ports_0  0x4_2008_0000 (512 KB)  MAC/PCS regs, MDIO master, GT APB
@@ -62,12 +62,12 @@ Commands:
                          utilisation fills the 16 KB FWD FIFO; the excess is dropped
                          whole and counted in DROP_FWD. A gap < 12 B (--min / --nom)
                          is refused without --i-know-the-phy-drops-frames: the DP83867
-                         loses frames after SGMII gaps < 12 B (bench D, 2026-10-14)
+                         loses frames after SGMII gaps < 12 B (measured 2026-10-14)
   latency (--pair P | --in A --out B) [--count N] [--timeout S] [--window NS] [--json]
                          TAP forwarding latency per frame, TX SFD(out) - RX SFD(in), from
                          the SFD log FIFOs while paced traffic flows (one frame in flight,
                          e.g. ping -s <size> -i 0.01 through the TAP): min/median/max
-  counters [--clear] [--json]   M0 frame counters
+  counters [--clear] [--json]   port frame counters
   sfd status [--json] [--clear]   SFD timestamping: edges, matches, stale, mismatches,
                          MAC->SFD deltas, TX latency, latest timestamps per port
   sfd config [--rx-win MIN MAX] [--tx-win MIN MAX] [--rx-offset P NS] [--tx-offset P NS]
@@ -141,9 +141,9 @@ is idle and EFF_PATH confirms it) and it is not in a TAP pair; no non-idle path
 generator runs on a port whose PHY is in loopback. Pair 0 (P0/P1) is treated as
 the LAN pair (PKTREC_LAN_PAIRS, default "0"; "" = none): there, any loopback
 (BMCR[14] via mdio, path loop, test linkdown, the internal hold path) is refused
-in EVERY mode, even with the pair in monitor and both paths idle (bench C: a
-looped P1 is one 'mode 0 tap' away from the incident; the LAN pair never needs
-a loopback). --force never overrides these checks; only --i-accept-lan-loop
+in EVERY mode, even with the pair in monitor and both paths idle (a looped P1
+is one 'mode 0 tap' away from reflecting the LAN; the LAN pair never needs a
+loopback). --force never overrides these checks; only --i-accept-lan-loop
 does, with a warning. The one internal exception is pktrec-phy-watch holding P0
 for link propagation: it runs inside the watch, sets path 0 idle first and sets
 the loopback only once EFF_PATH confirms that nothing is forwarded into P0.
@@ -189,9 +189,9 @@ M0_ID, M0_VERSION, M0_PATH_CTRL, M0_CNT_CTRL, M0_IO_STATUS, M0_IO_STICKY = (
 M0_PORT_BASE, M0_PORT_STRIDE = 0x100, 0x40
 M0_COUNTERS = ["RX_GOOD", "RX_BAD", "TX_GOOD", "TX_UNDERFLOW", "DROP_LOOP", "DROP_FWD",
                "GPIO0_EDGES", "GPIO1_EDGES"]
-# m0 map 1.2 (M3): pair mode, effective path, dynamic IFG, FWD FIFO fill, FLUSH
+# m0 map 1.2: pair mode, effective path, dynamic IFG, FWD FIFO fill, FLUSH
 M0_PAIR_MODE, M0_EFF_PATH = 0x018, 0x01C
-M0_PATH_RPL = 0x020          # m0 map 1.3 (M6): [n] = port n in path mode 4 REPLAY
+M0_PATH_RPL = 0x020          # m0 map 1.3: [n] = port n in path mode 4 REPLAY
 (P_IFG_CTRL, P_IFG_THRESH, P_FWD_FILL, P_IFG_STATUS, P_IFG_RED_CYC, P_IFG_RED_ENT,
  P_FLUSH) = (0x20, 0x24, 0x28, 0x2C, 0x30, 0x38, 0x3C)
 PAIR_MODES = {"monitor": 0, "tap": 1}
@@ -330,7 +330,7 @@ class Board:
             raise SystemExit("pktrec-phy: this bitstream has no traffic generator (m0 map 1.0)")
 
     def has_tap(self):
-        """m0 map 1.2 (M3): PAIR_MODE, EFF_PATH, dynamic IFG."""
+        """m0 map 1.2: PAIR_MODE, EFF_PATH, dynamic IFG."""
         return self.m0.rd(M0_VERSION) >= 0x00010002
 
     def need_tap(self):
@@ -353,7 +353,7 @@ class Board:
         return self.m0.rd(M0_VERSION) >= 0x00010004
 
     def has_replay(self):
-        """m0 map 1.3 (M6): PATH_RPL (path mode 4 replay)."""
+        """m0 map 1.3: PATH_RPL (path mode 4 replay)."""
         return self.m0.rd(M0_VERSION) >= 0x00010003
 
     def replay_ports(self):
@@ -490,8 +490,8 @@ class Board:
     def phy_loopback(self, n, on, lan_ok=False):
         """BMCR[14] MII loopback on / off. On also clears BMCR[12] (auto-negotiation
         enable): only loopback WITH AN off (0x4140) drops the copper link so the far
-        device sees link down (bench 2026-10-13); loopback with AN on (0x5140) keeps
-        the copper link up (bench D 2026-10-14: P0 held at 0x5140, its partner P2 stayed
+        device sees link down (measured 2026-10-13); loopback with AN on (0x5140) keeps
+        the copper link up (measured 2026-10-14: P0 held at 0x5140, its partner P2 stayed
         up). The PHY keeps running either way: its clocks (P0's CLK_OUT feeds P1-P3),
         MDIO and the SGMII side stay alive. Turning it off sets BMCR[12] again and
         restarts auto-negotiation (BMCR[9], self-clearing).
@@ -580,7 +580,7 @@ def loop_hazards(b, n):
 
 
 def lan_loop_why(n):
-    """Loopback on a LAN-pair port is refused in every mode (bench C, fix round 3)."""
+    """Loopback on a LAN-pair port is refused in every mode."""
     if n not in LAN_PORTS:
         return []
     return [f"P{n} is on the LAN pair {n // 2} (router-facing): loopback there is refused in "
@@ -990,7 +990,7 @@ class Propagator:
     restart, SGMII re-trigger, BMCR re-check (one retry), and for P0 last of all
     path 0 fwd again (only while pair 0 is still in TAP mode).
 
-    Why not MII loopback everywhere (fix round 1): a loopback on a port that is
+    Why not MII loopback everywhere: a loopback on a port that is
     forwarded into reflects the far side's traffic back at it. The hold itself was
     safe (the held port's partner had no link), but it made loopback look like a
     harmless way to drop a link, and that is how the LAN outage of 2026-10-13 was
@@ -1115,7 +1115,7 @@ class Propagator:
 class SkewCorrector:
     """Per-link-up RX latency correction from the DP83867 skew FIFO status (0x0055).
 
-    Bench 2026-10-13 (M2 session A, 19 link-ups of P2<->P3, TX-SFD -> RX-SFD of the
+    Measured 2026-10-13 (19 link-ups of P2<->P3, TX-SFD -> RX-SFD of the
     same frames, 1 ns sampler): the latency of a link is constant within a link-up
     but takes one of two values per link-up. On the 1000BASE-T master's receive
     side it is 8 ns longer exactly when that PHY's 0x0055 reads non-zero (0x0111 /
@@ -1124,7 +1124,7 @@ class SkewCorrector:
     [3:0] x 8 ns in follower mode, constant per link-up. So `ns` (8) of extra RX
     latency is taken off this link-up's timestamps: RX_OFFSET = base - ns while
     0x0055 != 0 AND the port resolved as 1000BASE-T master (0x0A bit 14), = base
-    otherwise. A non-zero 0x0055 on a slave (bench C: P0 0x0001) is logged but not
+    otherwise. A non-zero 0x0055 on a slave (seen: P0 0x0001) is logged but not
     corrected: there is no measurement that it changes the latency. The raw value is logged; it is not scaled by its
     fields (only the two non-zero values above were seen, both meaning +8 ns).
 
@@ -1203,7 +1203,7 @@ class SkewCorrector:
             a = PHY_ADDR[n]
             v = self.b.mdio_rd(a, SKEW_FIFO_STS)
             ms = (self.b.mdio_rd(a, STS1) >> 14) & 1
-            # only where bench A measured it: non-zero 0x0055 on the 1000BASE-T master
+            # only where it was measured: non-zero 0x0055 on the 1000BASE-T master
             corr = -self.ns if v and ms else 0
             self.reg55[n], self.master[n] = v, bool(ms)
             old = self.written[n]
@@ -1411,10 +1411,10 @@ def ifg_doc(b, n):
             "drop_fwd": m.rd(base + 0x14)}
 
 
-# Bench D (2026-10-14, zcu106 + OP080, DP83867 on both ends): MAC gaps below 12 B
+# Measured 2026-10-14 (zcu106 + OP080, DP83867 on both ends): MAC gaps below 12 B
 IFG_SAFE_MIN = 12
 IFG_PHY_DROPS = (
-    "the DP83867 loses frames after SGMII inter-frame gaps < 12 B. Bench D 2026-10-14, "
+    "the DP83867 loses frames after SGMII inter-frame gaps < 12 B. Measured 2026-10-14, "
     "P2 -> P0, generator at line rate: MAC gap 12 B: 15 854 447 sent, all received; "
     "11 B: 15 995 514 sent, 4 055 good / 37 bad received; 8 B: 16 594 129 sent, 41 good / "
     "258 bad (PHY FIFO depth 6/8 did not help). In a TAP with the reduced gap on (min "
@@ -1465,7 +1465,7 @@ def cmd_ifg(b, args):
     for d in docs:
         if (d["dyn_en"] and d["ifg_min"] < IFG_SAFE_MIN) or d["ifg_nom"] < IFG_SAFE_MIN:
             print(f"WARNING: P{d['port']} sends gaps < {IFG_SAFE_MIN} B: the DP83867 loses frames "
-                  f"after them (bench D); 'pktrec-phy ifg {d['port']} --enable off --nom 12 --min 12'")
+                  f"after them; 'pktrec-phy ifg {d['port']} --enable off --nom 12 --min 12'")
         print(f"P{d['port']} TX: dynamic IFG {'on' if d['dyn_en'] else 'OFF'} "
               f"({d['ifg_nom']} B -> {d['ifg_min']} B above {d['ifg_hi']} B until below "
               f"{d['ifg_lo']} B FWD fill) | now {'REDUCED' if d['reduced'] else 'normal'} "
@@ -1916,12 +1916,12 @@ def main():
     p.add_argument("port", help="0..3 or all")
     p.add_argument("mode", choices=sorted(MODES) + ["replay"])
     p.add_argument("--i-accept-lan-loop", action="store_true", help=LAN_HELP)
-    p = sub.add_parser("counters", help="M0 frame counters")
+    p = sub.add_parser("counters", help="port frame counters")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--json", action="store_true")
     port_t = lambda s: int(s.lstrip("pP")) if 0 <= int(s.lstrip("pP")) <= 3 else \
         (_ for _ in ()).throw(argparse.ArgumentTypeError("port 0..3"))
-    p = sub.add_parser("sfd", help="PHY SFD timestamping (M2)")
+    p = sub.add_parser("sfd", help="PHY SFD timestamping")
     ss = p.add_subparsers(dest="sfd_cmd", required=True)
     q = ss.add_parser("status", help="counters, deltas, latencies, latest timestamps")
     q.add_argument("--json", action="store_true")
@@ -1941,7 +1941,7 @@ def main():
     q.add_argument("port", type=port_t)
     q.add_argument("--dir", choices=["rx", "tx"], default="tx")
     q.add_argument("--json", action="store_true")
-    p = sub.add_parser("gen", help="per-port hardware traffic generator (M2)")
+    p = sub.add_parser("gen", help="per-port hardware traffic generator")
     p.add_argument("port", type=port_t)
     gs = p.add_subparsers(dest="gen_cmd", required=True)
     q = gs.add_parser("start")
@@ -1971,7 +1971,7 @@ def main():
     gs.add_parser("stop")
     q = gs.add_parser("status")
     q.add_argument("--json", action="store_true")
-    p = sub.add_parser("chk", help="per-port receive checker for generator traffic (M2)")
+    p = sub.add_parser("chk", help="per-port receive checker for generator traffic")
     p.add_argument("port", type=port_t)
     cs = p.add_subparsers(dest="chk_cmd", required=True)
     q = cs.add_parser("start")
@@ -1996,7 +1996,7 @@ def main():
     p.add_argument("--skew-ns", type=int, default=8,
                    help="RX latency (ns) a non-zero 0x0055 adds to a link-up (8, bench-measured)")
     p.add_argument("--json", action="store_true", help="log one JSON object per line")
-    p = sub.add_parser("mode", help="per-pair TAP / monitor mode (M3); in tap mode the watch "
+    p = sub.add_parser("mode", help="per-pair TAP / monitor mode; in tap mode the watch "
                        "service propagates link loss across the pair")
     p.add_argument("what", help="pair 0|1, or status")
     p.add_argument("mode", nargs="?", choices=sorted(PAIR_MODES))
@@ -2012,7 +2012,7 @@ def main():
     p.add_argument("--min", type=int, help="reduced gap, bytes (12; < 12 needs "
                    "--i-know-the-phy-drops-frames)")
     p.add_argument("--i-know-the-phy-drops-frames", action="store_true",
-                   help="allow a gap < 12 B (the DP83867 loses frames after it, bench D)")
+                   help="allow a gap < 12 B (the DP83867 loses frames after it)")
     p.add_argument("--hi", type=int, help="FWD fill (bytes) that starts the reduced gap (3072)")
     p.add_argument("--lo", type=int, help="FWD fill (bytes) that ends it (2048; > largest frame)")
     p.add_argument("--json", action="store_true")
@@ -2021,7 +2021,7 @@ def main():
     p.add_argument("--set", type=int, metavar="BYTES",
                    help="max frame incl. FCS, 64..16383 (reset 1522); raises IFG_LO/HI if needed")
     p.add_argument("--json", action="store_true")
-    p = sub.add_parser("latency", help="TAP forwarding latency from the SFD logs (M3)")
+    p = sub.add_parser("latency", help="TAP forwarding latency from the SFD logs")
     p.add_argument("--pair", type=int, choices=[0, 1], help="both directions of a pair")
     p.add_argument("--in", dest="inp", type=port_t, help="receiving port")
     p.add_argument("--out", type=port_t, help="forwarding port")

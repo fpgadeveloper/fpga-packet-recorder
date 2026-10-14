@@ -9,7 +9,7 @@ Contents:
 * `conf/layer.conf` -- the layer definition (scarthgap); sets `PKTREC_REPO_ROOT`, the
   repository root, from which the recipes take their sources.
 * `recipes-apps/pktrec-tools/` -- `pktrec-phy` (Python 3, sources `sw/pktrec-tools/`):
-  DP83867 configuration over the fabric MDIO master, link status, M0 path selection
+  DP83867 configuration over the fabric MDIO master, link status, port path selection
   and counters.
 * `recipes-kernel/linux/` -- `pktrec.cfg`: `CONFIG_UIO_PDRV_GENIRQ=y`, so the
   `generic-uio` nodes of the eth_ports register blocks bind at boot.

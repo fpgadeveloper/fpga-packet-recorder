@@ -363,7 +363,7 @@ def test_propagation():
     check(i_fwd is not None and i_sg is not None and i_clr < i_sg < i_fwd and e[i_clr][3] & 0x0200,
           "P0 release ordering: BMCR[14] cleared + AN restart, SGMII re-trigger, then path 0 fwd")
     check(not e[i_lb][3] & 0x1000 and e[i_clr][3] & 0x1000,
-          "P0 hold = loopback WITH AN off (0x4140 drops the copper link, 0x5140 does not: bench D); "
+          "P0 hold = loopback WITH AN off (0x4140 drops the copper link, 0x5140 does not, measured 2026-10-14); "
           "release sets AN enable again")
     holds = [e for e in ev if e["event"] == "hold"]
     check(holds and holds[0]["port"] == 0 and "path 0 fwd -> idle" in holds[0]["steps"]
@@ -514,7 +514,7 @@ def test_skew():
     check(S["bounce"][2] == -230, f"P2 link-up with 0x0055 = 0 -> base {S['bounce'][2]}")
     st = json.load(open(os.path.join(RUN, "phy-watch.json")))
     check(st["skew"][2]["base"] == -230 and st["skew"][2]["corr"] == 0, "state file: base / corr")
-    # slave with a non-zero 0x0055 (bench C: P0 0x0001 as slave): logged, never corrected
+    # slave with a non-zero 0x0055 (seen: P0 0x0001 as slave): logged, never corrected
     W.phy[m.PHY_ADDR[2]][m.SKEW_FIFO_STS] = 0x0001
     W.phy[m.PHY_ADDR[2]][0x0A] = 0x0000
     ev, out = watch_scenario([(0.2, "P2 bounce", lambda: W.renegotiate(2))], ["--no-propagate"], 2.5)
@@ -560,7 +560,7 @@ def test_safety():
     W.allow = False
     BOARD.mdio_wr(a1, 0, 0x1140)
     run(["mode", "0", "monitor"])
-    out = run(["mdio", "p1", "0", "0x5140"])           # bench C, fix round 3: the exact case
+    out = run(["mdio", "p1", "0", "0x5140"])           # the case that once reflected the LAN
     check("EXIT" in out and "refused" in out and "LAN pair" in out and bm(1) == 0x1140,
           "pair 0 monitor (paths idle): 'mdio p1 0 0x5140' refused (LAN pair), BMCR p1 unchanged")
     out = run(["mdio", "p0", "0", "0x5140"])
