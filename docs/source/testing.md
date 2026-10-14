@@ -126,7 +126,10 @@ P1 keep their links and keep answering MDIO; `pktrec-phy safe` reports SAFE thro
 
 `pktrec-phy test linkdown` uses the same method as the watcher: PHY power-down on P1 to P3 and,
 on P0, path idle followed by MII loopback. It refuses pair 0 unless `--i-accept-lan-loop` is
-given. Do not simulate a link loss by writing MII loopback into a PHY with `pktrec-phy mdio`:
+given. A test hold is not remembered across `pktrec-phy init`: restarting the
+`pktrec-phy-watch` service (whose start runs `pktrec-phy init`) or running `init` by hand
+re-configures every PHY and so ends the simulated loss; repeat `test linkdown` afterwards. Do
+not simulate a link loss by writing MII loopback into a PHY with `pktrec-phy mdio`:
 on a pair in TAP mode this reflects the traffic of the device on the other port back to it (the
 tool refuses it; see [Loop safety](modes.md#loop-safety)).
 

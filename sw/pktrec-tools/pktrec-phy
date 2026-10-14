@@ -49,7 +49,9 @@ Commands:
                          MII loopback. linkup undoes it (+ AN restart, SGMII re-trigger,
                          P0's fwd path restored if its pair is still in TAP mode).
                          Refused on the LAN pair (pair 0) unless --i-accept-lan-loop:
-                         run link-propagation tests on pair 1 (P2<->P3)
+                         run link-propagation tests on pair 1 (P2<->P3). A restart
+                         of pktrec-phy-watch (its ExecStartPre 'init') or any
+                         'pktrec-phy init' clears a test linkdown
   mode status [--json]   PAIR_MODE, PATH_CTRL and the effective path per pair
   ifg <port|all> [--enable on|off] [--nom B] [--min B] [--hi B] [--lo B] [--json]
                          dynamic inter-frame gap of the TAP forward path: settings,
@@ -1000,7 +1002,11 @@ class Propagator:
 
     The held ports are recorded in $PKTREC_RUN_DIR/phy-watch.json, so a restarted
     watch releases exactly the holds a previous instance left (and not a loopback
-    or power-down somebody set by hand for a test, e.g. pktrec-phy test linkdown)."""
+    or power-down somebody set by hand for a test, e.g. pktrec-phy test linkdown).
+    Note: restarting the pktrec-phy-watch *service* still clears such a hand-set
+    power-down, because its ExecStartPre `pktrec-phy init` re-configures every PHY
+    (BMCR power-down cleared, AN restarted); hand-set test holds are not recorded
+    anywhere, so re-run `test linkdown` after a service restart."""
 
     def __init__(self, b, log, debounce=0.5, grace=6.0, saved=None):
         self.b, self.log, self.debounce, self.grace = b, log, debounce, grace
