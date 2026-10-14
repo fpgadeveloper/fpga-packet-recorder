@@ -30,7 +30,8 @@ Commands:
                          each other (inline TAP), monitor = both ports receive only.
                          Refused while a capture runs (capture CTRL.ENABLE) unless --force;
                          tap is refused while a port of the pair is in replay (--force
-                         takes the port out of replay)
+                         takes the port out of replay). In tap mode pktrec-phy-watch
+                         (watch) propagates link loss across the pair (see watch)
   mode status [--json]   PAIR_MODE, PATH_CTRL and the effective path per pair
   ifg <port|all> [--enable on|off] [--nom B] [--min B] [--hi B] [--lo B] [--json]
                          dynamic inter-frame gap of the TAP forward path: settings,
@@ -51,20 +52,38 @@ Commands:
   gen <port> stop | status [--json]
   chk <port> start [--raw] [--etype E] | stop | status [--json]   receive checker
   (--size is the wire size INCLUDING the FCS, like test/gen_seq.py: 64..16387)
-  watch [--interval S] [--no-propagate] [--debounce S] [--grace S] [--json]
+  watch [--interval S] [--no-propagate] [--debounce S] [--grace S]
+        [--no-0055-correction] [--skew-ns NS] [--json]
                          re-trigger the SGMII status word (CFG2[7] 0->1) whenever a
                          PHY's copper link changes (DP83867 sends it only once), and
                          for pairs in TAP mode propagate link state: when a port's
-                         copper link stays down for --debounce s, power down its
-                         partner PHY (BMCR[11]) so the device on the other side sees
-                         link down too; power it up again (and re-trigger SGMII) when
-                         the port comes back. Ports we powered down never propagate,
-                         and a port just powered up gets --grace s to negotiate before
-                         its link-down counts (no ping-pong). Every action is logged
-                         (--json: one JSON object per line). On exit, or when the
-                         pair leaves TAP mode, every PHY it powered down is powered up.
+                         copper link stays down for --debounce s, put its partner PHY
+                         into MII loopback (BMCR[14]): the partner's copper link drops,
+                         so the device on the other side sees link down too, while the
+                         PHY keeps running (clocks, MDIO, SGMII). When the port comes
+                         back, clear the loopback (+ AN restart), re-trigger SGMII and
+                         read BMCR back. Ports held in loopback by us never propagate,
+                         and a released port gets --grace s to negotiate before its
+                         link-down counts (no ping-pong). No PHY is ever powered down:
+                         P0's DP83867 clocks P1-P3 (see "P0 guard" below). On exit, or
+                         when the pair leaves TAP mode, every held PHY is released.
+                         On every copper link-up, read the PHY's skew FIFO status
+                         (reg 0x0055): non-zero (0x0111 / 0x1011 seen on the 1000BASE-T
+                         master) means this link-up has --skew-ns (8) ns more RX
+                         latency, so the port's SFD RX_OFFSET is set to the calibration
+                         base - 8 ns; zero restores the base (--no-0055-correction: off).
+                         Every action is logged (--json: one JSON object per line);
+                         state in $PKTREC_RUN_DIR/phy-watch.json (/run/pktrec).
   mdio <phy> <reg> [val] raw PHY register access (phy: p0..p3 or MDIO address;
                          reg > 0x1f uses the extended REGCR/ADDAR indirection)
+
+P0 guard: on the OP080 only P0's DP83867 has a crystal; its CLK_OUT (25 MHz)
+feeds the XI clock input of P1-P3 (docs.opsero.com/op080/datasheet/
+detailed-description/, "Clocks"). Powering P0 down (BMCR[11]) or changing its
+CLK_OUT mode (IO_MUX_CFG 0x0170) stops that clock: P1-P3 lose their copper links
+and stop answering MDIO (bench 2026-10-13: a power-down of P0 for link
+propagation dead-locked the card). Every MDIO write goes through one function
+that refuses both, for every command including 'mdio'.
 
 There is one MDIO master for the four PHYs: every MDIO access (including the
 4-step extended-register sequences and read-modify-writes) holds an flock on
@@ -143,6 +162,15 @@ PHY_ADDR = [0x01, 0x03, 0x0C, 0x0F]
 BMCR, BMSR, PHYIDR1, PHYIDR2, ANAR, ANLPAR, CFG1, PHYCR, PHYSTS, CFG2, REGCR, ADDAR, CTRL = (
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x09, 0x10, 0x11, 0x14, 0x0D, 0x0E, 0x1F)
 CFG4, SGMIICTL1, SYNC_FIFO_CTRL, RXFCFG, GPIO_MUX_CTRL = 0x0031, 0x00D3, 0x00E9, 0x0134, 0x0172
+STS1 = 0x0A                  # 1000BASE-T status: [14] master/slave resolution (1 = master)
+SKEW_FIFO_STS = 0x0055       # [7:4] / [3:0] x 8 ns (leader / follower), per link-up
+IO_MUX_CFG = 0x0170          # CLK_OUT mode: never written on P0 (P0 guard)
+BMCR_RESET, BMCR_LOOPBACK, BMCR_AN_EN, BMCR_PWRDN, BMCR_ISOLATE, BMCR_AN_RESTART = (
+    0x8000, 0x4000, 0x1000, 0x0800, 0x0400, 0x0200)
+# per-port MAC max frame length (shell, ETH_PORT_BASE + n * stride): incl. FCS, minus 1
+P_TX_MAX_LEN, P_RX_MAX_LEN = 0x14, 0x18
+RUN_DIR = os.environ.get("PKTREC_RUN_DIR", "/run/pktrec")
+WATCH_STATE = os.path.join(RUN_DIR, "phy-watch.json")
 
 
 class Regs:
@@ -324,7 +352,21 @@ class Board:
             self._mdio(1, phy, REGCR, 0x401F)
             return self._mdio(2, phy, ADDAR)
 
+    @staticmethod
+    def p0_guard(phy, reg, val):
+        """Refuse the two writes that stop P0's CLK_OUT, which clocks P1-P3 (module
+        docstring, "P0 guard"). No option overrides this."""
+        if phy != PHY_ADDR[0]:
+            return
+        if reg == BMCR and val & BMCR_PWRDN:
+            raise RuntimeError("refused: BMCR[11] power-down on P0 (MDIO 0x01) stops the 25 MHz "
+                               "CLK_OUT that clocks P1-P3 (OP080): they would lose link and MDIO")
+        if reg == IO_MUX_CFG:
+            raise RuntimeError("refused: IO_MUX_CFG 0x0170 on P0 (MDIO 0x01) sets the CLK_OUT "
+                               "mode; P0's CLK_OUT clocks P1-P3 on the OP080")
+
     def mdio_wr(self, phy, reg, val):
+        self.p0_guard(phy, reg, val)
         with self.mdio_lock():
             if reg <= 0x1F:
                 self._mdio(1, phy, reg, val)
@@ -349,12 +391,26 @@ class Board:
     def copper_link(self, n):
         return bool(self.mdio_rd(PHY_ADDR[n], PHYSTS) & 0x0400)
 
-    def phy_power(self, n, up):
-        """BMCR[11] power-down off (up=True) / on. Registers are kept."""
-        self.mdio_rmw(PHY_ADDR[n], BMCR, 0x0800 if up else 0, 0 if up else 0x0800)
+    def phy_power_up(self, n):
+        """Clear BMCR[11] power-down (left by an older watch). This tool never sets it:
+        see the P0 guard."""
+        self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_PWRDN, 0)
 
     def phy_powered_down(self, n):
-        return bool(self.mdio_rd(PHY_ADDR[n], BMCR) & 0x0800)
+        return bool(self.mdio_rd(PHY_ADDR[n], BMCR) & BMCR_PWRDN)
+
+    def phy_loopback(self, n, on):
+        """BMCR[14] MII loopback on / off. With it on, the DP83867 drops its copper link
+        (the far device sees link down) but keeps running: its clocks (P0's CLK_OUT
+        feeds P1-P3), MDIO and the SGMII side stay alive (bench 2026-10-13). Turning it
+        off also restarts auto-negotiation (BMCR[9], self-clearing)."""
+        if on:
+            self.mdio_rmw(PHY_ADDR[n], BMCR, 0, BMCR_LOOPBACK)
+        else:
+            self.mdio_rmw(PHY_ADDR[n], BMCR, BMCR_LOOPBACK, BMCR_AN_RESTART)
+
+    def phy_looped(self, n):
+        return bool(self.mdio_rd(PHY_ADDR[n], BMCR) & BMCR_LOOPBACK)
 
     def sgmii_retrigger(self, n):
         """Make the DP83867 send a fresh SGMII config word (CFG2[7] 0 -> 1)."""
@@ -391,7 +447,7 @@ def init_phy(b, n, only1000, sfd):
         b.mdio_wr(a, RXFCFG, 0x1080)
         b.mdio_wr(a, GPIO_MUX_CTRL, 0x0012)
         b.mdio_wr(a, SYNC_FIFO_CTRL, 0xDF22)
-    b.mdio_rmw(a, BMCR, 0x0C00, 0x1000)        # AN on, not powered down / isolated
+    b.mdio_rmw(a, BMCR, 0x4C00, 0x1000)        # AN on, not powered down / isolated / looped
     b.mdio_wr(a, CTRL, 0x4000)                 # SW_RESTART (registers kept)
     time.sleep(0.01)
     print(f"P{n}: PHY @0x{a:02x} configured (strap mirror={'on' if cfg4 & 1 else 'OFF (Rev-A)'}, "
@@ -549,51 +605,100 @@ class EventLog:
                   + msg, flush=True)
 
 
+def read_watch_state(path=None):
+    try:
+        with open(path or WATCH_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_watch_state(doc, path=None):
+    path = path or WATCH_STATE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(doc, f, indent=1)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 class Propagator:
     """Link-state propagation for pairs in TAP mode (watch).
 
-    A port whose copper link has been down for `debounce` s makes us power down its
-    partner PHY (BMCR[11]) so the device on the partner's side sees link down, as on
-    a direct cable; when the port's link has been up again for `debounce` s, the
-    partner is powered up (and SGMII re-triggered). Guards against ping-pong:
-      - a port WE powered down never propagates (its link-down is our doing);
-      - a port we just powered up gets `grace` s (copper auto-negotiation takes
+    A port whose copper link has been down for `debounce` s makes us hold its
+    partner PHY in MII loopback (BMCR[14]): the partner's copper link drops, so the
+    device on the partner's side sees link down, as on a direct cable. The PHY
+    itself keeps running (clocks, MDIO, SGMII). When the port's link has been up
+    again for `debounce` s, the partner is released: loopback cleared + AN restart,
+    SGMII re-triggered, BMCR read back (re-check). Guards against ping-pong:
+      - a port WE hold never propagates (its link-down is our doing);
+      - a port we just released gets `grace` s (copper auto-negotiation takes
         ~3 s) before its own link-down counts;
       - at start every port gets `grace` s too.
-    If someone else powers a PHY back up (pktrec-phy init, mdio), we notice and
-    forget it. When a pair leaves TAP mode, or watch exits, every PHY powered down
-    here is powered up again."""
+    If someone else clears the loopback (pktrec-phy init, mdio), we notice and
+    forget the hold. When a pair leaves TAP mode, or watch exits, every PHY held
+    here is released.
 
-    def __init__(self, b, log, debounce=0.5, grace=6.0):
+    Why not BMCR[11] power-down (the first implementation): on the OP080 P0's
+    DP83867 clocks P1-P3 through its CLK_OUT. Powering P0 down for a link loss on
+    P1 dropped P2/P3 as well and silenced P1-P3 on MDIO, so P1's own recovery could
+    never be seen (bench 2026-10-13). MII loopback was proven on the same bench to
+    drop the far link while keeping everything alive. No PHY is powered down here.
+
+    The held ports are recorded in $PKTREC_RUN_DIR/phy-watch.json, so a restarted
+    watch releases exactly the holds a previous instance left (and not a loopback
+    somebody set by hand for a test)."""
+
+    def __init__(self, b, log, debounce=0.5, grace=6.0, saved=None):
         self.b, self.log, self.debounce, self.grace = b, log, debounce, grace
         now = time.monotonic()
-        self.pd = [False] * 4               # powered down by us
+        self.held = [False] * 4             # held in MII loopback by us
         self.state = [None] * 4             # last copper link state
         self.t_change = [now] * 4
         self.grace_until = [now + grace] * 4
-        # a PHY left powered down by a previous watch (crash/restart) in a TAP pair
         tap = self.b.pair_modes()
+        prev = set((saved or {}).get("held", []))
         for n in range(4):
+            # a PHY left powered down by an older watch (BMCR[11]) in a TAP pair
             if tap[n // 2] == "tap" and self.b.phy_powered_down(n):
-                self.b.phy_power(n, True)
-                self.log(n, "power_up", "PHY was powered down at start (previous watch?) "
+                self.b.phy_power_up(n)
+                self.b.sgmii_retrigger(n)
+                self.log(n, "power_up", "PHY was powered down at start (older watch?) "
                          "-> powered up", reason="startup")
+            # a loopback hold left by a previous watch (crash / restart)
+            if n in prev and self.b.phy_looped(n):
+                self.release(n, now, "left held by a previous watch")
 
-    def power(self, n, up, now, reason):
-        self.b.phy_power(n, up)
-        self.pd[n] = not up
-        if up:
-            self.grace_until[n] = now + self.grace
-            self.b.sgmii_retrigger(n)
-        self.log(n, "power_up" if up else "power_down",
-                 f"PHY powered {'UP (+SGMII re-trigger)' if up else 'DOWN'} ({reason})",
-                 reason=reason)
+    def held_ports(self):
+        return [n for n in range(4) if self.held[n]]
+
+    def hold(self, n, now, reason):
+        self.b.phy_loopback(n, True)
+        self.held[n] = True
+        self.log(n, "hold", f"PHY held in MII loopback: copper link DOWN ({reason})", reason=reason)
+
+    def release(self, n, now, reason):
+        self.b.phy_loopback(n, False)
+        self.held[n] = False
+        self.grace_until[n] = now + self.grace
+        self.b.sgmii_retrigger(n)
+        ok = not self.b.phy_looped(n)       # re-check
+        if not ok:                          # one retry, then report
+            self.b.phy_loopback(n, False)
+            ok = not self.b.phy_looped(n)
+        self.log(n, "release", f"PHY released from MII loopback (+AN restart, SGMII re-trigger"
+                 f"{', BMCR re-check ok' if ok else ', BMCR[14] STILL SET after a retry'}) ({reason})",
+                 reason=reason, recheck_ok=ok)
 
     def release_all(self, reason):
         now = time.monotonic()
         for n in range(4):
-            if self.pd[n]:
-                self.power(n, True, now, reason)
+            if self.held[n]:
+                self.release(n, now, reason)
 
     def step(self, now, links):
         for n in range(4):
@@ -607,30 +712,136 @@ class Propagator:
             a, c = 2 * pair, 2 * pair + 1
             if tap[pair] != "tap":
                 for x in (a, c):
-                    if self.pd[x]:
-                        self.power(x, True, now, f"pair {pair} left TAP mode")
+                    if self.held[x]:
+                        self.release(x, now, f"pair {pair} left TAP mode")
                 continue
-            for x in (a, c):                    # externally powered up again?
-                if self.pd[x] and not self.b.phy_powered_down(x):
-                    self.pd[x] = False
+            for x in (a, c):                    # loopback cleared by someone else?
+                if self.held[x] and not self.b.phy_looped(x):
+                    self.held[x] = False
                     self.grace_until[x] = now + self.grace
-                    self.log(x, "external_power_up", "PHY was powered up by someone else; "
-                             "no longer held down")
+                    self.log(x, "external_release", "MII loopback was cleared by someone else; "
+                             "no longer held")
             for x, y in ((a, c), (c, a)):
                 if self.state[x] is None or now - self.t_change[x] < self.debounce:
                     continue
-                if self.state[x] is False and not self.pd[x] and not self.pd[y] \
+                if self.state[x] is False and not self.held[x] and not self.held[y] \
                         and now >= self.grace_until[x]:
-                    self.power(y, False, now, f"P{x} link down")
-                elif self.state[x] is True and self.pd[y]:
-                    self.power(y, True, now, f"P{x} link up")
+                    self.hold(y, now, f"P{x} link down")
+                elif self.state[x] is True and self.held[y]:
+                    self.release(y, now, f"P{x} link up")
 
 
-def watch_loop(b, duration, interval, ports, quiet, prop=None, log=None):
+class SkewCorrector:
+    """Per-link-up RX latency correction from the DP83867 skew FIFO status (0x0055).
+
+    Bench 2026-10-13 (M2 session A, 19 link-ups of P2<->P3, TX-SFD -> RX-SFD of the
+    same frames, 1 ns sampler): the latency of a link is constant within a link-up
+    but takes one of two values per link-up. On the 1000BASE-T master's receive
+    side it is 8 ns longer exactly when that PHY's 0x0055 reads non-zero (0x0111 /
+    0x1011 in 6 of 16 link-ups, 244.5 instead of 236.5 ns); the slave's 0x0055 was
+    always 0 and its RX latency never moved. The datasheet: [7:4] x 8 ns in leader,
+    [3:0] x 8 ns in follower mode, constant per link-up. So `ns` (8) of extra RX
+    latency is taken off this link-up's timestamps: RX_OFFSET = base - ns while
+    0x0055 != 0, = base otherwise. The raw value is logged; it is not scaled by its
+    fields (only the two non-zero values above were seen, both meaning +8 ns).
+
+    base = the calibrated RX_OFFSET (pktrec-tb apply-calibration, sfd config). A
+    register value we did not write is adopted as the new base and the current
+    correction is re-applied on top (apply-calibration runs after watch at boot).
+    State (base / correction / written) in $PKTREC_RUN_DIR/phy-watch.json:
+    pktrec-tb save-calibration stores the base, not the corrected value."""
+
+    def __init__(self, b, log, ns=8, settle=1.0, saved=None):
+        self.b, self.log, self.ns, self.settle = b, log, int(ns), settle
+        self.ok = True
+        try:
+            self.c = b.cap
+        except SystemExit as e:
+            self.ok = False
+            log(None, "skew_off", f"0x0055 RX correction off: {e}")
+            return
+        self.base, self.corr, self.written = [0] * 4, [0] * 4, [0] * 4
+        self.reg55, self.master = [None] * 4, [None] * 4
+        self.pending = {}
+        sv = (saved or {}).get("skew") or []
+        for n in range(4):
+            r = self.read(n)
+            p = sv[n] if n < len(sv) and isinstance(sv[n], dict) else {}
+            if p.get("written") == r and "base" in p:  # our own earlier correction
+                self.base[n], self.corr[n] = p["base"], p.get("corr", 0)
+                self.reg55[n], self.master[n] = p.get("reg55"), p.get("master")
+            else:
+                self.base[n] = r
+            self.written[n] = r
+
+    def off(self, n):
+        return SFD_PORT_BASE + n * SFD_PORT_STRIDE + 0x38
+
+    def read(self, n):
+        return s32(self.c.rd(self.off(n)))
+
+    def write(self, n):
+        v = self.base[n] + self.corr[n]
+        self.c.wr(self.off(n), v & 0xFFFFFFFF)
+        self.written[n] = v
+
+    def link_up(self, n, now):
+        if self.ok:
+            self.pending[n] = now + self.settle
+
+    def link_down(self, n):
+        self.pending.pop(n, None)
+
+    def doc(self):
+        if not self.ok:
+            return None
+        return [{"port": n, "base": self.base[n], "corr": self.corr[n], "written": self.written[n],
+                 "reg55": self.reg55[n], "master": self.master[n]} for n in range(4)]
+
+    def step(self, now):
+        """-> True when something changed (state file update)."""
+        if not self.ok:
+            return False
+        changed = False
+        for n in range(4):
+            r = self.read(n)
+            if r != self.written[n]:
+                self.base[n], self.written[n] = r, r
+                msg = f"RX_OFFSET set to {r} ns by someone else: new calibration base"
+                if self.corr[n]:
+                    self.write(n)
+                    msg += f", 0x0055 correction {self.corr[n]:+d} ns re-applied -> {self.written[n]} ns"
+                self.log(n, "rx_offset_base", msg, base=r, rx_offset=self.written[n])
+                changed = True
+        for n, due in list(self.pending.items()):
+            if now < due:
+                continue
+            del self.pending[n]
+            a = PHY_ADDR[n]
+            v = self.b.mdio_rd(a, SKEW_FIFO_STS)
+            ms = (self.b.mdio_rd(a, STS1) >> 14) & 1
+            corr = -self.ns if v else 0
+            self.reg55[n], self.master[n] = v, bool(ms)
+            old = self.written[n]
+            self.corr[n] = corr
+            if self.base[n] + corr != old:
+                self.write(n)
+            self.log(n, "rx_skew", f"link-up: 0x0055 = 0x{v:04x} (1000BASE-T "
+                     f"{'master' if ms else 'slave'}) -> RX_OFFSET {self.base[n]} {corr:+d} = "
+                     f"{self.written[n]} ns" + ("" if old == self.written[n] else f" (was {old})"),
+                     reg55=v, master=bool(ms), base=self.base[n], corr=corr,
+                     rx_offset=self.written[n])
+            changed = True
+        return changed
+
+
+def watch_loop(b, duration, interval, ports, quiet, prop=None, log=None, skew=None,
+               on_change=None):
     """Poll the copper link of each PHY; on every change re-trigger the SGMII config
     word. Also re-trigger when copper is up but the PCS has no SGMII link (missed
     word), at most once per second per port. With a Propagator, propagate link
-    state across TAP pairs (see Propagator)."""
+    state across TAP pairs (see Propagator); with a SkewCorrector, apply the 0x0055
+    RX correction after every link-up."""
     log = log or EventLog()
     last = {n: None for n in ports}
     last_fix = {n: 0.0 for n in ports}
@@ -638,6 +849,7 @@ def watch_loop(b, duration, interval, ports, quiet, prop=None, log=None):
     while t_end is None or time.monotonic() < t_end:
         now = time.monotonic()
         links = {}
+        changed = False
         for n in ports:
             try:
                 up = b.copper_link(n)
@@ -654,12 +866,23 @@ def watch_loop(b, duration, interval, ports, quiet, prop=None, log=None):
                     why = "stale SGMII status" if (up == last[n]) else f"copper link {'up' if up else 'down'}"
                     log(n, "sgmii_retrigger", f"{why} -> SGMII re-triggered",
                         link=up, stale=bool(stale and up == last[n]))
+                if skew is not None and up != last[n]:
+                    skew.link_up(n, now) if up else skew.link_down(n)
                 last[n] = up
         if prop is not None:
+            held = prop.held_ports()
             try:
                 prop.step(now, links)
             except RuntimeError as e:
                 log(None, "mdio_error", f"propagation: {e}")
+            changed |= held != prop.held_ports()
+        if skew is not None:
+            try:
+                changed |= skew.step(now)
+            except RuntimeError as e:
+                log(None, "mdio_error", f"0x0055 correction: {e}")
+        if changed and on_change:
+            on_change()
         if t_end is not None and all(last[n] for n in ports) and \
                 all(b.eth_port(n, P_STATUS) & 0x800 for n in ports):
             return
@@ -669,21 +892,36 @@ def watch_loop(b, duration, interval, ports, quiet, prop=None, log=None):
 def cmd_watch(b, args):
     import signal
     log = EventLog(args.json)
-    prop = None
+    saved = read_watch_state()
+    prop = skew = None
     if not args.no_propagate:
-        prop = Propagator(b, log, args.debounce, args.grace)
+        prop = Propagator(b, log, args.debounce, args.grace, saved)
+    if not args.no_0055_correction:
+        skew = SkewCorrector(b, log, args.skew_ns, saved=saved)
+
+    def save():
+        write_watch_state({"pid": os.getpid(), "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                           "propagation": prop is not None,
+                           "held": prop.held_ports() if prop else [],
+                           "skew_correction_ns": None if skew is None or not skew.ok else skew.ns,
+                           "skew": skew.doc() if skew else None})
+    save()
     log(None, "start", f"watch: SGMII re-trigger on link changes, link-state propagation "
-        f"{'OFF' if prop is None else f'ON (debounce {args.debounce} s, grace {args.grace} s)'}"
+        f"{'OFF' if prop is None else f'ON via MII loopback (debounce {args.debounce} s, grace {args.grace} s)'}"
+        f", 0x0055 RX correction "
+        f"{'OFF' if skew is None or not skew.ok else f'ON ({skew.ns} ns)'}"
         f"; pair modes {', '.join(b.pair_modes())}")
-    # systemd stops the service with SIGTERM: leave no PHY powered down
+    # systemd stops the service with SIGTERM: leave no PHY held in loopback
     signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
-        watch_loop(b, None, args.interval, list(range(4)), quiet=True, prop=prop, log=log)
+        watch_loop(b, None, args.interval, list(range(4)), quiet=True, prop=prop, log=log,
+                   skew=skew, on_change=save)
     except KeyboardInterrupt:
         pass
     finally:
         if prop is not None:
             prop.release_all("watch exiting")
+        save()
         log(None, "stop", "watch stopped")
 
 
@@ -1218,17 +1456,24 @@ def main():
     cs.add_parser("stop")
     q = cs.add_parser("status")
     q.add_argument("--json", action="store_true")
-    p = sub.add_parser("watch", help="re-trigger SGMII on link changes; TAP link propagation")
+    p = sub.add_parser("watch", help="re-trigger SGMII on link changes; TAP link propagation "
+                       "(MII loopback); 0x0055 RX latency correction")
     p.add_argument("--interval", type=float, default=0.25)
     p.add_argument("--no-propagate", action="store_true",
                    help="do not propagate link state across TAP pairs")
     p.add_argument("--debounce", type=float, default=0.5,
                    help="s a link change must persist before it is propagated (0.5)")
     p.add_argument("--grace", type=float, default=6.0,
-                   help="s a freshly powered-up PHY gets to negotiate before its link-down "
+                   help="s a PHY released from loopback gets to negotiate before its link-down "
                         "counts (6)")
+    p.add_argument("--no-0055-correction", dest="no_0055_correction", action="store_true",
+                   help="do not correct RX_OFFSET from the PHY's skew FIFO status (0x0055) "
+                        "after each link-up")
+    p.add_argument("--skew-ns", type=int, default=8,
+                   help="RX latency (ns) a non-zero 0x0055 adds to a link-up (8, bench-measured)")
     p.add_argument("--json", action="store_true", help="log one JSON object per line")
-    p = sub.add_parser("mode", help="per-pair TAP / monitor mode (M3)")
+    p = sub.add_parser("mode", help="per-pair TAP / monitor mode (M3); in tap mode the watch "
+                       "service propagates link loss across the pair (MII loopback)")
     p.add_argument("what", help="pair 0|1, or status")
     p.add_argument("mode", nargs="?", choices=sorted(PAIR_MODES))
     p.add_argument("--force", action="store_true", help="switch even while a capture runs")
