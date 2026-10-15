@@ -33,10 +33,10 @@ Important links:
 
 * Datasheet for the [Ethernet FMC Max]
 * Datasheet for the [FPGA Drive FMC Gen4]
-* The user guide for this reference design is in [`docs/`](docs/source): start with the
-  [description](docs/source/description.md) and [getting started](docs/source/getting_started.md).
-  The pages are Sphinx (MyST Markdown) sources and read well on GitHub; to build the HTML
-  site locally, see [docs/README.md](docs/README.md)
+* The user guide for this reference design is published at
+  [packet-recorder.ethernetfmc.com](https://packet-recorder.ethernetfmc.com): start with the
+  description and getting-started pages. The sources are in [`docs/`](docs/source) (Sphinx, MyST
+  Markdown) and read well on GitHub; to build the HTML site locally, see [docs/README.md](docs/README.md)
 * To report a bug: [Report an issue](https://github.com/fpgadeveloper/fpga-packet-recorder/issues "Report an issue").
 * For technical support: [Contact Opsero](https://opsero.com/contact-us "Contact Opsero").
 
